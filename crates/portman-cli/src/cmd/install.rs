@@ -253,7 +253,7 @@ pub(crate) fn whoami() -> String {
 /// The target dir rides as a cargo `--target-dir` argument, never the
 /// CARGO_TARGET_DIR env var: sudo env_reset strips the env before cargo
 /// runs, so the sudo path built into the default target/ while install
-/// looked in target/portman-install (found on the first basement-box run).
+/// looked in target/portman-install (found the first time install ran under sudo on a real Linux box).
 fn release_build_argv(sudo_user: Option<&str>, target_dir: &std::path::Path) -> Vec<String> {
     let mut argv: Vec<String> = Vec::new();
     if let Some(user) = sudo_user {
