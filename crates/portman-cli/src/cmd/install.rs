@@ -250,12 +250,17 @@ pub(crate) fn whoami() -> String {
 /// was invoked.
 /// Pure argv for the release build; `sudo_user` is `$SUDO_USER` when set
 /// and non-blank. Split out so the sudo-vs-plain shape is unit-testable.
-fn release_build_argv(sudo_user: Option<&str>) -> Vec<String> {
+/// The target dir rides as a cargo `--target-dir` argument, never the
+/// CARGO_TARGET_DIR env var: sudo env_reset strips the env before cargo
+/// runs, so the sudo path built into the default target/ while install
+/// looked in target/portman-install (found on the first basement-box run).
+fn release_build_argv(sudo_user: Option<&str>, target_dir: &std::path::Path) -> Vec<String> {
     let mut argv: Vec<String> = Vec::new();
     if let Some(user) = sudo_user {
         argv.extend(["sudo", "-u", user].map(String::from));
     }
-    argv.extend(["cargo", "build", "--release", "--workspace"].map(String::from));
+    argv.extend(["cargo", "build", "--release", "--workspace", "--target-dir"].map(String::from));
+    argv.push(target_dir.display().to_string());
     argv
 }
 
@@ -270,11 +275,9 @@ pub(crate) fn release_build_command(
         eprintln!("running under sudo; building as {user} to keep target/ user-owned");
     }
 
-    let argv = release_build_argv(build_user.as_deref());
+    let argv = release_build_argv(build_user.as_deref(), install_target_dir);
     let mut cmd = StdCommand::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .env("CARGO_TARGET_DIR", install_target_dir)
-        .current_dir(repo);
+    cmd.args(&argv[1..]).current_dir(repo);
     cmd
 }
 
@@ -495,8 +498,9 @@ mod tests {
 
     #[test]
     fn release_build_argv_drops_to_the_invoking_user_only_under_sudo() {
+        let dir = std::path::Path::new("/tmp/t");
         assert_eq!(
-            release_build_argv(Some("dev")),
+            release_build_argv(Some("dev"), dir),
             [
                 "sudo",
                 "-u",
@@ -504,12 +508,21 @@ mod tests {
                 "cargo",
                 "build",
                 "--release",
-                "--workspace"
+                "--workspace",
+                "--target-dir",
+                "/tmp/t"
             ]
         );
         assert_eq!(
-            release_build_argv(None),
-            ["cargo", "build", "--release", "--workspace"]
+            release_build_argv(None, dir),
+            [
+                "cargo",
+                "build",
+                "--release",
+                "--workspace",
+                "--target-dir",
+                "/tmp/t"
+            ]
         );
     }
 
