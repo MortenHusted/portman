@@ -164,6 +164,7 @@ Anything not in a `portman.toml` can still get a hostname:
 ```bash
 portman add myapp.test 127.0.0.1:3070        # HTTP, routed by Host header
 portman add db.test 172.17.0.2:5432 --tcp    # TCP, dedicated loopback front
+portman add api.test 127.0.0.1:9000 --project acme   # joins the dashboard's project filter
 portman remove myapp.test
 ```
 
