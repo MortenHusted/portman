@@ -243,7 +243,10 @@ function alertCollisions() {
 // --- KPI strip -------------------------------------------------------------
 
 function renderKpis() {
+  // Every top-line number respects the project filter — a filtered view
+  // where some counts stay global reads as a bug.
   const services = visibleServices();
+  const ctrs = visibleContainers();
   const states = services.map(s => String(s.state || '').toLowerCase());
   const ready = states.filter(s => s === 'ready').length;
   const troubled = states.filter(s => s === 'backoff' || s === 'failed').length;
@@ -252,22 +255,40 @@ function renderKpis() {
     ? (troubled ? `${ready} ready · ${troubled} ${states.includes('failed') ? 'failed' : 'backoff'}` : `${ready} ready`)
     : '';
 
-  el('kpi-containers').textContent = snapshotTotals.containers;
-  el('kpi-containers-note').textContent = snapshotTotals.containers ? 'running' : '';
+  const containerCount = projectFilter ? ctrs.length : snapshotTotals.containers;
+  el('kpi-containers').textContent = containerCount;
+  el('kpi-containers-note').textContent = containerCount ? 'running' : '';
 
-  el('kpi-hosts').textContent = allEntries.length;
-  const wildcards = allEntries.filter(e => e.host.startsWith('*.')).length;
+  // Hostnames belong to a project through their backing service or
+  // container; static/wildcard rules with no live owner count under All.
+  let entries = allEntries;
+  if (projectFilter) {
+    const owned = new Set();
+    for (const s of services) if (s.host) owned.add(String(s.host).toLowerCase());
+    for (const c of ctrs) for (const h of (c.portman_hosts || [])) owned.add(String(h).toLowerCase());
+    entries = allEntries.filter(e => owned.has(String(e.host).toLowerCase()));
+  }
+  el('kpi-hosts').textContent = entries.length;
+  const wildcards = entries.filter(e => e.host.startsWith('*.')).length;
   el('kpi-hosts-note').textContent =
     `${wildcards ? wildcards + ' wildcard · ' : ''}${allTlds.map(t => '.' + t.name).join(' ')}`;
 
-  const svcGauges = [...gauges.values()];
+  const visibleNames = new Set(services.map(s => s.name));
+  const svcGauges = projectFilter
+    ? [...gauges.values()].filter(u => visibleNames.has(u.name))
+    : [...gauges.values()];
   const cpu = svcGauges.reduce((sum, u) => sum + (u.cpu_percent || 0), 0);
   const mem = svcGauges.reduce((sum, u) => sum + (u.memory_usage_bytes || 0), 0);
   el('kpi-cpu').textContent = cpu.toFixed(1) + '%';
   el('kpi-mem').textContent = formatBytes(mem);
+  const scope = projectFilter || 'all services';
+  el('kpi-cpu-label').textContent = `CPU · ${scope}`;
+  el('kpi-mem-label').textContent = `Memory · ${scope}`;
 
   const total = totalSeries();
-  const svcSeriesAll = historySeries.filter(s => s.kind === 'service');
+  const svcSeriesAll = historySeries.filter(
+    s => s.kind === 'service' && (!projectFilter || visibleNames.has(s.key))
+  );
   const sumByT = new Map();
   for (const s of svcSeriesAll) {
     for (const p of s.points) {
