@@ -1,0 +1,66 @@
+# mise config — runs everyone's local tooling and CI tasks.
+# Install mise from https://mise.jdx.dev then run `mise install` once.
+
+[tools]
+rust = "stable"
+
+[env]
+RUST_LOG = "info"
+
+# ---------------------------------------------------------------------------
+# Tasks — see `mise tasks` for the full list. Prefer running things through
+# these so CI and local match exactly.
+# ---------------------------------------------------------------------------
+
+[tasks.fmt]
+description = "Format all Rust code"
+run = "cargo fmt --all"
+
+[tasks."fmt:check"]
+description = "Check formatting without changing files (CI gate)"
+run = "cargo fmt --all -- --check"
+
+[tasks.lint]
+description = "Clippy on the whole workspace, warnings fail"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.check]
+description = "Fast type-check across the workspace"
+run = "cargo check --workspace --all-targets"
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo test --workspace"
+
+[tasks."setup-image:check"]
+description = "Check netbridge setup-image shell entrypoint without building Docker images"
+run = "sh -n crates/portman-netbridge/setup-image/entrypoint.sh"
+
+[tasks.build]
+description = "Release build of all binaries"
+run = "cargo build --release --workspace"
+
+[tasks.daemon]
+description = "Run the daemon in dev mode (verbose logs)"
+env = { RUST_LOG = "debug" }
+run = "cargo run -p portman-daemon"
+
+[tasks.daemon-root]
+description = "Run the daemon with sudo so it can bind :80 (Phase 6+)"
+# Separate target dir: `sudo cargo` writes artifacts as root, and a single
+# root-owned file in target/ makes every later non-sudo build fail with
+# EACCES. Keeping the root build out of target/ means the two never mix.
+env = { RUST_LOG = "debug", CARGO_TARGET_DIR = "target-root" }
+run = "sudo -E cargo run -p portman-daemon"
+
+[tasks.cli]
+description = "Run the CLI (pass args after --)"
+run = "cargo run -p portman-cli --"
+
+[tasks.dashboard]
+description = "Open the embedded web dashboard in your browser"
+run = "cargo run -p portman-cli -- dashboard"
+
+[tasks.ci]
+description = "Everything CI runs — run before pushing"
+depends = ["fmt:check", "lint", "test", "setup-image:check"]

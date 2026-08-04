@@ -1,0 +1,58 @@
+[package]
+name = "portman-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "portman daemon: Docker watcher, DNS, HTTP proxy"
+
+[[bin]]
+name = "portman-daemon"
+path = "src/main.rs"
+
+[dependencies]
+portman-core.workspace = true
+portman-protocol = { workspace = true, features = ["transport"] }
+anyhow.workspace = true
+bollard.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+hickory-server = "0.26"
+hickory-proto = "0.26"
+async-trait = "0.1"
+httparse = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
+rust-embed = { version = "8", features = ["include-exclude"] }
+mime_guess = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+dotenvy = { workspace = true }
+# Supervisor: identity switch (user), killpg (signal), getpgid (process);
+# net is the macOS ifindex resolution used by upstream/netbridge.
+nix = { version = "0.29", features = ["net", "user", "signal", "process"] }
+# Boot-reconciliation identity checks + per-service resource sampling.
+sysinfo = "0.39"
+# Service log store (bundled: no system sqlite dependency).
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Infisical universal-auth + secret listing (rustls to match the workspace).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Service `watch` paths: notify supplies both backends, the debouncer collapses
+# a rebuild's burst of writes into one respawn.
+notify = "8"
+notify-debouncer-full = "0.7"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+portman-netbridge.workspace = true
+# Interface-scoped upstream sockets (IP_BOUND_IF): socket2 sets the option.
+socket2 = { version = "0.5", features = ["all"] }
+
+[lints]
+workspace = true

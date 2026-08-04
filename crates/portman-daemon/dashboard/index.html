@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>portman</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="mark" aria-hidden="true"></div>
+        <span class="wordmark">portman</span>
+        <span id="version" class="version"></span>
+      </div>
+      <div class="topbar-status">
+        <span class="pill"><span id="status-dot" class="dot offline"></span><span id="status-label">offline</span></span>
+        <span class="pill" id="bridge-pill" hidden><span id="bridge-label"></span></span>
+        <span id="daemon-ports" class="ports mono"></span>
+      </div>
+    </header>
+
+    <div id="alerts"></div>
+
+    <section class="kpis" id="kpis">
+      <div class="kpi">
+        <span class="kpi-label">Services</span>
+        <div class="kpi-value-row"><span class="kpi-value" id="kpi-services">—</span><span class="kpi-note" id="kpi-services-note"></span></div>
+      </div>
+      <div class="kpi">
+        <span class="kpi-label">Containers</span>
+        <div class="kpi-value-row"><span class="kpi-value" id="kpi-containers">—</span><span class="kpi-note" id="kpi-containers-note"></span></div>
+      </div>
+      <div class="kpi">
+        <span class="kpi-label">Hostnames</span>
+        <div class="kpi-value-row"><span class="kpi-value" id="kpi-hosts">—</span><span class="kpi-note" id="kpi-hosts-note"></span></div>
+      </div>
+      <div class="kpi-spacer"></div>
+      <div class="kpi">
+        <span class="kpi-label">CPU · all services</span>
+        <div class="kpi-value-row"><span class="kpi-value" id="kpi-cpu">—</span><span id="kpi-cpu-spark" class="kpi-spark"></span></div>
+      </div>
+      <div class="kpi">
+        <span class="kpi-label">Memory · all services</span>
+        <div class="kpi-value-row"><span class="kpi-value" id="kpi-mem">—</span><span id="kpi-mem-spark" class="kpi-spark"></span></div>
+      </div>
+    </section>
+
+    <main class="layout">
+      <div class="left">
+        <section id="sec-services">
+          <div class="section-head">
+            <h2>Services</h2>
+            <span id="services-count" class="count"></span>
+          </div>
+          <div id="services-empty" class="empty" hidden>No supervised services. Run <code>portman up</code> in a repo with a <code>portman.toml</code>.</div>
+          <div id="service-groups"></div>
+        </section>
+
+        <section id="sec-containers">
+          <div class="section-head">
+            <h2>Containers</h2>
+            <span id="containers-count" class="count"></span>
+          </div>
+          <div id="containers-empty" class="empty" hidden>No running containers.</div>
+          <div id="container-groups"></div>
+        </section>
+
+        <section id="sec-routes">
+          <div class="section-head">
+            <h2>Routes</h2>
+            <span id="entries-count" class="count"></span>
+            <div class="grow"></div>
+            <input id="entries-filter" type="search" class="filter" placeholder="Filter host or target…" autocomplete="off">
+          </div>
+          <div id="entries-empty" class="empty" hidden>No entries yet.</div>
+          <div class="card" id="routes-card">
+            <div class="table-scroll">
+              <table class="table" id="entries-table">
+                <thead>
+                  <tr><th>Host</th><th class="col-target">Target</th><th class="col-mode">Mode</th><th class="col-source">Source</th><th class="col-actions"></th></tr>
+                </thead>
+                <tbody id="entries-body"></tbody>
+              </table>
+            </div>
+            <form id="add-form" class="add-row">
+              <input id="add-host" type="text" placeholder="crm.test" required aria-label="Hostname">
+              <span class="arrow" aria-hidden="true">→</span>
+              <input id="add-target" type="text" placeholder="127.0.0.1:3000" required aria-label="Target ip:port">
+              <label class="check"><input id="add-tcp" type="checkbox"> TCP</label>
+              <button type="submit">Add route</button>
+            </form>
+            <p id="add-error" class="error" hidden></p>
+          </div>
+        </section>
+      </div>
+
+      <aside class="inspector-rail">
+        <div class="section-head"><h2>Inspector</h2></div>
+        <div id="inspector-empty" class="empty">Select a service to inspect it.</div>
+        <div class="card inspector" id="config-editor" hidden>
+          <div class="inspector-id">
+            <div class="inspector-title">
+              <button type="button" id="cfg-back" class="secondary back-btn" title="Back to the inspector">&#8249; Back</button>
+              <span class="mono" id="cfg-root"></span>
+            </div>
+            <div class="cfg-tabs" id="cfg-tabs"></div>
+          </div>
+          <div class="cfg-body">
+            <p id="cfg-note" class="cfg-note" hidden></p>
+            <p id="cfg-error" class="error cfg-error" hidden></p>
+            <textarea id="cfg-text" class="mono" spellcheck="false" rows="22"></textarea>
+            <div class="actions cfg-actions">
+              <button type="button" id="cfg-save" class="primary">Save &amp; apply</button>
+              <button type="button" id="cfg-cancel" class="secondary">Cancel</button>
+              <span id="cfg-status" class="action-note"></span>
+            </div>
+          </div>
+        </div>
+        <div class="card inspector" id="inspector" hidden>
+          <div class="inspector-id">
+            <div class="inspector-title">
+              <button type="button" id="insp-back" class="secondary back-btn" title="Back to the overview (Esc)" hidden>&#8249; Back</button>
+              <span id="insp-name" class="mono"></span>
+              <span id="insp-state" class="badge"></span>
+              <div class="grow"></div>
+              <div id="focus-nav" class="focus-nav" hidden>
+                <button type="button" id="focus-prev" class="secondary tiny" title="Previous item (&#8593;)">&#8249;</button>
+                <button type="button" id="focus-next" class="secondary tiny" title="Next item (&#8595;)">&#8250;</button>
+                <span class="kbd-hint">&#8593;&#8595; switch &middot; Esc back</span>
+              </div>
+              <button type="button" id="insp-focus" class="linkish" title="Give this item the whole page">Focus</button>
+            </div>
+            <div id="insp-chips" class="chips"></div>
+            <div class="actions">
+              <button type="button" id="insp-restart" class="primary">Restart</button>
+              <button type="button" id="insp-toggle" class="secondary">Stop</button>
+              <a id="insp-open" class="button secondary" target="_blank" rel="noopener" hidden>Open host</a>
+              <button type="button" id="insp-config" class="secondary" hidden>Config</button>
+              <span id="insp-action-note" class="action-note"></span>
+            </div>
+            <p id="insp-detail" class="detail" hidden></p>
+          </div>
+          <div class="meta-strip" id="insp-meta"></div>
+          <div class="charts-row">
+            <div class="chart-block">
+              <div class="chart-head"><span class="chart-label">CPU · last 10 min</span><span id="insp-cpu-now" class="chart-now mono"></span></div>
+              <div id="chart-cpu" class="chart"></div>
+            </div>
+            <div class="chart-block">
+              <div class="chart-head"><span class="chart-label">Memory · last 10 min</span><span id="insp-mem-now" class="chart-now mono"></span></div>
+              <div id="chart-mem" class="chart"></div>
+            </div>
+          </div>
+          <div class="log-block" id="log-block">
+            <div class="chart-head">
+              <span class="chart-label">Log tail</span>
+              <div class="grow"></div>
+              <button type="button" id="log-expand" class="linkish" aria-pressed="false">Expand</button>
+              <button type="button" id="log-follow" class="linkish" aria-pressed="true">Follow</button>
+            </div>
+            <pre id="log-output" class="log-well mono"></pre>
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="footer mono">
+      <span id="dashboard-url"></span>
+      <span id="tld-summary"></span>
+      <div class="grow"></div>
+      <span>sampled every 5s · 10 min retained</span>
+    </footer>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

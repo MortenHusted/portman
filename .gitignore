@@ -1,0 +1,18 @@
+/target
+/target-root
+*.swp
+*.swo
+.DS_Store
+.vscode/
+.idea/
+*.xcuserstate
+xcuserdata/
+.env
+.env.*
+.mempacer/
+/.mcp.json
+/.mempacer.json
+/tmp/system-state-snapshots
+
+# No stray screenshots at the repo root
+/*.png

@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Portman UI — Design Canvas</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<style>
+  html, body { margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; background: #f0eee9; }
+  #root { width: 100%; height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script type="text/babel" src="design-canvas.jsx"></script>
+<script type="text/babel" src="src/tokens.jsx"></script>
+<script type="text/babel" src="src/icons.jsx"></script>
+<script type="text/babel" src="src/atoms.jsx"></script>
+<script type="text/babel" src="src/mockdata.jsx"></script>
+<script type="text/babel" src="src/menubar.jsx"></script>
+<script type="text/babel" src="src/window.jsx"></script>
+
+<script type="text/babel">
+// ─────────────────────────────────────────────────────────────
+// Portman Design Canvas — 10 states × light/dark, plus variations.
+// ─────────────────────────────────────────────────────────────
+
+// An artboard backdrop that fakes a chunk of the macOS menubar + desktop.
+function DesktopBackdrop({ mode = 'light', children, padding = 34, showMenuBar = true, style = {} }) {
+  return (
+    <div
+      className={mode === 'dark' ? 'pm-desk-dark' : 'pm-desk-light'}
+      style={{
+        width: '100%', height: '100%',
+        position: 'relative',
+        display: 'flex',
+        alignItems: 'flex-start',
+        justifyContent: 'center',
+        paddingTop: padding,
+        ...style,
+      }}
+    >
+      {showMenuBar && <FakeMenuBar mode={mode}/>}
+      {children}
+    </div>
+  );
+}
+
+function FakeMenuBar({ mode }) {
+  const isDark = mode === 'dark';
+  return (
+    <div style={{
+      position: 'absolute', top: 0, left: 0, right: 0,
+      height: 24,
+      background: isDark ? 'rgba(22,22,22,0.55)' : 'rgba(255,255,255,0.35)',
+      backdropFilter: 'blur(30px)',
+      WebkitBackdropFilter: 'blur(30px)',
+      borderBottom: `0.5px solid ${isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.1)'}`,
+      display: 'flex', alignItems: 'center',
+      padding: '0 10px', gap: 14,
+      fontSize: 12.5,
+      color: isDark ? 'rgba(255,255,255,0.85)' : 'rgba(0,0,0,0.82)',
+      fontFamily: FONTS.ui,
+    }}>
+      <span style={{ fontSize: 13 }}>🍎</span>
+      <span style={{ fontWeight: 600 }}>Terminal</span>
+      <span style={{ opacity: 0.8 }}>File</span>
+      <span style={{ opacity: 0.8 }}>Edit</span>
+      <span style={{ opacity: 0.8 }}>View</span>
+      <span style={{ opacity: 0.8 }}>Window</span>
+      <span style={{ opacity: 0.8 }}>Help</span>
+      <div style={{ flex: 1 }}/>
+      <span style={{ display: 'inline-flex', alignItems: 'center' }}>
+        <Icon.PortmanMark size={13}/>
+      </span>
+      <span style={{ fontSize: 11, opacity: 0.75 }}>Fri 22 Apr 14:28</span>
+    </div>
+  );
+}
+
+// Points from the menubar icon to the popover with a tiny arrow.
+function MenubarPopoverFrame({ mode, children, width = 360, rightOffset = 24 }) {
+  return (
+    <DesktopBackdrop mode={mode} padding={34}>
+      <div style={{ position: 'absolute', top: 28, right: rightOffset }}>
+        {/* arrow from menubar */}
+        <div style={{
+          width: 10, height: 10,
+          background: 'var(--pm-popoverBg)',
+          backdropFilter: 'blur(40px) saturate(180%)',
+          WebkitBackdropFilter: 'blur(40px) saturate(180%)',
+          border: '0.5px solid var(--pm-borderStrong)',
+          transform: 'rotate(45deg)',
+          position: 'absolute', top: -5, right: 48,
+          zIndex: 0,
+        }}/>
+        <div style={{ position: 'relative', zIndex: 1, marginTop: 4 }}>
+          {children}
+        </div>
+      </div>
+    </DesktopBackdrop>
+  );
+}
+
+// Simplify per-state builder
+function Popover({ mode = 'light', ...props }) {
+  return (
+    <PMTheme mode={mode}>
+      <MenubarPopoverFrame mode={mode}>
+        <PortmanMenubar {...props}/>
+      </MenubarPopoverFrame>
+    </PMTheme>
+  );
+}
+
+function Window({ mode = 'light', ...props }) {
+  return (
+    <PMTheme mode={mode}>
+      <DesktopBackdrop mode={mode} padding={34} showMenuBar={true}>
+        <div style={{ marginTop: 20 }}>
+          <PortmanWindow {...props}/>
+        </div>
+      </DesktopBackdrop>
+    </PMTheme>
+  );
+}
+
+// Artboard sizes
+const POP_W = 440;
+const POP_H = 640;
+const POP_TALL_H = 720;
+const WIN_W = 960;
+const WIN_H = 660;
+
+// ─────────────────────────────────────────────────────────────
+// All states — rendered twice, light & dark.
+// ─────────────────────────────────────────────────────────────
+function App({ settings = { mode: 'all', theme: 'both', focusState: '01' } }) {
+  // When focused: render a single large artboard for the selected state.
+  if (settings.mode === 'focus') {
+    return <FocusedView state={settings.focusState} theme={settings.theme === 'both' ? 'light' : settings.theme}/>;
+  }
+  return (
+    <DesignCanvas>
+      <DCSection id="hero" title="Menubar popover · Hero states" subtitle="Light + dark across the six primary states">
+
+        {/* 1 — Happy path */}
+        <DCArtboard id="1L" label="01 · Happy path — light" width={POP_W} height={POP_H}>
+          <Popover mode="light" status="online" statusMeta={PM_STATUS.online} entries={PM_ENTRIES_HAPPY}/>
+        </DCArtboard>
+        <DCArtboard id="1D" label="01 · Happy path — dark" width={POP_W} height={POP_H}>
+          <Popover mode="dark" status="online" statusMeta={PM_STATUS.online} entries={PM_ENTRIES_HAPPY}/>
+        </DCArtboard>
+
+        {/* 2 — Empty connected */}
+        <DCArtboard id="2L" label="02 · Empty + connected — light" width={POP_W} height={POP_H}>
+          <Popover mode="light" status="online" statusMeta={PM_STATUS.online} entries={[]}/>
+        </DCArtboard>
+        <DCArtboard id="2D" label="02 · Empty + connected — dark" width={POP_W} height={POP_H}>
+          <Popover mode="dark" status="online" statusMeta={PM_STATUS.online} entries={[]}/>
+        </DCArtboard>
+
+        {/* 3 — Disconnected — we ship BOTH as variations side by side */}
+        <DCArtboard id="3L-dim" label="03 · Disconnected (dim) — light" width={POP_W} height={POP_H}>
+          <Popover mode="light" status="offline" statusMeta={PM_STATUS.offline} entries={PM_ENTRIES_HAPPY} disconnectedMode="dim"/>
+        </DCArtboard>
+        <DCArtboard id="3D-dim" label="03 · Disconnected (dim) — dark" width={POP_W} height={POP_H}>
+          <Popover mode="dark" status="offline" statusMeta={PM_STATUS.offline} entries={PM_ENTRIES_HAPPY} disconnectedMode="dim"/>
+        </DCArtboard>
+
+        {/* 4 — Starting */}
+        <DCArtboard id="4L" label="04 · Daemon starting — light" width={POP_W} height={360}>
+          <Popover mode="light" status="starting" statusMeta={PM_STATUS.starting} entries={[]}/>
+        </DCArtboard>
+        <DCArtboard id="4D" label="04 · Daemon starting — dark" width={POP_W} height={360}>
+          <Popover mode="dark" status="starting" statusMeta={PM_STATUS.starting} entries={[]}/>
+        </DCArtboard>
+
+        {/* 5 — Add form open with validation error */}
+        <DCArtboard id="5L" label="05 · Add form — TLD error — light" width={POP_W} height={POP_TALL_H}>
+          <Popover
+            mode="light" status="online" statusMeta={PM_STATUS.online} entries={PM_ENTRIES_HAPPY}
+            addFormOpen={true} addFormHost="api.foo" addFormTarget="127.0.0.1:" addFormError={true}
+          />
+        </DCArtboard>
+        <DCArtboard id="5D" label="05 · Add form — TLD error — dark" width={POP_W} height={POP_TALL_H}>
+          <Popover
+            mode="dark" status="online" statusMeta={PM_STATUS.online} entries={PM_ENTRIES_HAPPY}
+            addFormOpen={true} addFormHost="api.foo" addFormTarget="127.0.0.1:" addFormError={true}
+          />
+        </DCArtboard>
+
+        {/* 6 — Hover states: static row (copy+trash), container hover, cert-error tooltip */}
+        <DCArtboard id="6L" label="06 · Hover states + cert error — light" width={POP_W} height={POP_H}>
+          <Popover
+            mode="light" status="online" statusMeta={PM_STATUS.online} entries={PM_ENTRIES_HOVER}
+            hoverForce={{ host: 'billing.test', kind: 'cert-error' }}
+          />
+        </DCArtboard>
+        <DCArtboard id="6D" label="06 · Hover states + cert error — dark" width={POP_W} height={POP_H}>
+          <Popover
+            mode="dark" status="online" statusMeta={PM_STATUS.online} entries={PM_ENTRIES_HOVER}
+            hoverForce={{ host: 'billing.test', kind: 'cert-error' }}
+          />
+        </DCArtboard>
+      </DCSection>
+
+      <DCSection id="window" title="Main window · Hero states" subtitle="NavigationSplitView — Entries · TLDs · About">
+        {/* 7 — Entries, many rows */}
+        <DCArtboard id="7L" label="07 · Entries pane — light" width={WIN_W} height={WIN_H}>
+          <Window mode="light" pane="entries" entries={PM_ENTRIES_WINDOW} selection={['mail.test', 'docs.test']} sortBy="host"/>
+        </DCArtboard>
+        <DCArtboard id="7D" label="07 · Entries pane — dark" width={WIN_W} height={WIN_H}>
+          <Window mode="dark" pane="entries" entries={PM_ENTRIES_WINDOW} selection={['mail.test', 'docs.test']} sortBy="host"/>
+        </DCArtboard>
+
+        {/* 8 — TLDs pane, .test expanded */}
+        <DCArtboard id="8L" label="08 · TLDs pane — light" width={WIN_W} height={WIN_H}>
+          <Window mode="light" pane="tlds" tlds={PM_TLDS} expandedTld="test"/>
+        </DCArtboard>
+        <DCArtboard id="8D" label="08 · TLDs pane — dark" width={WIN_W} height={WIN_H}>
+          <Window mode="dark" pane="tlds" tlds={PM_TLDS} expandedTld="test"/>
+        </DCArtboard>
+
+        {/* 9 — Add TLD form with .internal advisory */}
+        <DCArtboard id="9L" label="09 · Add TLD — advisory — light" width={WIN_W} height={WIN_H}>
+          <Window
+            mode="light" pane="tlds" tlds={PM_TLDS} addTldOpen={true}
+            addTldName="internal" addTldTls={true}
+            addTldWarning={{ kind: 'advisory', text: 'Apple intercepts .internal on recent macOS — portman may not reliably resolve hosts under this TLD. Consider .test or your own word.' }}
+          />
+        </DCArtboard>
+        <DCArtboard id="9D" label="09 · Add TLD — advisory — dark" width={WIN_W} height={WIN_H}>
+          <Window
+            mode="dark" pane="tlds" tlds={PM_TLDS} addTldOpen={true}
+            addTldName="internal" addTldTls={true}
+            addTldWarning={{ kind: 'advisory', text: 'Apple intercepts .internal on recent macOS — portman may not reliably resolve hosts under this TLD. Consider .test or your own word.' }}
+          />
+        </DCArtboard>
+
+        {/* 10 — About pane */}
+        <DCArtboard id="10L" label="10 · About pane — light" width={WIN_W} height={WIN_H}>
+          <Window mode="light" pane="about"/>
+        </DCArtboard>
+        <DCArtboard id="10D" label="10 · About pane — dark" width={WIN_W} height={WIN_H}>
+          <Window mode="dark" pane="about"/>
+        </DCArtboard>
+      </DCSection>
+
+      <DCSection id="variations" title="Variations" subtitle="TLD grouping · Disconnected treatment · Accent color">
+        {/* TLD grouping: flat */}
+        <DCArtboard id="v-flat-L" label="Flat TLD layout (rejected)" width={POP_W} height={POP_H}>
+          <PMTheme mode="light">
+            <MenubarPopoverFrame mode="light">
+              <PortmanMenubarFlat entries={PM_ENTRIES_HAPPY} tlds={PM_TLDS_MENUBAR}/>
+            </MenubarPopoverFrame>
+          </PMTheme>
+        </DCArtboard>
+        <DCArtboard id="v-section-L" label="Sectioned TLD layout (shipping)" width={POP_W} height={POP_H}>
+          <Popover mode="light" status="online" statusMeta={PM_STATUS.online} entries={PM_ENTRIES_HAPPY}/>
+        </DCArtboard>
+
+        {/* Disconnected: dim vs hide */}
+        <DCArtboard id="v-disc-dim" label="Disconnected · entries dimmed (shipping)" width={POP_W} height={POP_H}>
+          <Popover mode="light" status="offline" statusMeta={PM_STATUS.offline} entries={PM_ENTRIES_HAPPY} disconnectedMode="dim"/>
+        </DCArtboard>
+        <DCArtboard id="v-disc-hide" label="Disconnected · entries hidden" width={POP_W} height={360}>
+          <Popover mode="light" status="offline" statusMeta={PM_STATUS.offline} entries={PM_ENTRIES_HAPPY} disconnectedMode="hide"/>
+        </DCArtboard>
+
+        {/* Accent color explorations */}
+        <DCArtboard id="v-acc-warm" label="Accent · warm copper (shipping)" width={POP_W} height={POP_H}>
+          <Popover mode="light" status="online" statusMeta={PM_STATUS.online} entries={PM_ENTRIES_HAPPY}/>
+        </DCArtboard>
+        <DCArtboard id="v-acc-system" label="Accent · system blue" width={POP_W} height={POP_H}>
+          <PMTheme mode="light" style={{
+            '--pm-accent': '#0A7CFF', '--pm-accentHover': '#0870DD',
+            '--pm-accentSoft': 'rgba(10,124,255,0.12)', '--pm-accentText': '#FFFFFF',
+            '--pm-rowSelect': 'rgba(10,124,255,0.10)',
+          }}>
+            <MenubarPopoverFrame mode="light">
+              <PortmanMenubar status="online" statusMeta={PM_STATUS.online} entries={PM_ENTRIES_HAPPY}/>
+            </MenubarPopoverFrame>
+          </PMTheme>
+        </DCArtboard>
+        <DCArtboard id="v-acc-mono" label="Accent · monochrome" width={POP_W} height={POP_H}>
+          <PMTheme mode="light" style={{
+            '--pm-accent': '#1A1816', '--pm-accentHover': '#000',
+            '--pm-accentSoft': 'rgba(26,24,22,0.08)', '--pm-accentText': '#FFFFFF',
+            '--pm-rowSelect': 'rgba(26,24,22,0.06)',
+          }}>
+            <MenubarPopoverFrame mode="light">
+              <PortmanMenubar status="online" statusMeta={PM_STATUS.online} entries={PM_ENTRIES_HAPPY}/>
+            </MenubarPopoverFrame>
+          </PMTheme>
+        </DCArtboard>
+      </DCSection>
+
+      <DCSection id="notes" title="Decision notes" subtitle="Short answers to the brief's six questions">
+        <DCArtboard id="notes-card" label="Decision notes" width={840} height={1100}>
+          <DecisionNotes/>
+        </DCArtboard>
+      </DCSection>
+
+    </DesignCanvas>
+  );
+}
+
+// ── Focused view (single state, large) ────────────────────────
+function FocusedView({ state, theme }) {
+  const render = () => {
+    switch (state) {
+      case '01': return <Popover mode={theme} status="online" statusMeta={PM_STATUS.online} entries={PM_ENTRIES_HAPPY}/>;
+      case '02': return <Popover mode={theme} status="online" statusMeta={PM_STATUS.online} entries={[]}/>;
+      case '03': return <Popover mode={theme} status="offline" statusMeta={PM_STATUS.offline} entries={PM_ENTRIES_HAPPY} disconnectedMode="dim"/>;
+      case '04': return <Popover mode={theme} status="starting" statusMeta={PM_STATUS.starting} entries={[]}/>;
+      case '05': return <Popover mode={theme} status="online" statusMeta={PM_STATUS.online} entries={PM_ENTRIES_HAPPY} addFormOpen={true} addFormHost="api.foo" addFormTarget="127.0.0.1:" addFormError={true}/>;
+      case '06': return <Popover mode={theme} status="online" statusMeta={PM_STATUS.online} entries={PM_ENTRIES_HOVER} hoverForce={{ host: 'billing.test', kind: 'cert-error' }}/>;
+      case '07': return <Window mode={theme} pane="entries" entries={PM_ENTRIES_WINDOW} selection={['mail.test', 'docs.test']} sortBy="host"/>;
+      case '08': return <Window mode={theme} pane="tlds" tlds={PM_TLDS} expandedTld="test"/>;
+      case '09': return <Window mode={theme} pane="tlds" tlds={PM_TLDS} addTldOpen={true} addTldName="internal" addTldTls={true} addTldWarning={{ kind: 'advisory', text: 'Apple intercepts .internal on recent macOS — portman may not reliably resolve hosts under this TLD.' }}/>;
+      case '10': return <Window mode={theme} pane="about"/>;
+      default: return null;
+    }
+  };
+  return (
+    <div style={{ width: '100%', height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: theme === 'dark' ? '#1a1715' : '#f0eee9' }}>
+      <div style={{ width: state >= '07' ? 960 : 440, height: state >= '07' ? 660 : 680 }}>
+        {render()}
+      </div>
+    </div>
+  );
+}
+
+// ── Flat-TLD variation of the menubar ─────────────────────────
+function PortmanMenubarFlat({ entries, tlds }) {
+  return (
+    <div style={{
+      width: 360,
+      borderRadius: 10,
+      background: 'var(--pm-popoverBg)',
+      backdropFilter: 'blur(40px) saturate(180%)',
+      WebkitBackdropFilter: 'blur(40px) saturate(180%)',
+      border: '0.5px solid var(--pm-borderStrong)',
+      boxShadow: 'var(--pm-popoverShadow)',
+      overflow: 'hidden',
+      fontFamily: FONTS.ui,
+    }}>
+      <div style={{
+        padding: '10px 12px', display: 'flex', alignItems: 'center', gap: 8,
+        borderBottom: '0.5px solid var(--pm-divider)',
+      }}>
+        <Icon.PortmanMark size={15}/>
+        <span style={{ fontSize: 13, fontWeight: 600 }}>portman</span>
+        <span className="pm-mono" style={{ fontSize: 10.5, color: 'var(--pm-textTertiary)' }}>v0.6.2</span>
+        <div style={{ flex: 1 }}/>
+        <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '3px 8px', borderRadius: 10, background: 'var(--pm-surfaceHover)', fontSize: 11, color: 'var(--pm-textSecondary)' }}>
+          <StatusDot status="online"/><span>connected</span>
+        </div>
+      </div>
+      <div style={{ padding: '6px 4px 4px' }} className="pm-scroll">
+        {entries.map(e => (
+          <div key={e.host} style={{
+            display: 'grid',
+            gridTemplateColumns: '44px 1fr 60px 16px',
+            alignItems: 'center', gap: 8,
+            padding: '5px 12px', borderRadius: 6,
+          }}>
+            <SchemeBadge scheme={e.cert === 'none' ? 'http' : 'https'} cert={e.cert}/>
+            <div className="pm-mono" style={{ fontSize: 12.5, fontWeight: 500 }}>{e.host}</div>
+            <span className="pm-mono" style={{ fontSize: 10.5, color: 'var(--pm-textTertiary)' }}>.{e.tld}</span>
+            <span style={{ color: 'var(--pm-textTertiary)' }}>
+              {e.source === 'container' ? <Icon.Shippingbox size={12}/> : <Icon.Laptop size={12}/>}
+            </span>
+          </div>
+        ))}
+      </div>
+      <div style={{ borderTop: '0.5px solid var(--pm-divider)', padding: '6px', display: 'flex', alignItems: 'center' }}>
+        <button style={{ height: 26, padding: '0 9px 0 7px', borderRadius: 6, background: 'transparent', border: 'none', cursor: 'pointer', fontSize: 12, fontWeight: 500, color: 'var(--pm-text)', display: 'flex', alignItems: 'center', gap: 5 }}>
+          <Icon.Plus size={11}/> Add…
+        </button>
+        <div style={{ flex: 1 }}/>
+        <button style={{ height: 26, padding: '0 9px', borderRadius: 6, background: 'transparent', border: 'none', cursor: 'pointer', fontSize: 12, color: 'var(--pm-textSecondary)' }}>
+          Open window…
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Decision notes card ───────────────────────────────────────
+function DecisionNotes() {
+  const NoteHeader = ({ num, title }) => (
+    <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 6 }}>
+      <span className="pm-mono" style={{ fontSize: 11, color: '#c96442', fontWeight: 600, letterSpacing: 0.5 }}>NOTE {num}</span>
+      <span style={{ fontSize: 15, fontWeight: 600, color: '#1A1816', letterSpacing: -0.2 }}>{title}</span>
+    </div>
+  );
+  const P = ({ children, style = {} }) => (
+    <p style={{ fontSize: 13, lineHeight: 1.55, color: 'rgba(26,24,22,0.78)', margin: '0 0 10px 0', ...style }}>{children}</p>
+  );
+  const Kbd = ({ children }) => <code style={{ fontFamily: FONTS.mono, fontSize: 12, background: 'rgba(0,0,0,0.05)', padding: '1px 5px', borderRadius: 3, color: '#1A1816' }}>{children}</code>;
+  const Block = ({ children }) => (
+    <div style={{ background: '#fff', border: '0.5px solid rgba(0,0,0,0.08)', borderRadius: 10, padding: '18px 22px', marginBottom: 14 }}>
+      {children}
+    </div>
+  );
+  return (
+    <div style={{ padding: 26, background: '#f6f5f3', height: '100%', overflow: 'auto', fontFamily: FONTS.ui }} className="pm-scroll">
+      <div style={{ maxWidth: 760, margin: '0 auto' }}>
+        <div style={{ fontSize: 22, fontWeight: 700, letterSpacing: -0.4, marginBottom: 4, color: '#1A1816' }}>portman · decision notes</div>
+        <div style={{ fontSize: 13, color: 'rgba(26,24,22,0.6)', marginBottom: 20 }}>Six calls + three warnings.</div>
+
+        <Block>
+          <NoteHeader num="01" title="TLD grouping in the menubar"/>
+          <P><b>Sectioned, not flat with a column.</b> Developers think per-TLD: <Kbd>.test</Kbd> is their mkcert project, <Kbd>.acme</Kbd> is their plain-http project, <Kbd>.crm</Kbd> is a client. Sectioned reads as "here are my projects, here's what's in each." A flat list with a TLD column sorts hosts alphabetically, which buries that mental model and makes the TLS posture of any given row feel incidental.</P>
+          <P>The flat variant (see Variations) also crowds a ~360pt popover — four columns competing with the hover actions. Section headers double as a place to show the <Kbd>TLS</Kbd> / <Kbd>HTTP</Kbd> badge once per TLD instead of reprinting the scheme semantics beside every row, which we still do for the individual cert state (pending / error).</P>
+        </Block>
+
+        <Block>
+          <NoteHeader num="02" title="Scheme / cert badge treatment"/>
+          <P><b>https + ready</b> is a calm desaturated teal-green — not the iOS system green. Users opted in; they should feel quietly good about it, not alarmed. <b>http</b> is neutral grey — it's the default, not a problem.</P>
+          <P><b>pending</b> and <b>error</b> collapse to the same amber accent, with a 5px dot appended inside the https badge. We don't turn the whole row amber; only the badge shifts. Tooltip on hover carries the actionable copy ("mkcert root CA isn't installed. Run <Kbd>mkcert -install</Kbd>.") — the badge is a tell, the tooltip is the remedy.</P>
+          <P>The happy state avoids feeling alarmist because the only always-visible status color is the header's connected dot, which is small and surrounded by generous whitespace. No row has a red pixel in the resting state.</P>
+        </Block>
+
+        <Block>
+          <NoteHeader num="03" title="Disconnected state — dim vs hide"/>
+          <P><b>Dim.</b> The variations board ships both; we pick dim because when the daemon drops (often right after a macOS update or a container restart), developers want to <i>see what was there</i> so they know which services will come back. Hiding the list leaks information.</P>
+          <P>The dim treatment reduces opacity to 45%, desaturates, and disables pointer events. Hover actions are gone (no useful copy/trash in this state). The Start-daemon CTA sits above the dimmed list as the clear next step.</P>
+          <P>Hide-mode is the fallback if the entry list has hundreds of rows and scrolling past them to reach Start feels disrespectful — but at that point the user has bigger problems than our UX.</P>
+        </Block>
+
+        <Block>
+          <NoteHeader num="04" title="Menubar vs window split"/>
+          <P><b>Menubar = glance + two mutations.</b> Seeing what's mapped, adding a one-off static entry, removing a stale one. Everything single-row.</P>
+          <P><b>Window = manage TLDs and certs.</b> These mutations touch <Kbd>/etc/resolver/</Kbd>, require sudo, and have blast radius (a bad <Kbd>.dev</Kbd> registration can eat all web browsing). They need the space to show warnings, advisory copy, and cert health. Putting them behind the "Open window…" link also keeps the menubar's cognitive surface small — the popover stays 4 interactions, forever.</P>
+          <P>Filter / sort / batch-remove live in the window too — there's no meaningful filter at 7 rows, and the keyboard-heavy devs we're building for will be happier with a real <Kbd>Table</Kbd> and <Kbd>⌘F</Kbd> than inventing a filter pill in the popover.</P>
+        </Block>
+
+        <Block>
+          <NoteHeader num="05" title="certStatus in the IPC protocol?"/>
+          <P><b>Add it.</b> Right now we'd derive it from "does the cert file exist on disk?" — which is cheap but subtly wrong. A file can exist and be expired, issued against the old CA after a <Kbd>mkcert -install</Kbd> re-run, or be mid-write. The daemon already owns the cert lifecycle; it's the correct source of truth.</P>
+          <P>Proposal: extend the <Kbd>ListEntries</Kbd> response with <Kbd>certStatus</Kbd> = <Kbd>.none</Kbd> | <Kbd>.ready</Kbd> | <Kbd>.pending</Kbd> | <Kbd>.error(string)</Kbd>, computed daemon-side as part of TLS issuance. Reserve the error string for actionable hints only (e.g. "CA not installed", "mkcert binary missing"). UI stays dumb; tooltip copy comes from the daemon.</P>
+          <P>Fallback for this design cycle: UI-derives <Kbd>.ready</Kbd> / <Kbd>.none</Kbd> from disk, and shows <Kbd>.pending</Kbd> only during the brief window after <Kbd>AddStatic</Kbd> returns and before the file appears. No <Kbd>.error</Kbd> until the protocol change lands.</P>
+        </Block>
+
+        <Block>
+          <NoteHeader num="06" title="Three things to warn you about if you shipped this"/>
+          <P><b>1. The Start-daemon admin flow is fragile.</b> <Kbd>NSAppleScript</Kbd> → <Kbd>do shell script with administrator privileges</Kbd> pops a native dialog, but if the user declines once, AppleScript caches the decision for the app session. Add an explicit "Try again" state with instructions for running the <Kbd>launchctl</Kbd> command manually, otherwise users get stuck in a loop of clicking Start and nothing happening.</P>
+          <P><b>2. TLS badges lie by design.</b> A green <Kbd>https</Kbd> badge means "we issued a cert," not "the browser will trust it." If the user's browser profile didn't pick up the mkcert root CA (Firefox uses its own store), the URL bar goes red even though our UI looks happy. Decide whether to: (a) probe browser stores, (b) add a browser-specific copy line to the cert-health panel, or (c) just document it.</P>
+          <P><b>3. "Sectioned by TLD" scales badly past ~6 TLDs.</b> I've designed for 2–4, and the window pane handles 4+ fine. If a user ends up with 12 TLDs in the menubar we should collapse them to "recents" + search, not keep stacking headers. Watch usage; add collapse when you see the first support thread.</P>
+        </Block>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Tweaks — the host toolbar's "Tweaks" toggle flips a panel that
+// switches the whole canvas between Light and Dark mode, and between
+// "All states" and "Focused single state" views.
+// ─────────────────────────────────────────────────────────────
+const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "mode": "all",
+  "theme": "both",
+  "focusState": "01"
+}/*EDITMODE-END*/;
+
+function TweaksPanel({ settings, onChange, onClose }) {
+  const set = (k, v) => onChange({ ...settings, [k]: v });
+  const Btn = ({ val, cur, onClick, children }) => (
+    <button onClick={onClick} style={{
+      padding: '5px 10px', borderRadius: 5, border: 'none', cursor: 'pointer',
+      background: val === cur ? '#c96442' : 'rgba(0,0,0,0.05)',
+      color: val === cur ? '#fff' : '#1A1816',
+      fontSize: 12, fontWeight: 500, fontFamily: FONTS.ui,
+    }}>{children}</button>
+  );
+  return (
+    <div style={{
+      position: 'fixed', bottom: 16, right: 16, zIndex: 9999,
+      background: '#fff', borderRadius: 10,
+      boxShadow: '0 12px 40px rgba(0,0,0,0.18), 0 0 0 0.5px rgba(0,0,0,0.08)',
+      padding: 14, minWidth: 260, fontFamily: FONTS.ui,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+        <div style={{ fontSize: 13, fontWeight: 600 }}>Tweaks</div>
+        <div style={{ flex: 1 }}/>
+        <button onClick={onClose} style={{ border: 'none', background: 'transparent', cursor: 'pointer', fontSize: 13, color: '#888' }}>×</button>
+      </div>
+      <div style={{ fontSize: 10.5, letterSpacing: 0.4, fontWeight: 600, color: '#888', marginBottom: 4 }}>VIEW</div>
+      <div style={{ display: 'flex', gap: 4, marginBottom: 10 }}>
+        <Btn val="all" cur={settings.mode} onClick={() => set('mode', 'all')}>All states</Btn>
+        <Btn val="focus" cur={settings.mode} onClick={() => set('mode', 'focus')}>Focus one</Btn>
+      </div>
+      <div style={{ fontSize: 10.5, letterSpacing: 0.4, fontWeight: 600, color: '#888', marginBottom: 4 }}>THEME</div>
+      <div style={{ display: 'flex', gap: 4, marginBottom: 10, flexWrap: 'wrap' }}>
+        <Btn val="both" cur={settings.theme} onClick={() => set('theme', 'both')}>Both</Btn>
+        <Btn val="light" cur={settings.theme} onClick={() => set('theme', 'light')}>Light</Btn>
+        <Btn val="dark" cur={settings.theme} onClick={() => set('theme', 'dark')}>Dark</Btn>
+      </div>
+      {settings.mode === 'focus' && (
+        <>
+          <div style={{ fontSize: 10.5, letterSpacing: 0.4, fontWeight: 600, color: '#888', marginBottom: 4 }}>STATE</div>
+          <select value={settings.focusState} onChange={e => set('focusState', e.target.value)}
+            style={{ width: '100%', padding: '5px 8px', borderRadius: 5, border: '1px solid #ddd', fontFamily: FONTS.ui, fontSize: 12 }}>
+            <option value="01">01 · Happy path</option>
+            <option value="02">02 · Empty + connected</option>
+            <option value="03">03 · Disconnected</option>
+            <option value="04">04 · Starting</option>
+            <option value="05">05 · Add form + TLD error</option>
+            <option value="06">06 · Hover + cert error</option>
+            <option value="07">07 · Entries pane</option>
+            <option value="08">08 · TLDs pane</option>
+            <option value="09">09 · Add TLD advisory</option>
+            <option value="10">10 · About pane</option>
+          </select>
+        </>
+      )}
+    </div>
+  );
+}
+
+function Root() {
+  const [settings, setSettings] = React.useState(TWEAK_DEFAULTS);
+  const [tweaksOpen, setTweaksOpen] = React.useState(false);
+
+  React.useEffect(() => {
+    const handler = (ev) => {
+      if (ev.data?.type === '__activate_edit_mode') setTweaksOpen(true);
+      if (ev.data?.type === '__deactivate_edit_mode') setTweaksOpen(false);
+    };
+    window.addEventListener('message', handler);
+    window.parent.postMessage({ type: '__edit_mode_available' }, '*');
+    return () => window.removeEventListener('message', handler);
+  }, []);
+
+  const update = (s) => {
+    setSettings(s);
+    window.parent.postMessage({ type: '__edit_mode_set_keys', edits: s }, '*');
+  };
+
+  return (
+    <>
+      <App settings={settings}/>
+      {tweaksOpen && <TweaksPanel settings={settings} onChange={update} onClose={() => setTweaksOpen(false)}/>}
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<Root/>);
+</script>
+</body>
+</html>

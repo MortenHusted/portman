@@ -1,0 +1,53 @@
+[package]
+name = "portman-netbridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# v1 Rust port of chipmk/docker-mac-net-connect. See PHASES.md for the
+# implementation sequence; PLAN.md in repo root for motivation and
+# workflow-safety constraints (Phase A+B+C interleaves with v0 stack,
+# Phase D is the discrete cutover).
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# Shared helpers (user_home, docker_socket_candidates).
+portman-core.workspace = true
+# Phase A.1: PF_ROUTE socket, route_msghdr/if_msghdr, AF_ROUTE constants.
+libc = "0.2"
+# Phase A.2: Docker event stream + container / network inspect.
+bollard.workspace = true
+futures-util.workspace = true
+# Phase B.0: userspace WireGuard (Cloudflare, pure Rust).
+# Re-exports x25519-dalek for keygen. 40k LOC — large compile hit, paid
+# once.
+boringtun = "0.6"
+# Phase B.0: random-key generation for WireGuard static keypairs.
+rand = "0.8"
+# Phase B.1: allocate a `utun` device on macOS and shuttle packets
+# through it. Feature `async` enables tokio integration.
+tun = { version = "0.6", features = ["async"] }
+# Route repair: `if_nametoindex` answers "does this interface still exist?",
+# which is how a stale route pointing at a destroyed utun is recognised.
+nix = { version = "0.29", features = ["net"] }
+
+[lib]
+path = "src/lib.rs"
+
+# This crate is the ONE place in the workspace where `unsafe` is allowed
+# (PF_ROUTE socket parsing, utun ioctls, boringtun FFI). We override the
+# workspace `unsafe_code = "forbid"` to `deny` — still errors on any
+# stray unsafe, but lets individual modules opt-in with a scoped
+# `#![allow(unsafe_code)]` and a comment explaining why. Every other
+# workspace lint stays identical to the root Cargo.toml settings.
+[lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+needless_pass_by_value = "allow"
