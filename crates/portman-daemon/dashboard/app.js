@@ -318,6 +318,23 @@ function stateBadge(state) {
   return `<span class="badge ${esc(s)}">${esc(s || '?')}</span>`;
 }
 
+// Trouble first, then live, stopped last — alphabetical inside each band.
+function stateRank(s) {
+  switch (String(s.state || '').toLowerCase()) {
+    case 'failed': return 0;
+    case 'backoff': return 1;
+    case 'starting': return 2;
+    case 'pending': return 3;
+    case 'ready': return 4;
+    case 'stopped': return 5;
+    default: return 6;
+  }
+}
+
+function byStateThenName(a, b) {
+  return stateRank(a) - stateRank(b) || a.name.localeCompare(b.name);
+}
+
 function renderGroups() {
   const container = el('service-groups');
   const services = visibleServices();
@@ -335,7 +352,12 @@ function renderGroups() {
     }
   }
 
-  for (const [group, members] of [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+  const groupRank = members => Math.min(...members.map(stateRank));
+  const orderedGroups = [...groups.entries()].sort(
+    (a, b) => groupRank(a[1]) - groupRank(b[1]) || a[0].localeCompare(b[0])
+  );
+  for (const [group, members] of orderedGroups) {
+    members.sort(byStateThenName);
     let cpu = 0, mem = 0;
     for (const m of members) {
       const u = gauges.get(m.name);
