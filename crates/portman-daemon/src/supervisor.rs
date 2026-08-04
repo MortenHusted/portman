@@ -447,6 +447,13 @@ struct Inner {
     /// pass the cross-root name-collision check and one would silently
     /// overwrite the other — the exact invariant sync's own bail! asserts.
     sync_gate: tokio::sync::Mutex<()>,
+    /// Serializes snapshot + write in `persist`. The atomic writer makes
+    /// each write all-or-nothing, but two concurrent persists can still
+    /// rename out of snapshot order — the older snapshot lands last and
+    /// silently regresses the file (a spawn's running marker vanished this
+    /// way under CI load). Held across snapshot AND write so renames happen
+    /// in snapshot order.
+    persist_gate: std::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -478,6 +485,7 @@ impl Supervisor {
                 secrets: Mutex::new(BTreeMap::new()),
                 shutdown_tx,
                 sync_gate: tokio::sync::Mutex::new(()),
+                persist_gate: std::sync::Mutex::new(()),
             }),
         }
     }
@@ -1729,6 +1737,8 @@ fn load_persisted(path: &Path) -> Result<Persisted> {
 }
 
 fn persist(inner: &Arc<Inner>) {
+    // See Inner::persist_gate — snapshot and write as one ordered unit.
+    let _gate = inner.persist_gate.lock().expect("persist gate poisoned");
     let persisted = {
         let slots = inner.slots.lock().expect("slots lock poisoned");
         let secrets = inner.secrets.lock().expect("secrets lock poisoned");
