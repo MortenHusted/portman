@@ -18,8 +18,8 @@ portman exists because OrbStack's networking is genuinely nice, and I wanted tho
 ### Containers
 
 ```bash
-git clone https://github.com/MortenHusted/portman && cd portman
-portman install            # builds release binaries, installs the launchd daemon (sudo)
+brew install MortenHusted/tap/portman
+portman install            # wires up the system daemon (sudo)
 portman tld add test       # manage the .test TLD (writes /etc/resolver/test)
 portman bridge mode docker && portman bridge enable   # macOS: route container IPs
 
@@ -54,12 +54,25 @@ portman down        # stop the repo's stack
 
 ## Install
 
-Prereqs: a Rust toolchain (`rustup`, or [mise](https://mise.jdx.dev) — the repo pins one via `mise install`), a Docker runtime if you want container routing, and [`mkcert`](https://github.com/FiloSottile/mkcert) if you want local TLS.
+Three ways to get the binaries; all of them are followed by `portman install`, which wires up the system service (a root LaunchDaemon on macOS, a systemd unit on Linux). `portman install` works from installed binaries — no checkout needed.
+
+```bash
+# Homebrew (macOS and Linux)
+brew install MortenHusted/tap/portman
+
+# Shell installer
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/MortenHusted/portman/releases/latest/download/portman-installer.sh | sh
+
+# From source (needs a Rust toolchain — rustup, or mise via `mise install`)
+git clone https://github.com/MortenHusted/portman && cd portman && cargo build --release -p portman
+```
+
+Optional extras: a Docker runtime if you want container routing, and [`mkcert`](https://github.com/FiloSottile/mkcert) if you want local TLS.
 
 ### macOS
 
 ```bash
-portman install          # builds binaries, installs a root LaunchDaemon, builds the bridge setup image
+portman install          # installs binaries + root LaunchDaemon, builds the bridge setup image
 portman tld add test
 portman dashboard        # opens http://127.0.0.1:7341
 ```
@@ -76,7 +89,7 @@ sudo portman tld add test
 portman dashboard
 ```
 
-TLD registration writes a portman-managed drop-in under `/etc/systemd/resolved.conf.d/` and restarts `systemd-resolved` (reload does not re-read drop-ins). CI runs an end-to-end job on Ubuntu (install, resolved integration, proxy, service runner, container routing), but Linux has had much less real-world use than macOS. Expect rough edges and please file what you hit.
+TLD registration writes a portman-managed drop-in under `/etc/systemd/resolved.conf.d/` and restarts `systemd-resolved` (reload does not re-read drop-ins). There's a step-by-step walkthrough in [`docs/install-linux.md`](./docs/install-linux.md). CI runs an end-to-end job on Ubuntu (install, resolved integration, proxy, service runner, container routing), but Linux has had much less real-world use than macOS. Expect rough edges and please file what you hit.
 
 ## Security model
 

@@ -414,16 +414,16 @@ pub(crate) fn parse_route_get_interface(stdout: &str) -> Option<String> {
     })
 }
 
-pub(crate) fn setup_image_build_command(repo: &Path) -> SetupImageBuildCommand {
+pub(crate) fn setup_image_build_command(context_dir: &Path) -> SetupImageBuildCommand {
     SetupImageBuildCommand {
         program: "docker".to_string(),
         args: vec![
             "build".to_string(),
             "-t".to_string(),
             SETUP_IMAGE.to_string(),
-            "crates/portman-netbridge/setup-image".to_string(),
+            ".".to_string(),
         ],
-        current_dir: repo.to_path_buf(),
+        current_dir: context_dir.to_path_buf(),
     }
 }
 
@@ -829,19 +829,18 @@ destination: 172.18.0.0
     }
 
     #[test]
-    fn setup_image_build_command_uses_repo_setup_image_context() {
-        let cmd = setup_image_build_command(Path::new("/Users/dev/projects/portman"));
-
+    fn setup_image_build_command_builds_from_the_given_context_dir() {
+        let cmd = setup_image_build_command(Path::new("/tmp/portman-setup-image"));
         assert_eq!(cmd.program, "docker");
         assert_eq!(
             cmd.args,
             vec![
-                "build",
-                "-t",
-                SETUP_IMAGE,
-                "crates/portman-netbridge/setup-image"
+                "build".to_string(),
+                "-t".to_string(),
+                SETUP_IMAGE.to_string(),
+                ".".to_string(),
             ]
         );
-        assert_eq!(cmd.current_dir, Path::new("/Users/dev/projects/portman"));
+        assert_eq!(cmd.current_dir, Path::new("/tmp/portman-setup-image"));
     }
 }

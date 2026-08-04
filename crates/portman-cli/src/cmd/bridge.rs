@@ -1,9 +1,9 @@
 //! Netbridge commands: status, enable/disable, mode, prepare, doctor.
 
 use crate::client::{bridge_enabled, wait_for_bridge_state};
-use crate::cmd::{locate_repo_root, run_setup_image_build};
+use crate::cmd::run_setup_image_build;
 use crate::doctor;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use portman_protocol::NetbridgeMode;
 use tokio::time::{sleep, Duration};
 
@@ -115,9 +115,8 @@ pub(crate) async fn cmd_bridge_mode(mode: Option<String>) -> Result<()> {
 }
 
 pub(crate) async fn cmd_bridge_prepare() -> Result<()> {
-    let repo = locate_repo_root().context("locating portman repo root")?;
-    eprintln!("building netbridge setup image from {}", repo.display());
-    run_setup_image_build(&repo)?;
+    eprintln!("building netbridge setup image from the embedded context…");
+    run_setup_image_build()?;
     println!("netbridge setup image ready: {}", doctor::SETUP_IMAGE);
     Ok(())
 }

@@ -17,29 +17,54 @@ pub(crate) async fn cmd_install() -> Result<()> {
     return cmd_install_linux().await;
 }
 
+/// Where the binaries to install come from. In a checkout, build them
+/// fresh; otherwise (brew, shell installer, a downloaded tarball) install
+/// the very binaries we're running from — `portman-daemon` must sit next
+/// to the running `portman`.
+fn resolve_install_sources() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    if let Ok(repo) = locate_repo_root() {
+        eprintln!("using repo: {}", repo.display());
+        let install_target_dir = repo.join("target/portman-install");
+        eprintln!("building release binaries…");
+        run(&mut release_build_command(&repo, &install_target_dir))?;
+        let daemon_src = install_target_dir.join("release/portman-daemon");
+        let cli_src = install_target_dir.join("release/portman");
+        for p in [&daemon_src, &cli_src] {
+            if !p.exists() {
+                bail!("expected build output missing: {}", p.display());
+            }
+        }
+        return Ok((daemon_src, cli_src));
+    }
+    let cli_src = std::env::current_exe().context("resolving the running portman binary")?;
+    let daemon_src = cli_src
+        .parent()
+        .context("running binary has no parent directory")?
+        .join("portman-daemon");
+    if !daemon_src.exists() {
+        bail!(
+            "not inside a portman checkout, and no portman-daemon next to {} — \
+             install prebuilt binaries (brew or the shell installer) or run from a checkout",
+            cli_src.display()
+        );
+    }
+    eprintln!(
+        "installing from prebuilt binaries at {}",
+        cli_src.parent().unwrap().display()
+    );
+    Ok((daemon_src, cli_src))
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) async fn cmd_install_macos() -> Result<()> {
     use crate::cmd::run_setup_image_build;
     use portman_core::launchd::{daemon_plist, DAEMON_LABEL, DAEMON_PLIST_PATH};
     use portman_core::paths::user_home;
 
-    let repo = locate_repo_root().context("locating portman repo root")?;
-    eprintln!("using repo: {}", repo.display());
-    let install_target_dir = repo.join("target/portman-install");
-
-    eprintln!("building release binaries…");
-    run(&mut release_build_command(&repo, &install_target_dir))?;
+    let (daemon_src, cli_src) = resolve_install_sources()?;
 
     eprintln!("building netbridge setup image…");
-    run_setup_image_build(&repo)?;
-
-    let daemon_src = install_target_dir.join("release/portman-daemon");
-    let cli_src = install_target_dir.join("release/portman");
-    for p in [&daemon_src, &cli_src] {
-        if !p.exists() {
-            bail!("expected build output missing: {}", p.display());
-        }
-    }
+    run_setup_image_build()?;
 
     install_binaries(&daemon_src, &cli_src)?;
 
@@ -90,20 +115,7 @@ pub(crate) async fn cmd_install_macos() -> Result<()> {
 pub(crate) async fn cmd_install_linux() -> Result<()> {
     use portman_core::systemd::{daemon_unit, DAEMON_UNIT_PATH};
 
-    let repo = locate_repo_root().context("locating portman repo root")?;
-    eprintln!("using repo: {}", repo.display());
-    let install_target_dir = repo.join("target/portman-install");
-
-    eprintln!("building release binaries…");
-    run(&mut release_build_command(&repo, &install_target_dir))?;
-
-    let daemon_src = install_target_dir.join("release/portman-daemon");
-    let cli_src = install_target_dir.join("release/portman");
-    for p in [&daemon_src, &cli_src] {
-        if !p.exists() {
-            bail!("expected build output missing: {}", p.display());
-        }
-    }
+    let (daemon_src, cli_src) = resolve_install_sources()?;
 
     install_binaries(&daemon_src, &cli_src)?;
 

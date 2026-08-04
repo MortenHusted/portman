@@ -50,8 +50,24 @@ pub(crate) fn run_sudo(argv: &[&str]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn run_setup_image_build(repo: &std::path::Path) -> Result<()> {
-    let spec = doctor::setup_image_build_command(repo);
+/// Build the netbridge setup image from a context embedded in this binary
+/// at compile time (include_str! of the repo files), so the image is always
+/// exactly the one this build expects — and no repo checkout is needed.
+/// A brew- or installer-delivered binary can build it just the same.
+pub(crate) fn run_setup_image_build() -> Result<()> {
+    let dir = std::env::temp_dir().join("portman-setup-image");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::write(
+        dir.join("Dockerfile"),
+        include_str!("../../../portman-netbridge/setup-image/Dockerfile"),
+    )
+    .context("writing embedded Dockerfile")?;
+    std::fs::write(
+        dir.join("entrypoint.sh"),
+        include_str!("../../../portman-netbridge/setup-image/entrypoint.sh"),
+    )
+    .context("writing embedded entrypoint.sh")?;
+    let spec = doctor::setup_image_build_command(&dir);
     let mut cmd = StdCommand::new(&spec.program);
     cmd.args(&spec.args).current_dir(&spec.current_dir);
     run(&mut cmd).with_context(|| format!("building {}", doctor::SETUP_IMAGE))
