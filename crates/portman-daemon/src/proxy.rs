@@ -522,6 +522,7 @@ mod tests {
             source: Source::Static,
             mode,
             container_id: None,
+            project: None,
         }
     }
 
@@ -637,6 +638,7 @@ mod tests {
             source: Source::Service,
             mode: Mode::Http,
             container_id: None,
+            project: None,
         });
         let proxy_addr = proxy_once(registry, StubStarter::inert()).await;
 

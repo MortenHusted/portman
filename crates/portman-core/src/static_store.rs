@@ -28,6 +28,9 @@ struct Rule {
     /// `StartService` for hosts whose process isn't a Docker container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     service: Option<String>,
+    /// Project tag for UI grouping/filtering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
 }
 
 /// On-disk schema. `version` lets us migrate without breaking reads — the
@@ -83,13 +86,13 @@ impl StaticStore {
     }
 
     /// Current rules as `(host, target, mode)` tuples, host-sorted.
-    pub fn list(&self) -> Vec<(String, String, Mode)> {
+    pub fn list(&self) -> Vec<(String, String, Mode, Option<String>)> {
         self.state
             .lock()
             .expect("static store lock poisoned")
             .entries
             .iter()
-            .map(|(h, r)| (h.clone(), r.target.clone(), r.mode))
+            .map(|(h, r)| (h.clone(), r.target.clone(), r.mode, r.project.clone()))
             .collect()
     }
 
@@ -102,6 +105,7 @@ impl StaticStore {
         target: String,
         mode: Mode,
         service: Option<String>,
+        project: Option<String>,
     ) -> Result<Option<(String, Mode)>> {
         // Mutate a clone, persist it, then swap — if the disk write fails,
         // memory keeps matching disk instead of silently diverging until the
@@ -116,6 +120,7 @@ impl StaticStore {
                     target,
                     mode,
                     service,
+                    project,
                 },
             )
             .map(|r| (r.target, r.mode));
@@ -124,14 +129,14 @@ impl StaticStore {
         Ok(prev)
     }
 
-    /// The rule for `host`, if any, as `(target, mode)`.
-    pub fn get(&self, host: &str) -> Option<(String, Mode)> {
+    /// The rule for `host`, if any, as `(target, mode, project)`.
+    pub fn get(&self, host: &str) -> Option<(String, Mode, Option<String>)> {
         self.state
             .lock()
             .expect("static store lock poisoned")
             .entries
             .get(host)
-            .map(|r| (r.target.clone(), r.mode))
+            .map(|r| (r.target.clone(), r.mode, r.project.clone()))
     }
 
     /// The service-runner mapping for `host`, if its rule has one.
@@ -176,6 +181,7 @@ fn parse_persisted(bytes: &[u8]) -> Result<Persisted> {
                         target: t,
                         mode: Mode::Http,
                         service: None,
+                        project: None,
                     },
                 )
             })
@@ -291,18 +297,24 @@ mod tests {
         assert!(store.list().is_empty());
 
         store
-            .add("crm.acme".into(), "127.0.0.1:3070".into(), Mode::Http, None)
+            .add(
+                "crm.acme".into(),
+                "127.0.0.1:3070".into(),
+                Mode::Http,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(
             store.list(),
-            vec![("crm.acme".into(), "127.0.0.1:3070".into(), Mode::Http)]
+            vec![("crm.acme".into(), "127.0.0.1:3070".into(), Mode::Http, None)]
         );
 
         // Reload and confirm persistence.
         let store2 = StaticStore::load(path.clone()).unwrap();
         assert_eq!(
             store2.list(),
-            vec![("crm.acme".into(), "127.0.0.1:3070".into(), Mode::Http)]
+            vec![("crm.acme".into(), "127.0.0.1:3070".into(), Mode::Http, None)]
         );
 
         let removed = store2.remove("crm.acme").unwrap();
@@ -315,15 +327,27 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = StaticStore::load(dir.path().join("static.json")).unwrap();
         store
-            .add("a.test".into(), "10.0.0.1:80".into(), Mode::Http, None)
+            .add(
+                "a.test".into(),
+                "10.0.0.1:80".into(),
+                Mode::Http,
+                None,
+                None,
+            )
             .unwrap();
         let prev = store
-            .add("a.test".into(), "10.0.0.2:80".into(), Mode::Http, None)
+            .add(
+                "a.test".into(),
+                "10.0.0.2:80".into(),
+                Mode::Http,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(prev, Some(("10.0.0.1:80".into(), Mode::Http)));
         assert_eq!(
             store.list(),
-            vec![("a.test".into(), "10.0.0.2:80".into(), Mode::Http)]
+            vec![("a.test".into(), "10.0.0.2:80".into(), Mode::Http, None)]
         );
     }
 
@@ -340,13 +364,19 @@ mod tests {
         let path = dir.path().join("static.json");
         let store = StaticStore::load(path.clone()).unwrap();
         store
-            .add("db.acme".into(), "172.17.0.2:5432".into(), Mode::Tcp, None)
+            .add(
+                "db.acme".into(),
+                "172.17.0.2:5432".into(),
+                Mode::Tcp,
+                None,
+                None,
+            )
             .unwrap();
 
         let store2 = StaticStore::load(path).unwrap();
         assert_eq!(
             store2.list(),
-            vec![("db.acme".into(), "172.17.0.2:5432".into(), Mode::Tcp)]
+            vec![("db.acme".into(), "172.17.0.2:5432".into(), Mode::Tcp, None)]
         );
     }
 
@@ -361,6 +391,7 @@ mod tests {
                 "127.0.0.1:3070".into(),
                 Mode::Http,
                 Some("acme/web".into()),
+                None,
             )
             .unwrap();
 
@@ -369,7 +400,13 @@ mod tests {
         assert_eq!(store2.service_for("other.acme"), None);
 
         store2
-            .add("crm.acme".into(), "127.0.0.1:3070".into(), Mode::Http, None)
+            .add(
+                "crm.acme".into(),
+                "127.0.0.1:3070".into(),
+                Mode::Http,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(store2.service_for("crm.acme"), None);
     }
@@ -393,7 +430,7 @@ mod tests {
         let store = StaticStore::load(path).unwrap();
         assert_eq!(
             store.list(),
-            vec![("old.test".into(), "127.0.0.1:3000".into(), Mode::Http)]
+            vec![("old.test".into(), "127.0.0.1:3000".into(), Mode::Http, None)]
         );
     }
 

@@ -215,6 +215,7 @@ impl RouteSink for RouteBinder {
             source: portman_protocol::Source::Service,
             mode: def.mode,
             container_id: None,
+            project: def.project.clone(),
         });
         if def.mode == portman_protocol::Mode::Http
             && crate::certs::tls_enabled_for_host(&self.tls_store, host)
@@ -240,13 +241,14 @@ impl RouteSink for RouteBinder {
         // static rule — re-seed it instead of silently unrouting the
         // fallback (mirrors main's seed_from_static_store).
         match self.static_store.get(host) {
-            Some((target, mode)) => {
+            Some((target, mode, project)) => {
                 self.registry.upsert(portman_protocol::Entry {
                     host: host.clone(),
                     target,
                     source: portman_protocol::Source::Static,
                     mode,
                     container_id: None,
+                    project,
                 });
                 info!(service = %def.name, %host, "service route released; static rule re-seeded");
             }
@@ -1717,29 +1719,13 @@ fn persist(inner: &Arc<Inner>) {
 /// Atomic-rename write, 0600 (the inline env of a personal config may carry
 /// sensitive values; same trust posture as the credentials store).
 fn write_persisted(path: &Path, persisted: &Persisted) -> Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(persisted)?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)
-        .with_context(|| format!("creating temp file {}", tmp.display()))?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
+    // Through the shared atomic writer: persist() fires on every state
+    // change, and this fn's old fixed `services.json.tmp` name meant two
+    // concurrent persists clobbered each other's tempfile — one renamed it
+    // away, the other's rename ENOENTed (or worse, won with a stale
+    // snapshot). The exact bug class 2.2 fixed in the core stores; this
+    // copy was missed. 0600: the state embeds service environments.
+    portman_core::atomic_json::atomic_write_json_with_mode(path, persisted, 0o600)
 }
 
 #[cfg(test)]
@@ -2953,6 +2939,7 @@ mod tests {
                 "127.0.0.1:9080".into(),
                 portman_protocol::Mode::Http,
                 None,
+                None,
             )
             .unwrap();
         registry.upsert(portman_protocol::Entry {
@@ -2961,6 +2948,7 @@ mod tests {
             source: portman_protocol::Source::Static,
             mode: portman_protocol::Mode::Http,
             container_id: None,
+            project: None,
         });
 
         let svc = routed_def("web", "web.internal", 34568, dir.path());

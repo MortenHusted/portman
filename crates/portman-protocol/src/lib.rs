@@ -207,6 +207,9 @@ pub enum Request {
         /// the process manager instead of Docker. Absent = no mapping.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         service: Option<String>,
+        /// Project tag for UI grouping/filtering. Absent = no project.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
     },
     RemoveStatic {
         host: String,
@@ -493,6 +496,11 @@ pub struct Entry {
     /// Short Docker container id for `Source::Container` entries; `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
+    /// Project tag: from `portman add --project` on static rules, the
+    /// `dev.portman.project` label on containers, or the owning config
+    /// file's `project` on service-derived routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 /// One row of the TldList response.

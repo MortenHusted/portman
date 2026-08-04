@@ -94,6 +94,7 @@ async fn handle_event(docker: &Docker, state: &DaemonState, msg: EventMessage) {
                         source: Source::Container,
                         mode,
                         container_id: Some(short(id).to_string()),
+                        project: project_label(actor),
                     };
                     registry.upsert(entry);
                     if mode == Mode::Http && state.host_tls_enabled(&host) {
@@ -128,6 +129,15 @@ async fn handle_event(docker: &Docker, state: &DaemonState, msg: EventMessage) {
         }
         _ => {}
     }
+}
+
+fn project_label(actor: &EventActor) -> Option<String> {
+    actor
+        .attributes
+        .as_ref()?
+        .get("dev.portman.project")
+        .cloned()
+        .filter(|v| !v.is_empty())
 }
 
 fn host_label(actor: &EventActor) -> Option<String> {

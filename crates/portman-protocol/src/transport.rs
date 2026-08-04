@@ -93,6 +93,7 @@ mod tests {
                 source: Source::Container,
                 mode: Mode::Http,
                 container_id: Some("abc123".into()),
+                project: None,
             }],
         };
         write_response(&mut a, &resp).await.unwrap();

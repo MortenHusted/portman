@@ -493,6 +493,7 @@ async fn handle_add_static(stream: TcpStream, state: DaemonState, body: &[u8]) -
                 target: parsed.target,
                 mode,
                 service: parsed.service.filter(|s| !s.trim().is_empty()),
+                project: None,
             },
             &state,
         )

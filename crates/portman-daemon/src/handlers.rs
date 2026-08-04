@@ -17,7 +17,8 @@ pub(crate) async fn dispatch(request: Request, state: &DaemonState) -> Response 
             target,
             mode,
             service,
-        } => handle_add(state, host, target, mode, service),
+            project,
+        } => handle_add(state, host, target, mode, service, project),
         Request::RemoveStatic { host } => handle_remove(state, host),
         Request::StartService { host } => handle_start_service(state, host).await,
         Request::TldList => Response::Tlds {
@@ -350,6 +351,7 @@ fn handle_add(
     target: String,
     mode: Mode,
     service: Option<String>,
+    project: Option<String>,
 ) -> Response {
     use portman_core::static_store::{validate_host, validate_service, validate_target};
     use portman_core::{Entry, Source};
@@ -387,9 +389,10 @@ fn handle_add(
         ));
     }
 
-    if let Err(e) = state
-        .static_store
-        .add(host.clone(), target.clone(), mode, service)
+    if let Err(e) =
+        state
+            .static_store
+            .add(host.clone(), target.clone(), mode, service, project.clone())
     {
         return err(format!("persisting static rule: {e:#}"));
     }
@@ -399,6 +402,7 @@ fn handle_add(
         source: Source::Static,
         mode,
         container_id: None,
+        project,
     });
     if mode == Mode::Http && state.host_tls_enabled(&host) {
         if let Err(err) = state.cert_manager.ensure(&host) {
@@ -637,6 +641,7 @@ mod tests {
                 target: "127.0.0.1:3070".into(),
                 mode: Mode::Http,
                 service: None,
+                project: None,
             },
             &state,
         )
@@ -663,6 +668,7 @@ mod tests {
                 target: "127.0.0.1:5432".into(),
                 mode: Mode::Tcp,
                 service: None,
+                project: None,
             },
             &state,
         )

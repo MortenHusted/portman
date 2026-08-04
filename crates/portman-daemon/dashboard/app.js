@@ -78,6 +78,20 @@ function visibleContainers() {
   return projectFilter ? containers.filter(c => containerProjectOf(c) === projectFilter) : containers;
 }
 
+// An entry belongs to a project via its own tag (portman add --project,
+// container label, owning config file) or via its backing service/container.
+function visibleEntries() {
+  if (!projectFilter) return allEntries;
+  const owned = new Set();
+  for (const s of visibleServices()) if (s.host) owned.add(String(s.host).toLowerCase());
+  for (const c of visibleContainers()) {
+    for (const h of (c.portman_hosts || [])) owned.add(String(h).toLowerCase());
+  }
+  return allEntries.filter(
+    e => e.project === projectFilter || owned.has(String(e.host).toLowerCase())
+  );
+}
+
 function setProjectFilter(name) {
   projectFilter = name;
   localStorage.setItem('portman.projectFilter', name);
@@ -259,15 +273,7 @@ function renderKpis() {
   el('kpi-containers').textContent = containerCount;
   el('kpi-containers-note').textContent = containerCount ? 'running' : '';
 
-  // Hostnames belong to a project through their backing service or
-  // container; static/wildcard rules with no live owner count under All.
-  let entries = allEntries;
-  if (projectFilter) {
-    const owned = new Set();
-    for (const s of services) if (s.host) owned.add(String(s.host).toLowerCase());
-    for (const c of ctrs) for (const h of (c.portman_hosts || [])) owned.add(String(h).toLowerCase());
-    entries = allEntries.filter(e => owned.has(String(e.host).toLowerCase()));
-  }
+  const entries = visibleEntries();
   el('kpi-hosts').textContent = entries.length;
   const wildcards = entries.filter(e => e.host.startsWith('*.')).length;
   el('kpi-hosts-note').textContent =
@@ -963,6 +969,7 @@ function schemeForHost(host) {
 }
 
 function renderRoutes() {
+  const allEntries = visibleEntries();
   const filter = el('entries-filter').value.trim().toLowerCase();
   const entries = [...allEntries].sort((a, b) => a.host.localeCompare(b.host));
   const shown = filter

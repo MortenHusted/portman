@@ -277,6 +277,7 @@ mod tests {
                 "127.0.0.1:39997".into(),
                 portman_core::Mode::Http,
                 Some("legacy/web".into()),
+                None,
             )
             .unwrap();
 

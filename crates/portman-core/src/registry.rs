@@ -150,6 +150,7 @@ mod tests {
             source: Source::Container,
             mode: portman_protocol::Mode::Http,
             container_id: Some(id.into()),
+            project: None,
         }
     }
 
@@ -199,6 +200,7 @@ mod tests {
             source: Source::Static,
             mode: portman_protocol::Mode::Http,
             container_id: None,
+            project: None,
         }
     }
 

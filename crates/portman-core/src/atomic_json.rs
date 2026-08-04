@@ -20,6 +20,16 @@ use serde::Serialize;
 
 /// Serialize `value` as pretty JSON and atomically replace `path` with it.
 pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    atomic_write_json_impl(path, value, None)
+}
+
+/// Same, but the file is created with `mode` (e.g. 0o600 for state that
+/// embeds service environments).
+pub fn atomic_write_json_with_mode<T: Serialize>(path: &Path, value: &T, mode: u32) -> Result<()> {
+    atomic_write_json_impl(path, value, Some(mode))
+}
+
+fn atomic_write_json_impl<T: Serialize>(path: &Path, value: &T, mode: Option<u32>) -> Result<()> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     let parent = path.parent().context("target path has no parent")?;
@@ -37,7 +47,13 @@ pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
     let bytes = serde_json::to_vec_pretty(value)?;
     let result = (|| -> Result<()> {
-        let mut file = fs::File::create(&tmp)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        if let Some(mode) = mode {
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
+        }
+        let mut file = options
+            .open(&tmp)
             .with_context(|| format!("creating temp file {}", tmp.display()))?;
         file.write_all(&bytes)?;
         file.sync_all()?;
@@ -98,5 +114,15 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(matches!(parsed["v"].as_u64(), Some(1 | 2)));
+    }
+
+    #[test]
+    fn with_mode_sets_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        atomic_write_json_with_mode(&path, &serde_json::json!({"k": 1}), 0o600).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

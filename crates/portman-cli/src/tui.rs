@@ -777,6 +777,7 @@ async fn mutate_add_entry(host: &str, target: &str, mode: Mode) -> Result<()> {
         target: target.to_string(),
         mode,
         service: None,
+        project: None,
     })
     .await?;
     match resp {

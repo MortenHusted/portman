@@ -58,6 +58,9 @@ enum Command {
         /// Start button — a pitchfork daemon id like `acme/web`.
         #[arg(long, value_name = "ID")]
         service: Option<String>,
+        /// Project tag for dashboard grouping/filtering (e.g. `acme`).
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
     },
     /// Remove a static host rule.
     Remove {
@@ -246,7 +249,8 @@ async fn main() -> Result<()> {
             target,
             tcp,
             service,
-        } => cmd_add(host, target, tcp, service).await,
+            project,
+        } => cmd_add(host, target, tcp, service, project).await,
         Command::Remove { host } => cmd_remove(host).await,
         Command::Start { host } => cmd_start(host).await,
         Command::Up { names } => cmd_up(names).await,
@@ -403,7 +407,13 @@ fn print_resource_row(row: &ContainerResourceUsage) {
     }
 }
 
-async fn cmd_add(host: String, target: String, tcp: bool, service: Option<String>) -> Result<()> {
+async fn cmd_add(
+    host: String,
+    target: String,
+    tcp: bool,
+    service: Option<String>,
+    project: Option<String>,
+) -> Result<()> {
     let mode = if tcp { Mode::Tcp } else { Mode::Http };
     let added_host = host.clone();
     let resp = request(Request::AddStatic {
@@ -411,6 +421,7 @@ async fn cmd_add(host: String, target: String, tcp: bool, service: Option<String
         target,
         mode,
         service,
+        project,
     })
     .await?;
     match resp {

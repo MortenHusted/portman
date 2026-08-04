@@ -237,6 +237,7 @@ mod tests {
             source: Source::Static,
             mode,
             container_id: None,
+            project: None,
         }
     }
 

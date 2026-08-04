@@ -475,7 +475,7 @@ fn seed_from_static_store(state: &DaemonState) {
     let rules = state.static_store.list();
     let mut seeded = 0usize;
     let mut skipped = 0usize;
-    for (host, target, mode) in rules {
+    for (host, target, mode, project) in rules {
         if !state.host_tld_is_managed(&host) {
             warn!(%host, "skipping static rule: TLD is not managed; run `portman tld add <tld>` first");
             skipped += 1;
@@ -487,6 +487,7 @@ fn seed_from_static_store(state: &DaemonState) {
             source: Source::Static,
             mode,
             container_id: None,
+            project,
         });
         seeded += 1;
     }
@@ -569,6 +570,12 @@ async fn seed_from_running_containers(docker: &Docker, state: &DaemonState) {
                         source: Source::Container,
                         mode,
                         container_id: Some(short(id).to_string()),
+                        project: inspect
+                            .config
+                            .as_ref()
+                            .and_then(|c| c.labels.as_ref())
+                            .and_then(|l| l.get("dev.portman.project"))
+                            .cloned(),
                     });
                     seeded += 1;
                 }
