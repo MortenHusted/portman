@@ -227,6 +227,14 @@ mise run dashboard  # open http://127.0.0.1:7341
 
 GitHub Actions runs the same checks on Ubuntu and macOS.
 
+## Authorship
+
+This project is written end to end by LLMs (Claude), evolved gradually over
+long working sessions and dogfooded daily as the author's own dev stack. The
+author directs, reviews, and runs everything; the code, tests, and docs are
+machine-written. Read it with the same skepticism you'd apply to any code —
+the test suite and the CI end-to-end jobs are the receipts.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).

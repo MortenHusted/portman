@@ -218,6 +218,8 @@ pub async fn daemon_main() -> Result<()> {
         "connected to docker"
     );
 
+    ensure_data_dir_owned_by_login_user().context("preparing data dir")?;
+
     let registry = Registry::new();
     // Shared host → loopback-address map: the DNS server answers TCP hosts with
     // their front, and the forwarder binds a listener there. Same handle, so
@@ -469,6 +471,41 @@ fn connect_docker(args: &Args) -> Result<Docker> {
          ~/.docker/run/docker.sock, /var/run/docker.sock. \
          Set PORTMAN_DOCKER_SOCKET or start a runtime (e.g. `colima start`)."
     )
+}
+
+/// The daemon runs as root under launchd/systemd, but the data dir must be
+/// owned by the login user: the IPC socket's group and the peer-credential
+/// gate both derive from this directory's ownership. On a fresh box the
+/// root daemon is the first thing to touch the path — left root-owned,
+/// everything ownership-derived collapses to root-only and the CLI gets
+/// EACCES on the socket (found by the linux-e2e job on its first run).
+/// Only the directory itself is chowned; root-written contents (logs.db,
+/// credentials.json) stay root's.
+fn ensure_data_dir_owned_by_login_user() -> Result<()> {
+    let dir = portman_core::paths::data_dir()?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    if !nix::unistd::geteuid().is_root() {
+        return Ok(());
+    }
+    let Ok(sudo_user) = std::env::var("SUDO_USER") else {
+        return Ok(());
+    };
+    let name = sudo_user.trim();
+    if name.is_empty() {
+        return Ok(());
+    }
+    let Some(user) = nix::unistd::User::from_name(name)
+        .with_context(|| format!("looking up login user {name}"))?
+    else {
+        warn!(
+            user = name,
+            "SUDO_USER does not resolve; data dir stays root-owned"
+        );
+        return Ok(());
+    };
+    std::os::unix::fs::chown(&dir, Some(user.uid.as_raw()), Some(user.gid.as_raw()))
+        .with_context(|| format!("chowning {} to {name}", dir.display()))?;
+    Ok(())
 }
 
 fn seed_from_static_store(state: &DaemonState) {
