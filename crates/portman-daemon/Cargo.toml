@@ -4,12 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 description = "portman daemon: Docker watcher, DNS, HTTP proxy"
-
-[[bin]]
-name = "portman-daemon"
-path = "src/main.rs"
 
 [dependencies]
 portman-core.workspace = true

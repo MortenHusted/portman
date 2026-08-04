@@ -203,8 +203,10 @@ impl DaemonState {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// The daemon's whole entry point. Lives in this lib crate so the single
+/// distributable `portman` package can carry the `portman-daemon` bin as a
+/// thin shim (one brew formula, two binaries).
+pub async fn daemon_main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
 

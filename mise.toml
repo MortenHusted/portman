@@ -55,11 +55,11 @@ run = "sudo -E cargo run -p portman-daemon"
 
 [tasks.cli]
 description = "Run the CLI (pass args after --)"
-run = "cargo run -p portman-cli --"
+run = "cargo run -p portman --"
 
 [tasks.dashboard]
 description = "Open the embedded web dashboard in your browser"
-run = "cargo run -p portman-cli -- dashboard"
+run = "cargo run -p portman -- dashboard"
 
 [tasks.ci]
 description = "Everything CI runs — run before pushing"

@@ -1,18 +1,24 @@
 [package]
-name = "portman-cli"
+name = "portman"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
-description = "portman command-line client"
+description = "portman: local-dev DNS, proxy, and service runner (CLI + daemon)"
 
 [[bin]]
 name = "portman"
 path = "src/main.rs"
 
+[[bin]]
+name = "portman-daemon"
+path = "src/bin/portman-daemon.rs"
+
 [dependencies]
 portman-core.workspace = true
+portman-daemon.workspace = true
 portman-protocol = { workspace = true, features = ["transport"] }
 anyhow.workspace = true
 clap.workspace = true

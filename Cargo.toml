@@ -13,12 +13,14 @@ version = "0.0.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/MortenHusted/portman"
+homepage = "https://github.com/MortenHusted/portman"
 rust-version = "1.78"
 
 [workspace.dependencies]
 portman-core = { path = "crates/portman-core" }
 portman-netbridge = { path = "crates/portman-netbridge" }
 portman-protocol = { path = "crates/portman-protocol" }
+portman-daemon = { path = "crates/portman-daemon" }
 
 anyhow = "1"
 base64 = "0.22"
