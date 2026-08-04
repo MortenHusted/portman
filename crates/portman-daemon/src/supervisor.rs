@@ -2143,7 +2143,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
         sup.up(Some(&["watchy".to_string()])).await.unwrap();
         wait_for_state(&sup, "watchy", StateKind::Ready, Duration::from_secs(20)).await;
-        let first = pid_of(&sup, "watchy").await.expect("running pid");
+        let first = running_pid(&sup, "watchy").await;
 
         touch_next_second(&trigger, "v2").await;
 
@@ -2180,7 +2180,7 @@ mod tests {
         wait_for_state(&sup, "budget", StateKind::Ready, Duration::from_secs(20)).await;
 
         for (i, content) in ["v2", "v3"].iter().enumerate() {
-            let before = pid_of(&sup, "budget").await.expect("running pid");
+            let before = running_pid(&sup, "budget").await;
             touch_next_second(&trigger, content).await;
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
@@ -2281,7 +2281,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
         sup.up(Some(&["late".to_string()])).await.unwrap();
         wait_for_state(&sup, "late", StateKind::Ready, Duration::from_secs(20)).await;
-        let first = pid_of(&sup, "late").await.expect("running pid");
+        let first = running_pid(&sup, "late").await;
 
         std::fs::write(&not_yet_built, "freshly built").unwrap();
 
