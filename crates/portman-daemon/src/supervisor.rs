@@ -308,6 +308,7 @@ pub(crate) struct ServiceStatus {
     pub port: Option<u16>,
     pub desired_up: bool,
     pub groups: Vec<String>,
+    pub project: Option<String>,
 }
 
 /// What `sync` did, for CLI display.
@@ -755,6 +756,7 @@ impl Supervisor {
                     port: slot.def.port,
                     desired_up: *slot.desired_tx.borrow(),
                     groups: slot.def.groups.clone(),
+                    project: slot.def.project.clone(),
                 }
             })
             .collect()
@@ -1826,6 +1828,7 @@ mod tests {
             watch_mode: Default::default(),
             watch_debounce_ms: 500,
             groups: Vec::new(),
+            project: None,
         }
     }
 

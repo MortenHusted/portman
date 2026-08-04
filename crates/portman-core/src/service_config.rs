@@ -102,6 +102,10 @@ fn merge_and_resolve(
             raw.service.insert(name, merged);
         }
         raw.secrets.extend(local.secrets);
+        // Scalar file-level fields: the overlay wins when it speaks.
+        if local.project.is_some() {
+            raw.project = local.project.clone();
+        }
         // File-level groups union across both files — tags are additive, and
         // wholesale-replacing them would silently untag committed services
         // the moment a local overlay exists.
@@ -150,6 +154,11 @@ pub fn load_from_strings(
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    /// File-level project tag, inherited by every service in the file.
+    /// One project per config file — a project that spans repos repeats the
+    /// same name in each file.
+    #[serde(default)]
+    project: Option<String>,
     /// File-level group tags, applied to every service in the file. Unioned
     /// with each service's own `groups` — tags are additive, so repeating one
     /// on five services is exactly the tedium this form removes.
@@ -296,12 +305,22 @@ fn resolve(root: &Path, raw: RawConfig) -> Result<ServiceConfig> {
     for tag in &raw.groups {
         validate_group_tag(tag).context("in file-level `groups`")?;
     }
+    if let Some(project) = &raw.project {
+        validate_group_tag(project).context("in file-level `project`")?;
+    }
 
     let mut services = BTreeMap::new();
     for (name, svc) in raw.service {
         validate_service_name(&name)?;
-        let def = resolve_service(root, &name, svc, &secrets, &raw.groups)
-            .with_context(|| format!("in [service.{name}]"))?;
+        let def = resolve_service(
+            root,
+            &name,
+            svc,
+            &secrets,
+            &raw.groups,
+            raw.project.as_deref(),
+        )
+        .with_context(|| format!("in [service.{name}]"))?;
         services.insert(name, def);
     }
 
@@ -320,6 +339,7 @@ fn resolve_service(
     raw: RawService,
     secrets: &BTreeMap<String, SecretsProviderConfig>,
     file_groups: &[String],
+    project: Option<&str>,
 ) -> Result<ServiceDefinition> {
     // Absent after merging = the local file introduced this service without
     // saying what to run. (Patching a committed service never lands here --
@@ -425,6 +445,7 @@ fn resolve_service(
         watch_mode: raw.watch_mode.unwrap_or_default(),
         watch_debounce_ms: raw.watch_debounce_ms.unwrap_or(500),
         groups,
+        project: project.map(str::to_string),
     })
 }
 
@@ -734,6 +755,55 @@ mod tests {
         // (env_files resolve to absolute paths under the config root).
         assert_eq!(web.env_files, vec![dir.path().join(".env.committed")]);
         assert_eq!(web.groups, vec!["committed-group".to_string()]);
+    }
+
+    #[test]
+    fn file_level_project_inherits_and_local_overrides() {
+        let dir = tempdir().unwrap();
+        write_config(
+            dir.path(),
+            CONFIG_FILE,
+            r#"
+            project = "acme"
+            [service.web]
+            run = "cmd"
+            "#,
+        );
+        let cfg = load(dir.path()).unwrap();
+        assert_eq!(cfg.services["web"].project.as_deref(), Some("acme"));
+
+        // The overlay's project wins wholesale, like every scalar field.
+        write_config(
+            dir.path(),
+            LOCAL_CONFIG_FILE,
+            r#"
+            project = "acme-dev"
+            [service.extra]
+            run = "cmd2"
+            "#,
+        );
+        let cfg = load(dir.path()).unwrap();
+        assert_eq!(cfg.services["web"].project.as_deref(), Some("acme-dev"));
+        assert_eq!(cfg.services["extra"].project.as_deref(), Some("acme-dev"));
+    }
+
+    #[test]
+    fn project_tag_is_validated_like_group_tags() {
+        let dir = tempdir().unwrap();
+        write_config(
+            dir.path(),
+            CONFIG_FILE,
+            r#"
+            project = "bad name!"
+            [service.web]
+            run = "cmd"
+            "#,
+        );
+        let err = format!("{:?}", load(dir.path()).unwrap_err());
+        assert!(
+            err.contains("project"),
+            "error should name the field: {err}"
+        );
     }
 
     #[test]

@@ -317,6 +317,7 @@ mod tests {
             watch_mode: Default::default(),
             watch_debounce_ms: 500,
             groups: Vec::new(),
+            project: None,
         };
 
         let first = source.resolve(&def, &blocks).await.unwrap();

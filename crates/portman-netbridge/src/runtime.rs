@@ -1428,25 +1428,13 @@ destination: 172.18.0.0
             ExistingRoute::Repair
         );
         // After shutdown forgets it, the kernel may recycle the name for a
-        // VPN — a live foreign interface must never be repointed.
+        // VPN (chipmk's bridge, someone else's tunnel) — a live foreign
+        // interface must never be repointed. This assertion is the one home
+        // of that guarantee: a separate test using the same loopback name
+        // would race the claimed window above.
         forget_own_utun(&name);
         assert_eq!(
             classify_existing_route(&name, "utun9"),
-            ExistingRoute::Foreign
-        );
-    }
-
-    #[test]
-    fn a_route_via_someone_elses_live_interface_is_never_touched() {
-        // chipmk's bridge, a VPN — not ours to repoint, whatever we'd prefer.
-        // Loopback is the one interface guaranteed alive on every platform
-        // this test runs on (en0 exists on Macs but not Linux CI runners).
-        #[cfg(target_os = "macos")]
-        let live_foreign = "lo0";
-        #[cfg(not(target_os = "macos"))]
-        let live_foreign = "lo";
-        assert_eq!(
-            classify_existing_route(live_foreign, "utun9"),
             ExistingRoute::Foreign
         );
     }

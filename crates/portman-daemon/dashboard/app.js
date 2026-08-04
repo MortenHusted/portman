@@ -54,6 +54,64 @@ function groupsOf(s) {
   return [base || 'ungrouped'];
 }
 
+// --- Project filter --------------------------------------------------------
+// One axis across both worlds: services carry `project` from portman.toml
+// (falling back to their repo directory name), containers use their compose
+// project. '' = show everything.
+let projectFilter = localStorage.getItem('portman.projectFilter') || '';
+
+function projectOf(s) {
+  if (s.project) return s.project;
+  const base = String(s.root || '').split('/').filter(Boolean).pop();
+  return base || 'unassigned';
+}
+
+function containerProjectOf(c) {
+  return c.compose_project || 'standalone';
+}
+
+function visibleServices() {
+  return projectFilter ? services.filter(s => projectOf(s) === projectFilter) : services;
+}
+
+function visibleContainers() {
+  return projectFilter ? containers.filter(c => containerProjectOf(c) === projectFilter) : containers;
+}
+
+function setProjectFilter(name) {
+  projectFilter = name;
+  localStorage.setItem('portman.projectFilter', name);
+  renderProjectFilter();
+  renderKpis();
+  renderGroups();
+  renderContainers();
+}
+
+function renderProjectFilter() {
+  const bar = el('project-filter');
+  const counts = new Map();
+  for (const s of services) counts.set(projectOf(s), (counts.get(projectOf(s)) || 0) + 1);
+  for (const c of containers) {
+    const p = containerProjectOf(c);
+    counts.set(p, (counts.get(p) || 0) + 1);
+  }
+  const names = [...counts.keys()].sort((a, b) => a.localeCompare(b));
+  // A filter with one (or zero) projects is noise.
+  bar.hidden = names.length < 2;
+  if (bar.hidden) { if (projectFilter) setProjectFilter(''); return; }
+  // A stored filter whose project vanished (repo forgotten, stack down)
+  // must not silently blank the dashboard.
+  if (projectFilter && !counts.has(projectFilter)) { setProjectFilter(''); return; }
+  const chip = (name, label, count) =>
+    `<button class="project-chip${projectFilter === name ? ' active' : ''}" data-project="${esc(name)}">` +
+    `${esc(label)}${count != null ? `<span class="count">${count}</span>` : ''}</button>`;
+  bar.innerHTML = `<span class="filter-label">Project</span>` +
+    chip('', 'All', null) +
+    names.map(n => chip(n, n, counts.get(n))).join('');
+  bar.querySelectorAll('.project-chip').forEach(b =>
+    b.addEventListener('click', () => setProjectFilter(b.dataset.project)));
+}
+
 function serviceSeries(name) {
   return historySeries.find(s => s.kind === 'service' && s.key === name);
 }
@@ -185,6 +243,7 @@ function alertCollisions() {
 // --- KPI strip -------------------------------------------------------------
 
 function renderKpis() {
+  const services = visibleServices();
   const states = services.map(s => String(s.state || '').toLowerCase());
   const ready = states.filter(s => s === 'ready').length;
   const troubled = states.filter(s => s === 'backoff' || s === 'failed').length;
@@ -234,6 +293,7 @@ function stateBadge(state) {
 
 function renderGroups() {
   const container = el('service-groups');
+  const services = visibleServices();
   const empty = el('services-empty');
   el('services-count').textContent = services.length ? String(services.length) : '';
   container.innerHTML = '';
@@ -528,6 +588,7 @@ el('insp-toggle').addEventListener('click', () => {
 function renderContainers() {
   const container = el('container-groups');
   const empty = el('containers-empty');
+  const containers = visibleContainers();
   el('containers-count').textContent = containers.length ? String(containers.length) : '';
   container.innerHTML = '';
   empty.hidden = containers.length > 0;
@@ -1057,6 +1118,7 @@ async function refresh() {
 
     renderStatus(status);
     alertCollisions();
+    renderProjectFilter();
     renderKpis();
     renderGroups();
     renderContainers();

@@ -142,6 +142,7 @@ fn handle_service_status(state: &DaemonState) -> Response {
             port: s.port,
             desired_up: s.desired_up,
             groups: s.groups,
+            project: s.project,
         })
         .collect();
     Response::ServiceStatuses { services }
@@ -748,6 +749,7 @@ mod tests {
             watch_mode: Default::default(),
             watch_debounce_ms: 500,
             groups: Vec::new(),
+            project: None,
         };
         let response = dispatch(
             Request::SyncServices {

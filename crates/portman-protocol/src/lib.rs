@@ -459,6 +459,10 @@ pub struct ServiceStatusInfo {
     /// `root` directory name instead.
     #[serde(default)]
     pub groups: Vec<String>,
+    /// Project tag from the owning config file; `None` → UI falls back to
+    /// the `root` directory name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 /// One captured log line.
@@ -765,6 +769,11 @@ pub struct ServiceDefinition {
     /// layer, so the fallback tracks a moved checkout.
     #[serde(default)]
     pub groups: Vec<String>,
+    /// File-level `project` tag: one project per config file, inherited by
+    /// every service in it. `None` means the UI falls back to the config
+    /// root's directory name — same contract as empty `groups`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 fn default_stop_grace_ms() -> u64 {
@@ -1060,6 +1069,7 @@ mod tests {
                 watch_mode: WatchMode::Poll,
                 watch_debounce_ms: 500,
                 groups: vec!["pacer".into()],
+                project: None,
             }],
             secrets: std::collections::BTreeMap::from([(
                 "pacer".to_string(),
@@ -1115,6 +1125,7 @@ mod tests {
                 port: Some(3000),
                 desired_up: true,
                 groups: vec!["pacer".into()],
+                project: None,
             }],
         };
         let json = serde_json::to_string(&response).unwrap();
