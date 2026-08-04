@@ -1689,12 +1689,18 @@ fn marker_identity_matches(marker: &RunningMarker) -> bool {
         .map(|s| s.to_string_lossy().into_owned())
         .collect();
     if argv.is_empty() {
-        // Unreadable argv is inconclusive — stay conservative, don't signal.
+        // Argv is the third, weakest signal — pgid and start-time already
+        // matched, and start-time alone defeats pid recycling (a recycled
+        // pid can't reproduce the recorded spawn instant). sysinfo has been
+        // observed returning empty argv for live processes that `ps` reads
+        // fine (Apple's /usr/bin tool stubs re-exec, and KERN_PROCARGS2
+        // handling varies), so an unreadable argv must not veto two solid
+        // matches and strand the survivor holding its port.
         warn!(
             pid = marker.pid,
-            "survivor identity inconclusive: argv unreadable; not signaling"
+            "survivor argv unreadable; accepting identity on pgid + start time"
         );
-        return false;
+        return true;
     }
     let matches =
         argv == marker.argv || (argv.len() == marker.argv.len() && argv[1..] == marker.argv[1..]);
@@ -1812,6 +1818,10 @@ mod tests {
     /// Supervisor with a fake home (so the machine's real mise install never
     /// engages) and current-user identity.
     fn test_supervisor(dir: &TempDir, sink: Arc<dyn LineSink>) -> Supervisor {
+        // Route tracing into the test harness's captured output — the
+        // supervisor's warn-level diagnostics (survivor identity, persist
+        // failures) are exactly what a CI-only failure needs to show.
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         Supervisor::new(
@@ -2664,6 +2674,23 @@ mod tests {
         // holding the port.
         sup_a.abandon_for_test();
         tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The respawn below can only work if reconciliation will recognize
+        // (and kill) the survivor. Assert that premise directly first: when
+        // the identity check goes inconclusive, THIS is the failure to show,
+        // with the leg-naming warn! in the captured output — not a 60s
+        // EADDRINUSE crash-loop two waits later.
+        let persisted = load_persisted(&dir.path().join("services.json")).unwrap();
+        let marker = persisted.services["binder"]
+            .running
+            .clone()
+            .expect("abandoned run must leave a running marker");
+        assert!(
+            marker_identity_matches(&marker),
+            "survivor identity check went inconclusive for live pid {} (see warnings above); \
+             reconciliation would strand the port",
+            marker.pid
+        );
 
         // A new daemon generation must terminate the orphan (identity check
         // passes) and respawn exactly once — the rebind only succeeds if the
