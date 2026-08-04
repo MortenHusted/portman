@@ -616,6 +616,11 @@ pub struct ContainerResourceUsage {
     pub compose_project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compose_service: Option<String>,
+    /// Explicit `dev.portman.project` label — groups the container with host
+    /// services under one project in the UI. Absent: UI falls back to the
+    /// compose project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     #[serde(default)]
     pub cpu_percent: f64,
     #[serde(default)]

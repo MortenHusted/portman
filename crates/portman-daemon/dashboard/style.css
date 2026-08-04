@@ -278,7 +278,7 @@ code { font-family: var(--font-mono); font-size: 12px; background: var(--hover);
 .chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .chip { padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; font-size: 11px; color: var(--ink-2); }
 
-.project-filter { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 0 0 4px; }
+.project-filter { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 14px 28px 0 28px; }
 .project-filter .filter-label { font-size: 11px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.08em; margin-right: 2px; }
 .project-chip {
   padding: 3px 12px;

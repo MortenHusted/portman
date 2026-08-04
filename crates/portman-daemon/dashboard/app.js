@@ -67,7 +67,7 @@ function projectOf(s) {
 }
 
 function containerProjectOf(c) {
-  return c.compose_project || 'standalone';
+  return c.project || c.compose_project || 'standalone';
 }
 
 function visibleServices() {
@@ -590,6 +590,9 @@ function renderContainers() {
   const empty = el('containers-empty');
   const containers = visibleContainers();
   el('containers-count').textContent = containers.length ? String(containers.length) : '';
+  el('containers-empty').textContent = projectFilter
+    ? `No running containers in ${projectFilter}.`
+    : 'No running containers.';
   container.innerHTML = '';
   empty.hidden = containers.length > 0;
   if (!containers.length) return;

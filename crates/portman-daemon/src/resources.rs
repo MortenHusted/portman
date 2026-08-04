@@ -399,6 +399,7 @@ fn usage_from_stats(
             portman_hosts: base.portman_hosts,
             compose_project: base.compose_project,
             compose_service: base.compose_service,
+            project: base.project,
             cpu_percent,
             memory_usage_bytes,
             memory_limit_bytes,
@@ -495,6 +496,7 @@ struct ContainerBase {
     portman_hosts: Vec<String>,
     compose_project: Option<String>,
     compose_service: Option<String>,
+    project: Option<String>,
 }
 
 impl ContainerBase {
@@ -520,6 +522,7 @@ impl ContainerBase {
             compose_service: labels
                 .and_then(|l| l.get("com.docker.compose.service"))
                 .cloned(),
+            project: labels.and_then(|l| l.get("dev.portman.project")).cloned(),
         }
     }
 
