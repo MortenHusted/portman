@@ -22,6 +22,63 @@ jobs:
       - name: build release
         run: cargo build --release --workspace
 
+  # The proof behind the README's Linux claim: not "compiles on Linux" but
+  # the installed daemon actually resolving, proxying, supervising, and
+  # routing containers on a real Ubuntu box with real systemd-resolved.
+  linux-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build CLI
+        run: cargo build --release -p portman
+      - name: install (binaries + systemd unit, the user path)
+        run: ./target/release/portman install
+      - name: daemon is up
+        run: |
+          for i in $(seq 1 30); do portman status >/dev/null 2>&1 && break; sleep 1; done
+          systemctl is-active portman-daemon
+          portman status
+      - name: manage .test through systemd-resolved
+        run: |
+          sudo -E portman tld add test
+          cat /etc/systemd/resolved.conf.d/portman-test.conf || ls /etc/systemd/resolved.conf.d/
+          portman tld list
+      - name: static rule -> DNS -> proxy -> backend
+        run: |
+          python3 -m http.server 8099 --bind 127.0.0.1 &
+          sleep 1
+          portman add web.test 127.0.0.1:8099 --project e2e
+          resolvectl query web.test
+          curl -fsS --max-time 10 -H "Host: web.test" http://127.0.0.1/ >/dev/null
+          curl -fsS --max-time 10 http://web.test/ >/dev/null
+          echo "static rule end-to-end OK"
+      - name: service runner end to end
+        run: |
+          mkdir -p /tmp/e2e-app
+          printf 'project = "e2e"\n\n[service.hello]\nrun = ["python3", "-m", "http.server", "8123", "--bind", "127.0.0.1"]\nport = 8123\nhost = "hello.test"\n' > /tmp/e2e-app/portman.toml
+          cd /tmp/e2e-app
+          portman up
+          curl -fsS --max-time 10 http://hello.test/ >/dev/null
+          portman status --repo
+          portman logs hello | tail -3
+          portman down
+          echo "service runner end-to-end OK"
+      - name: labelled container routes natively
+        run: |
+          docker run -d --name e2e-nginx -l dev.portman.host=ctr.test -l dev.portman.port=80 nginx:alpine
+          sleep 5
+          portman list
+          resolvectl query ctr.test
+          curl -fsS --max-time 10 http://ctr.test/ | grep -qi nginx
+          echo "container routing end-to-end OK"
+      - name: daemon journal on failure
+        if: failure()
+        run: |
+          sudo journalctl -u portman-daemon --no-pager | tail -150
+          resolvectl status || true
+          sudo ss -tlnp | head -30
+
   rust-macos:
     runs-on: macos-latest
     steps:
