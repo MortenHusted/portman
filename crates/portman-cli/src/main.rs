@@ -233,6 +233,22 @@ enum TldAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `portman status | head` closes stdout early; the default panic on the
+    // resulting broken-pipe write is noise, not an error. The workspace
+    // forbids unsafe (no SIGPIPE reset), so exit quietly from the hook.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let broken_pipe = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(|s| s.contains("Broken pipe"))
+            .unwrap_or(false);
+        if broken_pipe {
+            std::process::exit(0);
+        }
+        default_hook(info);
+    }));
+
     let cli = Cli::parse();
     let Some(command) = cli.command else {
         // Bare `portman` launches the TUI. This is the primary surface.

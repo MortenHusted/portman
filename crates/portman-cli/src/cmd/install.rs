@@ -132,6 +132,9 @@ pub(crate) async fn cmd_install_linux() -> Result<()> {
     eprintln!("enabling systemd service…");
     run_sudo(&["systemctl", "daemon-reload"])?;
     run_sudo(&["systemctl", "enable", "--now", "portman-daemon"])?;
+    // `enable --now` is a no-op when the unit is already active — an
+    // upgrade must actually swap onto the new binary.
+    run_sudo(&["systemctl", "restart", "portman-daemon"])?;
 
     print_install_success(log_dir, DEFAULT_DASHBOARD_PORT);
     Ok(())
