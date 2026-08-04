@@ -76,7 +76,7 @@ sudo portman tld add test
 portman dashboard
 ```
 
-TLD registration writes a portman-managed drop-in under `/etc/systemd/resolved.conf.d/` and reloads `systemd-resolved`. CI runs an end-to-end job on Ubuntu (install, resolved integration, proxy, service runner, container routing), but Linux has had much less real-world use than macOS. Expect rough edges and please file what you hit.
+TLD registration writes a portman-managed drop-in under `/etc/systemd/resolved.conf.d/` and restarts `systemd-resolved` (reload does not re-read drop-ins). CI runs an end-to-end job on Ubuntu (install, resolved integration, proxy, service runner, container routing), but Linux has had much less real-world use than macOS. Expect rough edges and please file what you hit.
 
 ## Security model
 

@@ -82,11 +82,7 @@ pub(crate) async fn cmd_tld_add(raw: String, tls: Option<String>) -> Result<()> 
     sudo_write(&path, &contents)?;
 
     #[cfg(target_os = "linux")]
-    {
-        let _ = StdCommand::new("sudo")
-            .args(["systemctl", "reload", "systemd-resolved"])
-            .status();
-    }
+    restart_resolved();
 
     match request(Request::TldAdd {
         tld: tld.clone(),
@@ -108,6 +104,26 @@ pub(crate) async fn cmd_tld_add(raw: String, tls: Option<String>) -> Result<()> 
     #[cfg(target_os = "linux")]
     println!("verify with: resolvectl query foo.{tld}");
     Ok(())
+}
+
+/// Apply a resolver drop-in change. `reload` looks gentler but resolved
+/// does not re-read config drop-ins on reload (verified on Ubuntu 24.04 by
+/// the linux-e2e job: Global DNS stayed on DHCP after a clean reload) — a
+/// restart is momentary and deterministic. Loudly non-fatal: DNS keeps
+/// working via the old config until the user restarts resolved themselves.
+#[cfg(target_os = "linux")]
+fn restart_resolved() {
+    let status = StdCommand::new("sudo")
+        .args(["systemctl", "restart", "systemd-resolved"])
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!(
+            "warning: systemctl restart systemd-resolved exited {s}; \
+             the resolver change is written but not yet applied"
+        ),
+        Err(err) => eprintln!("warning: could not restart systemd-resolved: {err}"),
+    }
 }
 
 pub(crate) fn normalize_tls_mode_arg(tls: Option<String>) -> Result<Option<TlsMode>> {
@@ -135,11 +151,7 @@ pub(crate) async fn cmd_tld_remove(raw: String) -> Result<()> {
     }
 
     #[cfg(target_os = "linux")]
-    {
-        let _ = StdCommand::new("sudo")
-            .args(["systemctl", "reload", "systemd-resolved"])
-            .status();
-    }
+    restart_resolved();
 
     request(Request::TldRemove { tld: tld.clone() })
         .await?
