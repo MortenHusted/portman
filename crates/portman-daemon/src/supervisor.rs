@@ -1817,6 +1817,32 @@ mod tests {
 
     /// Supervisor with a fake home (so the machine's real mise install never
     /// engages) and current-user identity.
+    /// Like `test_supervisor`, but with readiness patience for tests whose
+    /// child is a real interpreter: python's cold start on a loaded CI
+    /// runner routinely blows past fast_timings' 600ms ready window, which
+    /// reads as a respawn loop rather than the behavior under test.
+    fn patient_supervisor(dir: &TempDir, sink: Arc<dyn LineSink>) -> Supervisor {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let timings = Timings {
+            ready_timeout: Duration::from_secs(20),
+            ..fast_timings()
+        };
+        Supervisor::new(
+            dir.path().join("services.json"),
+            BaseEnv {
+                user: std::env::var("USER").unwrap_or_else(|_| "test".into()),
+                home,
+            },
+            IdentityPolicy::CurrentUser,
+            timings,
+            sink,
+            Arc::new(NoSecrets),
+            Arc::new(NoRoutes),
+        )
+    }
+
     fn test_supervisor(dir: &TempDir, sink: Arc<dyn LineSink>) -> Supervisor {
         // Route tracing into the test harness's captured output — the
         // supervisor's warn-level diagnostics (survivor identity, persist
@@ -2661,7 +2687,7 @@ mod tests {
             svc
         };
 
-        let sup_a = test_supervisor(&dir, CollectSink::new());
+        let sup_a = patient_supervisor(&dir, CollectSink::new());
         sup_a
             .sync(dir.path(), vec![make_def(dir.path())], Map::new())
             .await
@@ -2695,7 +2721,7 @@ mod tests {
         // A new daemon generation must terminate the orphan (identity check
         // passes) and respawn exactly once — the rebind only succeeds if the
         // old group is gone.
-        let sup_b = test_supervisor(&dir, CollectSink::new());
+        let sup_b = patient_supervisor(&dir, CollectSink::new());
         sup_b.restore().await.unwrap();
         wait_for_state(&sup_b, "binder", StateKind::Ready, Duration::from_secs(60)).await;
         let new_pid = running_pid(&sup_b, "binder").await;
