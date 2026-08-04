@@ -16,3 +16,8 @@ xcuserdata/
 
 # No stray screenshots at the repo root
 /*.png
+
+# Private working notes (symlinks into ../portman-docs — see its link.sh)
+/docs/plans
+/docs/solutions
+/CLAUDE.local.md
