@@ -12,6 +12,7 @@ members = [
 version = "0.0.1"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/MortenHusted/portman"
 rust-version = "1.78"
 
 [workspace.dependencies]
@@ -43,6 +44,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
