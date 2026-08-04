@@ -1847,7 +1847,7 @@ checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
 
 [[package]]
 name = "portman"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1863,7 +1863,7 @@ dependencies = [
 
 [[package]]
 name = "portman-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "portman-protocol",
@@ -1876,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "portman-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1912,7 +1912,7 @@ dependencies = [
 
 [[package]]
 name = "portman-netbridge"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1930,7 +1930,7 @@ dependencies = [
 
 [[package]]
 name = "portman-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde",
