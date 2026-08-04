@@ -1645,11 +1645,21 @@ fn clear_running_marker(inner: &Arc<Inner>, name: &str) {
 /// pid/pgid/start-time still pin the identity. Any *argument* mismatch is a
 /// veto: a recycled pgid is never signaled.
 fn marker_identity_matches(marker: &RunningMarker) -> bool {
+    // Every inconclusive leg logs at warn: a false negative here means a
+    // survivor keeps its port while the respawn crash-loops on EADDRINUSE,
+    // and a debug-level reason is invisible exactly when it matters (CI).
     let pid = Pid::from_raw(marker.pid as i32);
     let Ok(live_pgid) = nix::unistd::getpgid(Some(pid)) else {
+        // Process gone — nothing to kill, marker just clears.
         return false;
     };
     if live_pgid.as_raw() != marker.pgid {
+        warn!(
+            pid = marker.pid,
+            marker_pgid = marker.pgid,
+            live_pgid = live_pgid.as_raw(),
+            "survivor identity mismatch: pgid changed; not signaling"
+        );
         return false;
     }
 
@@ -1657,10 +1667,20 @@ fn marker_identity_matches(marker: &RunningMarker) -> bool {
     let mut system = sysinfo::System::new();
     system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sys_pid]), true);
     let Some(process) = system.process(sys_pid) else {
+        warn!(
+            pid = marker.pid,
+            "survivor identity inconclusive: process table has no entry; not signaling"
+        );
         return false;
     };
     let started_ms = process.start_time().saturating_mul(1000);
     if started_ms.abs_diff(marker.spawn_unix_ms) > 5_000 {
+        warn!(
+            pid = marker.pid,
+            started_ms,
+            marker_ms = marker.spawn_unix_ms,
+            "survivor identity mismatch: start time drifted; not signaling"
+        );
         return false;
     }
     let argv: Vec<String> = process
@@ -1670,9 +1690,23 @@ fn marker_identity_matches(marker: &RunningMarker) -> bool {
         .collect();
     if argv.is_empty() {
         // Unreadable argv is inconclusive — stay conservative, don't signal.
+        warn!(
+            pid = marker.pid,
+            "survivor identity inconclusive: argv unreadable; not signaling"
+        );
         return false;
     }
-    argv == marker.argv || (argv.len() == marker.argv.len() && argv[1..] == marker.argv[1..])
+    let matches =
+        argv == marker.argv || (argv.len() == marker.argv.len() && argv[1..] == marker.argv[1..]);
+    if !matches {
+        warn!(
+            pid = marker.pid,
+            live_argv = ?argv,
+            marker_argv = ?marker.argv,
+            "survivor identity mismatch: argv differs; not signaling"
+        );
+    }
+    matches
 }
 
 // ---------------------------------------------------------------------------
