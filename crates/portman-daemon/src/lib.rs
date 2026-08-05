@@ -548,6 +548,7 @@ fn seed_from_static_store(state: &DaemonState) {
             mode,
             container_id: None,
             project,
+            egress: None,
         });
         seeded += 1;
     }
@@ -603,7 +604,7 @@ async fn seed_from_running_containers(docker: &Docker, state: &DaemonState) {
             .cloned()
             .filter(|v| !v.is_empty())
             .or_else(|| match mode {
-                Mode::Http => Some("80".into()),
+                Mode::Http | Mode::Egress => Some("80".into()),
                 Mode::Tcp => None,
             })
         else {
@@ -630,6 +631,7 @@ async fn seed_from_running_containers(docker: &Docker, state: &DaemonState) {
                         source: Source::Container,
                         mode,
                         container_id: Some(short(id).to_string()),
+                        egress: None,
                         project: inspect
                             .config
                             .as_ref()

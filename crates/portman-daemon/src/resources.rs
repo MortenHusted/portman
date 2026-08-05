@@ -750,6 +750,7 @@ mod tests {
                 mode: Mode::Http,
                 container_id: Some("abcdef123456".to_string()),
                 project: None,
+                egress: None,
             },
             Entry {
                 host: "mail.test".to_string(),
@@ -758,6 +759,7 @@ mod tests {
                 mode: Mode::Http,
                 container_id: None,
                 project: None,
+                egress: None,
             },
         ];
         let index = portman_hosts_by_container_id(&entries);

@@ -245,6 +245,7 @@ mod tests {
             mode,
             container_id: None,
             project: None,
+            egress: None,
         }
     }
 

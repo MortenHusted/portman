@@ -76,7 +76,7 @@ async fn handle_event(docker: &Docker, state: &DaemonState, msg: EventMessage) {
             let mode = Mode::parse_label(mode_label(actor).as_deref());
             let port = match (port_label(actor), mode) {
                 (Some(p), _) => p,
-                (None, Mode::Http) => "80".into(),
+                (None, Mode::Http | Mode::Egress) => "80".into(),
                 (None, Mode::Tcp) => {
                     warn!(
                         %host,
@@ -95,6 +95,7 @@ async fn handle_event(docker: &Docker, state: &DaemonState, msg: EventMessage) {
                         mode,
                         container_id: Some(short(id).to_string()),
                         project: project_label(actor),
+                        egress: None,
                     };
                     registry.upsert(entry);
                     if mode == Mode::Http && state.host_tls_enabled(&host) {

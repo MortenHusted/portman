@@ -523,6 +523,7 @@ mod tests {
             mode,
             container_id: None,
             project: None,
+            egress: None,
         }
     }
 
@@ -639,6 +640,7 @@ mod tests {
             mode: Mode::Http,
             container_id: None,
             project: None,
+            egress: None,
         });
         let proxy_addr = proxy_once(registry, StubStarter::inert()).await;
 

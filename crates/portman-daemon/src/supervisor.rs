@@ -217,6 +217,7 @@ impl RouteSink for RouteBinder {
             mode: def.mode,
             container_id: None,
             project: def.project.clone(),
+            egress: None,
         });
         if def.mode == portman_protocol::Mode::Http
             && crate::certs::tls_enabled_for_host(&self.tls_store, host)
@@ -250,6 +251,7 @@ impl RouteSink for RouteBinder {
                     mode,
                     container_id: None,
                     project,
+                    egress: None,
                 });
                 info!(service = %def.name, %host, "service route released; static rule re-seeded");
             }
@@ -3096,6 +3098,7 @@ mod tests {
             mode: portman_protocol::Mode::Http,
             container_id: None,
             project: None,
+            egress: None,
         });
 
         let svc = routed_def("web", "web.internal", 34568, dir.path());

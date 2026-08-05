@@ -403,6 +403,7 @@ fn handle_add(
         mode,
         container_id: None,
         project,
+        egress: None,
     });
     if mode == Mode::Http && state.host_tls_enabled(&host) {
         if let Err(err) = state.cert_manager.ensure(&host) {

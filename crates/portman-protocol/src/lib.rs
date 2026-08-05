@@ -501,6 +501,39 @@ pub struct Entry {
     /// file's `project` on service-derived routes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Credential to attach when proxying to `target`. Only meaningful for
+    /// [`Mode::Egress`]; `None` everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressSpec>,
+}
+
+/// Which credential the proxy attaches to a request on its way out, and how.
+///
+/// This names a secret; it never carries one. The daemon resolves the named
+/// `[secrets.<block>]` key at proxy time, so the value exists only inside the
+/// daemon and never in a config file, a registry dump, or a caller's
+/// environment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EgressSpec {
+    /// `[secrets.<block>]` the value comes from.
+    pub secrets: String,
+    /// Key within that block.
+    pub key: String,
+    /// Header to set, e.g. `Authorization`.
+    pub header: String,
+    /// Value template; `{value}` is replaced with the resolved secret.
+    pub format: String,
+    /// `Host:` to present to the upstream, e.g. `api.github.com`.
+    pub upstream_host: String,
+}
+
+impl EgressSpec {
+    /// Render the header value. Kept here so the substitution rule has one
+    /// definition rather than one per call site.
+    #[must_use]
+    pub fn render(&self, value: &str) -> String {
+        self.format.replace("{value}", value)
+    }
 }
 
 /// One row of the TldList response.
@@ -706,6 +739,13 @@ pub enum Mode {
     /// Raw TCP — fronted on a dedicated loopback address that relays to
     /// `target`. Required for Postgres, MySQL, Redis, gRPC without Host, etc.
     Tcp,
+    /// Authenticated egress: the proxy rewrites the request head and attaches
+    /// the credential named by [`Entry::egress`] before forwarding to an
+    /// external `target`, so the caller never holds it.
+    ///
+    /// This is the one mode the proxy branches on beyond `Tcp`; routing
+    /// otherwise stays source-agnostic.
+    Egress,
 }
 
 impl Mode {
@@ -722,6 +762,7 @@ impl Mode {
         match self {
             Mode::Http => "http",
             Mode::Tcp => "tcp",
+            Mode::Egress => "egress",
         }
     }
 }
