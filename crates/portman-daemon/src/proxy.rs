@@ -23,6 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
+use crate::egress::{rewrite_head, Credentials, EgressAudit};
 use crate::runner::Starter;
 use crate::upstream::{self, BridgeIfIndex};
 
@@ -42,9 +43,10 @@ pub(crate) async fn run(
     port: u16,
     bridge: BridgeIfIndex,
     starter: Arc<dyn Starter>,
+    credentials: Credentials,
 ) -> Result<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    run_on(registry, addr, bridge, starter).await
+    run_on(registry, addr, bridge, starter, credentials).await
 }
 
 pub(crate) async fn run_on(
@@ -52,6 +54,7 @@ pub(crate) async fn run_on(
     addr: SocketAddr,
     bridge: BridgeIfIndex,
     starter: Arc<dyn Starter>,
+    credentials: Credentials,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await.with_context(|| {
         if addr.port() < 1024 {
@@ -72,8 +75,11 @@ pub(crate) async fn run_on(
                 let registry = registry.clone();
                 let bridge = bridge.clone();
                 let starter = starter.clone();
+                let credentials = credentials.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(client, registry, bridge, starter).await {
+                    if let Err(err) =
+                        handle_connection(client, registry, bridge, starter, credentials).await
+                    {
                         debug!(%peer, error = %err, "proxy connection ended");
                     }
                 });
@@ -88,6 +94,7 @@ async fn handle_connection(
     registry: Registry,
     bridge: BridgeIfIndex,
     starter: Arc<dyn Starter>,
+    credentials: Credentials,
 ) -> Result<()> {
     let mut buf = Vec::with_capacity(4096);
     let head = match tokio::time::timeout(
@@ -203,7 +210,59 @@ async fn handle_connection(
     };
 
     // The bytes we read to find the Host header belong to the client's
-    // request. Forward them to upstream before we start byte-splicing.
+    // request. Forward them to upstream before we start byte-splicing —
+    // rewritten first on an egress route, so the credential is attached and
+    // the caller's own auth headers never reach the upstream.
+    if entry.mode == Mode::Egress {
+        let Some(spec) = entry.egress.as_ref() else {
+            warn!(%host, "egress route has no credential spec; refusing rather than forwarding unauthenticated");
+            write_error(
+                &mut client,
+                502,
+                &host,
+                &format!("{host} is an egress route with no credential configured."),
+                "Add the `secrets` and `key` fields to its config and re-run `portman up`.",
+                "",
+                wants_html,
+            )
+            .await
+            .ok();
+            return Ok(());
+        };
+        let audit = EgressAudit::from_spec(&host, &target, spec);
+        let Some(value) = credentials.resolve(spec) else {
+            warn!(
+                host = audit.host,
+                upstream = audit.upstream,
+                secrets = audit.secrets_block,
+                key = audit.key,
+                "egress credential unavailable; refusing rather than forwarding unauthenticated"
+            );
+            write_error(
+                &mut client,
+                502,
+                &host,
+                &format!("{host} could not resolve its credential."),
+                "Check the referenced secrets block and that `portman secrets set-*` has run.",
+                "",
+                wants_html,
+            )
+            .await
+            .ok();
+            return Ok(());
+        };
+        info!(
+            host = audit.host,
+            upstream = audit.upstream,
+            secrets = audit.secrets_block,
+            key = audit.key,
+            "egress request authenticated"
+        );
+        // `rewrite_head` forces `Connection: close`, so the splice below
+        // ends after this one request rather than carrying an unparsed —
+        // and therefore unauthenticated — second request through.
+        buf = rewrite_head(&buf, headers_end, spec, &value);
+    }
     upstream.write_all(&buf).await?;
 
     match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
@@ -568,15 +627,58 @@ mod tests {
     }
 
     async fn proxy_once(registry: Registry, starter: Arc<dyn Starter>) -> SocketAddr {
+        proxy_once_with(registry, starter, Arc::new(crate::egress::NoCredentials)).await
+    }
+
+    async fn proxy_once_with(
+        registry: Registry,
+        starter: Arc<dyn Starter>,
+        credentials: Credentials,
+    ) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (client, _) = listener.accept().await.unwrap();
-            handle_connection(client, registry, upstream::new_bridge_ifindex(), starter)
-                .await
-                .unwrap();
+            handle_connection(
+                client,
+                registry,
+                upstream::new_bridge_ifindex(),
+                starter,
+                credentials,
+            )
+            .await
+            .unwrap();
         });
         addr
+    }
+
+    /// Hands out one fixed value, standing in for a resolved secrets block.
+    struct StubCredentials(&'static str);
+
+    impl crate::egress::CredentialSource for StubCredentials {
+        fn resolve(&self, _spec: &portman_protocol::EgressSpec) -> Option<String> {
+            Some(self.0.to_string())
+        }
+    }
+
+    struct NoSuchCredential;
+
+    impl crate::egress::CredentialSource for NoSuchCredential {
+        fn resolve(&self, _spec: &portman_protocol::EgressSpec) -> Option<String> {
+            None
+        }
+    }
+
+    fn egress_entry(host: &str, target: String) -> Entry {
+        let mut e = entry(host, target, Mode::Egress);
+        e.egress = Some(portman_protocol::EgressSpec {
+            secrets: "gh".into(),
+            key: "GITHUB_TOKEN".into(),
+            header: "Authorization".into(),
+            format: "Bearer {value}".into(),
+            upstream_host: "api.github.com".into(),
+        });
+        e
     }
 
     async fn upstream_once(
@@ -623,6 +725,82 @@ mod tests {
             .unwrap()
             .starts_with("HTTP/1.1 200 OK"));
         assert_eq!(upstream.await.unwrap(), request);
+    }
+
+    /// The tracer bullet: a caller that holds no credential reaches an
+    /// upstream that receives an authenticated request. Also pins the three
+    /// rewrites that make that safe — the caller's own auth header is gone,
+    /// the upstream sees its own `Host`, and the connection is closed so no
+    /// unparsed second request can follow.
+    #[tokio::test]
+    async fn egress_route_injects_the_credential_the_caller_never_held() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let (upstream_addr, upstream) = upstream_once(response).await;
+        let registry = Registry::new();
+        registry.upsert(egress_entry("github.api.test", upstream_addr.to_string()));
+        let proxy_addr = proxy_once_with(
+            registry,
+            StubStarter::inert(),
+            Arc::new(StubCredentials("s3cret-token")),
+        )
+        .await;
+
+        // The caller sends its own Authorization header; it must not survive.
+        let request = b"GET /user HTTP/1.1\r\nHost: github.api.test\r\nAuthorization: Bearer caller-supplied\r\nConnection: keep-alive\r\n\r\n";
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(request).await.unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert!(std::str::from_utf8(&received)
+            .unwrap()
+            .starts_with("HTTP/1.1 200 OK"));
+
+        let seen = upstream.await.unwrap();
+        let seen = std::str::from_utf8(&seen).unwrap();
+        assert!(
+            seen.contains("Authorization: Bearer s3cret-token\r\n"),
+            "upstream must receive the injected credential: {seen:?}"
+        );
+        assert!(
+            !seen.contains("caller-supplied"),
+            "caller's own credential must be stripped: {seen:?}"
+        );
+        assert!(
+            seen.contains("Host: api.github.com\r\n") && !seen.contains("github.api.test"),
+            "upstream must see its own host: {seen:?}"
+        );
+        assert!(
+            seen.contains("Connection: close\r\n") && !seen.contains("keep-alive"),
+            "keep-alive must be forced closed: {seen:?}"
+        );
+    }
+
+    /// An egress route with no resolvable credential refuses. Forwarding
+    /// unauthenticated would look like a working route while quietly
+    /// dropping the guarantee the route exists to provide.
+    #[tokio::test]
+    async fn egress_route_refuses_rather_than_forwarding_unauthenticated() {
+        let (upstream_addr, upstream) = upstream_once(b"HTTP/1.1 200 OK\r\n\r\n").await;
+        let registry = Registry::new();
+        registry.upsert(egress_entry("github.api.test", upstream_addr.to_string()));
+        let proxy_addr =
+            proxy_once_with(registry, StubStarter::inert(), Arc::new(NoSuchCredential)).await;
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: github.api.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert!(
+            std::str::from_utf8(&received)
+                .unwrap()
+                .starts_with("HTTP/1.1 502"),
+            "expected a refusal: {:?}",
+            std::str::from_utf8(&received).unwrap()
+        );
+        upstream.abort();
     }
 
     /// A service-derived route (`Source::Service`, as the supervisor's

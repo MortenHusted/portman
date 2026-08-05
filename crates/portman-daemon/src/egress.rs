@@ -1,0 +1,228 @@
+//! Authenticated egress: attaching a credential the caller never holds.
+//!
+//! A [`Mode::Egress`](portman_protocol::Mode::Egress) route names an external
+//! upstream and a `[secrets.<block>]` key. The proxy resolves that key and
+//! rewrites the request head on its way out, so a process reaching the route
+//! gets an authenticated request without ever having been given the value —
+//! the same shape as an authenticated reverse proxy in front of a REST API.
+//!
+//! What this does NOT do, so nobody reads more into it than is there: it
+//! authenticates nothing about the *caller*. Any local process that can reach
+//! the proxy port can use the credential. It stops the value being copied into
+//! environments, config files, and logs; it does not stop a process that
+//! wanted to make the call from making it.
+
+use std::sync::Arc;
+
+use portman_protocol::EgressSpec;
+
+/// Headers the caller must never dictate on an egress route: the proxy owns
+/// authentication and the upstream identity, and it closes the connection
+/// after one request (see [`rewrite_head`]).
+const CALLER_OWNED: [&str; 4] = ["authorization", "proxy-authorization", "host", "connection"];
+
+/// Resolves the value behind an [`EgressSpec`].
+///
+/// Threaded into the proxy the same way the runner is, so the proxy gains one
+/// capability rather than the whole daemon state.
+pub(crate) trait CredentialSource: Send + Sync + 'static {
+    /// The secret named by `spec`, or `None` if the block or key is unknown.
+    fn resolve(&self, spec: &EgressSpec) -> Option<String>;
+}
+
+/// No egress routes configured; every lookup misses.
+pub(crate) struct NoCredentials;
+
+impl CredentialSource for NoCredentials {
+    fn resolve(&self, _spec: &EgressSpec) -> Option<String> {
+        None
+    }
+}
+
+/// Rebuild a request head for an egress hop.
+///
+/// `buf` is the raw bytes read from the client and `headers_end` the offset
+/// just past the blank line ending the head, so anything after it is body
+/// bytes already in hand and is preserved untouched.
+///
+/// Four changes, and each is load-bearing:
+///
+/// - **caller-supplied `Authorization`/`Proxy-Authorization` are dropped.**
+///   The injected header is written last, but a duplicate would still reach
+///   the upstream, and which one wins is the upstream's choice rather than
+///   ours. Stripping is what makes injection authoritative.
+/// - **`Host` is rewritten** to the upstream's, since the caller addressed a
+///   local name the upstream has never heard of.
+/// - **`Connection: close`** — the proxy parses only the FIRST head on a
+///   connection and splices the rest verbatim, so a keep-alive connection
+///   would carry request 2 straight through unstripped and unauthenticated.
+///   Closing after one request is what makes that safe. Removing this without
+///   also framing every request is a security regression, not a performance
+///   tweak.
+/// - **the credential is appended last**, after the strip pass.
+pub(crate) fn rewrite_head(
+    buf: &[u8],
+    headers_end: usize,
+    spec: &EgressSpec,
+    value: &str,
+) -> Vec<u8> {
+    let head = &buf[..headers_end.min(buf.len())];
+    let body = buf.get(headers_end..).unwrap_or(&[]);
+    let text = String::from_utf8_lossy(head);
+
+    let mut out = String::with_capacity(text.len() + 128);
+    let mut lines = text.split("\r\n");
+
+    // The request line is copied verbatim: the path and query belong to the
+    // caller, and rewriting them would be a different feature.
+    if let Some(request_line) = lines.next() {
+        out.push_str(request_line);
+        out.push_str("\r\n");
+    }
+    for line in lines {
+        if line.is_empty() {
+            continue; // the head's trailing blank line; re-added below
+        }
+        let name = line
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if CALLER_OWNED.contains(&name.as_str()) {
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+
+    out.push_str(&format!("Host: {}\r\n", spec.upstream_host));
+    out.push_str("Connection: close\r\n");
+    out.push_str(&format!("{}: {}\r\n", spec.header, spec.render(value)));
+    out.push_str("\r\n");
+
+    let mut bytes = out.into_bytes();
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+/// Everything an egress hop logs. Deliberately structural: it carries the
+/// credential's KEY, never its value, so no logging call site can leak one.
+pub(crate) struct EgressAudit<'a> {
+    pub host: &'a str,
+    pub upstream: &'a str,
+    pub secrets_block: &'a str,
+    pub key: &'a str,
+}
+
+impl EgressAudit<'_> {
+    pub(crate) fn from_spec<'a>(
+        host: &'a str,
+        upstream: &'a str,
+        spec: &'a EgressSpec,
+    ) -> EgressAudit<'a> {
+        EgressAudit {
+            host,
+            upstream,
+            secrets_block: &spec.secrets,
+            key: &spec.key,
+        }
+    }
+}
+
+/// Convenience alias for the trait object the proxy carries.
+pub(crate) type Credentials = Arc<dyn CredentialSource>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> EgressSpec {
+        EgressSpec {
+            secrets: "gh".into(),
+            key: "GITHUB_TOKEN".into(),
+            header: "Authorization".into(),
+            format: "Bearer {value}".into(),
+            upstream_host: "api.github.com".into(),
+        }
+    }
+
+    fn rewrite(raw: &str) -> String {
+        let buf = raw.as_bytes();
+        let end = raw.find("\r\n\r\n").expect("head terminator") + 4;
+        String::from_utf8(rewrite_head(buf, end, &spec(), "s3cret")).expect("utf8")
+    }
+
+    #[test]
+    fn injects_the_credential_and_rewrites_the_upstream_host() {
+        let out = rewrite("GET /user HTTP/1.1\r\nHost: github.api.test\r\nAccept: */*\r\n\r\n");
+        assert!(out.starts_with("GET /user HTTP/1.1\r\n"), "{out:?}");
+        assert!(out.contains("Authorization: Bearer s3cret\r\n"), "{out:?}");
+        assert!(out.contains("Host: api.github.com\r\n"), "{out:?}");
+        assert!(
+            !out.contains("github.api.test"),
+            "local host must not leak: {out:?}"
+        );
+        assert!(
+            out.contains("Accept: */*\r\n"),
+            "unrelated headers survive: {out:?}"
+        );
+        assert!(
+            out.ends_with("\r\n\r\n"),
+            "head must stay terminated: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_caller_supplied_credential_is_stripped_not_duplicated() {
+        let out = rewrite(
+            "GET / HTTP/1.1\r\nHost: github.api.test\r\nAuthorization: Bearer attacker\r\nProxy-Authorization: Basic xyz\r\n\r\n",
+        );
+        assert!(!out.contains("attacker"), "{out:?}");
+        assert!(
+            !out.to_ascii_lowercase().contains("proxy-authorization"),
+            "{out:?}"
+        );
+        assert_eq!(
+            out.matches("Authorization: ").count(),
+            1,
+            "exactly one authorization header: {out:?}"
+        );
+    }
+
+    #[test]
+    fn header_matching_ignores_case_and_whitespace() {
+        let out = rewrite(
+            "GET / HTTP/1.1\r\nhost: github.api.test\r\nAUTHORIZATION : Bearer attacker\r\n\r\n",
+        );
+        assert!(!out.contains("attacker"), "{out:?}");
+        assert_eq!(out.matches("Host: ").count(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn keep_alive_is_forced_closed() {
+        let out =
+            rewrite("GET / HTTP/1.1\r\nHost: github.api.test\r\nConnection: keep-alive\r\n\r\n");
+        assert!(out.contains("Connection: close\r\n"), "{out:?}");
+        assert_eq!(out.matches("Connection: ").count(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn body_bytes_already_read_are_preserved() {
+        let raw = "POST /x HTTP/1.1\r\nHost: github.api.test\r\nContent-Length: 5\r\n\r\nhello";
+        let out = rewrite(raw);
+        assert!(out.ends_with("\r\n\r\nhello"), "{out:?}");
+        assert!(out.contains("Content-Length: 5\r\n"), "{out:?}");
+    }
+
+    #[test]
+    fn the_format_template_is_honoured() {
+        let mut spec = spec();
+        spec.header = "X-Api-Key".into();
+        spec.format = "{value}".into();
+        let raw = "GET / HTTP/1.1\r\nHost: github.api.test\r\n\r\n";
+        let end = raw.len();
+        let out = String::from_utf8(rewrite_head(raw.as_bytes(), end, &spec, "abc123")).unwrap();
+        assert!(out.contains("X-Api-Key: abc123\r\n"), "{out:?}");
+    }
+}

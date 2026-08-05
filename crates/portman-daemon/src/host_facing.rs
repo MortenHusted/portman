@@ -161,7 +161,19 @@ fn spawn_http(
     tokio::spawn(async move {
         let mut attempt = 1u64;
         loop {
-            match proxy::run_on(registry.clone(), addr, bridge.clone(), starter.clone()).await {
+            // Container-facing: egress routes are declared per repo and
+            // resolved on the host-facing proxy, so this listener carries no
+            // credentials rather than a second, differently-scoped set.
+            let credentials: crate::egress::Credentials = Arc::new(crate::egress::NoCredentials);
+            match proxy::run_on(
+                registry.clone(),
+                addr,
+                bridge.clone(),
+                starter.clone(),
+                credentials,
+            )
+            .await
+            {
                 Ok(()) => warn!("container-facing http proxy stopped unexpectedly; retrying"),
                 Err(err) => {
                     warn!(%err, attempt, %addr, "container-facing http proxy failed; retrying")
