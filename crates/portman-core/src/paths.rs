@@ -52,6 +52,12 @@ pub fn secrets_credentials_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("credentials.json"))
 }
 
+/// Bearer token guarding the dashboard's `/api/*` routes. 0600, owned by the
+/// login user so the unprivileged CLI can read it under a root daemon.
+pub fn dashboard_token_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("dashboard-token"))
+}
+
 /// Default TCP port for the embedded web dashboard.
 pub const DEFAULT_DASHBOARD_PORT: u16 = 7341;
 

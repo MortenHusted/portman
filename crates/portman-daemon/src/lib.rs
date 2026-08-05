@@ -6,6 +6,7 @@
 
 mod certs;
 mod dashboard;
+mod dashboard_auth;
 mod dns;
 mod docker_events;
 mod env_compose;
@@ -115,6 +116,12 @@ struct Args {
     /// TCP port for the embedded web dashboard on 127.0.0.1.
     #[arg(long, env = "PORTMAN_DASHBOARD_PORT", default_value_t = portman_core::paths::DEFAULT_DASHBOARD_PORT)]
     dashboard_port: u16,
+
+    /// Require a bearer token on the dashboard's `/api/*` routes. On by
+    /// default: those routes read captured logs and write repo config, and
+    /// loopback is not a trust boundary against local processes.
+    #[arg(long, env = "PORTMAN_DASHBOARD_AUTH", default_value_t = true, action = clap::ArgAction::Set)]
+    dashboard_auth: bool,
 }
 
 /// Snapshot of daemon-level state useful for introspection (e.g. the IPC
@@ -159,6 +166,10 @@ pub(crate) struct DaemonState {
     pub logs: log_store::LogStore,
     /// Machine credentials for secrets providers (0600 store).
     pub credentials: secrets::CredentialsStore,
+    /// Bearer token the dashboard's `/api/*` routes require. `None` disables
+    /// the check (`--dashboard-auth=off`), which is a development escape
+    /// hatch: the API can read logs and write repo config.
+    pub dashboard_token: Option<String>,
     pub dns_port: u16,
     pub proxy_port: u16,
     pub tls_port: u16,
@@ -278,6 +289,16 @@ pub async fn daemon_main() -> Result<()> {
         supervisor.clone(),
     );
 
+    let dashboard_token = if args.dashboard_auth {
+        let path = portman_core::paths::dashboard_token_path()?;
+        let token = dashboard_auth::load_or_create(&path).context("preparing dashboard token")?;
+        info!(path = %path.display(), "dashboard API requires a bearer token");
+        Some(token)
+    } else {
+        warn!("dashboard API auth is OFF; any local process can read logs and write config");
+        None
+    };
+
     let state = DaemonState {
         docker: docker.clone(),
         registry: registry.clone(),
@@ -298,6 +319,7 @@ pub async fn daemon_main() -> Result<()> {
         proxy_port: args.proxy_port,
         tls_port: args.tls_port,
         dashboard_port: args.dashboard_port,
+        dashboard_token,
         started: Instant::now(),
     };
 

@@ -88,6 +88,13 @@ async fn handle_connection(mut stream: TcpStream, state: DaemonState) -> Result<
             }
         }
     }
+    // Loopback keeps the network out, not the machine: any local process can
+    // reach these routes, which read captured logs and write repo config.
+    if let Some(token) = state.dashboard_token.as_deref() {
+        if !crate::dashboard_auth::authorize(raw_path, header_value(&req, "authorization"), token) {
+            return write_response(stream, 401, "text/plain", b"Unauthorized").await;
+        }
+    }
 
     match (method, path) {
         ("GET", "/") | ("GET", "/index.html") => serve_asset(stream, "index.html").await,
@@ -566,6 +573,7 @@ async fn write_response(
 ) -> Result<()> {
     let status = match code {
         200 => "200 OK",
+        401 => "401 Unauthorized",
         403 => "403 Forbidden",
         404 => "404 Not Found",
         505 => "505 HTTP Version Not Supported",
