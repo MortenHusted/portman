@@ -99,7 +99,9 @@ Local-dev networking needs privileges. Here is exactly what portman takes and wh
 - The CLI performs the privileged filesystem writes (`/etc/resolver/<tld>`, launchd plists) via explicit `sudo`, with marker checks so portman only ever overwrites files portman wrote. A resolver file managed by something else (a VPN's split-DNS, say) is a refusal, not a clobber.
 - TLD registration is opt-in per TLD. A container label under an unmanaged TLD is ignored with a warning rather than silently reshaping your DNS.
 - The IPC socket (`portman.sock`) is mode 0660 and peer-credential-gated to root and the owning user. The dashboard binds loopback only and validates Host/Origin.
+- The dashboard's `/api/*` routes require a bearer token (0600 in the daemon's data dir, owned by your login user). Loopback keeps the network out, not other local processes, and those routes read captured logs and write repo config. `portman dashboard` passes the token to the browser; scripts send `Authorization: Bearer $(cat …/dashboard-token)`. `--dashboard-auth=false` turns it off for development.
 - Secrets never live in repo config. `portman.toml` carries provider coordinates only; machine credentials (Infisical universal-auth, 1Password service accounts) are stored 0600 in the daemon's data dir, written via `portman secrets set-*` reading from stdin.
+- Values portman hands a service are masked in that service's captured output before it is stored, so the log store never becomes a second copy of a secret. Exact-value matching, so a value the service transforms before printing is not caught.
 - Optionally, `scripts/setup-sudoers.sh` installs a narrow NOPASSWD sudoers fragment so `portman install` runs unattended. Read it before installing it; nothing requires it.
 
 ## Service runner (`portman.toml`)

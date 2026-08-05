@@ -625,6 +625,9 @@ mod tests {
             proxy_port: 80,
             tls_port: 443,
             dashboard_port: 7341,
+            // These tests drive `handlers::dispatch` directly, below the HTTP
+            // layer that checks the token.
+            dashboard_token: None,
             started: std::time::Instant::now(),
         }
     }

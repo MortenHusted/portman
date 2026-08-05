@@ -18,10 +18,14 @@
 //!
 //! Retention is per-service line cap plus an age sweep on a timer.
 //!
-//! Captured child output may itself contain app-printed secrets; the store
-//! and its read routes carry that exposure by design (0600, root-owned —
-//! same trust boundary as the env files it replaces). The no-secrets rule
-//! covers portman-emitted content, not what services choose to print.
+//! Captured child output may itself contain app-printed secrets. The daemon
+//! wraps this store's sink in `secret_masker`, so values portman handed a
+//! service are replaced with a non-disclosing marker before they are stored.
+//! The store and its read routes (the dashboard included) are a weaker trust
+//! boundary than the provider a value came from, so an unmasked copy here is
+//! a secondary disclosure portman created rather than one the service chose.
+//! Masking is exact-value matching and therefore best-effort: it does not
+//! catch a value the service transformed before printing.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -388,6 +392,69 @@ mod tests {
 
     /// End-to-end: a supervised toy service's stdout lands in the store and
     /// is visible via a direct cursor query (U3 verification).
+    /// End-to-end: a value the supervisor handed a service must not reach the
+    /// store when the service prints it. Wired exactly as the daemon wires it
+    /// (`with_masker` + a wrapped sink), so this covers registration before
+    /// spawn, masking through the sink, and what actually lands in SQLite.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_services_own_secret_never_reaches_the_store() {
+        use crate::secret_masker::SecretMasker;
+        use crate::supervisor::{IdentityPolicy, NoRoutes, NoSecrets, Supervisor, Timings};
+
+        const SECRET: &str = "tok-live-do-not-store-me-42";
+
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let env_file = dir.path().join("svc.env");
+        std::fs::write(&env_file, format!("SECRET_TOKEN={SECRET}\n")).unwrap();
+
+        let store = LogStore::open(&dir.path().join("logs.db"), Retention::default()).unwrap();
+        let masker = SecretMasker::new();
+        let sup = Supervisor::with_masker(
+            dir.path().join("services.json"),
+            crate::env_compose::BaseEnv {
+                user: "test".into(),
+                home,
+            },
+            IdentityPolicy::CurrentUser,
+            Timings::default(),
+            masker.wrap(store.sink()),
+            masker,
+            std::sync::Arc::new(NoSecrets),
+            std::sync::Arc::new(NoRoutes),
+        );
+
+        let mut def = toy_def(dir.path());
+        def.name = "leaky".into();
+        def.run = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "echo \"token is $SECRET_TOKEN\"".into(),
+        ];
+        def.env_files = vec![env_file];
+        sup.sync(dir.path(), vec![def], Default::default())
+            .await
+            .unwrap();
+        sup.up(None).await.unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let line = loop {
+            let chunk = store.query_after("leaky", 0, 10).await.unwrap();
+            if let Some(hit) = chunk.lines.iter().find(|l| l.line.starts_with("token is ")) {
+                break hit.line.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "leaky output never reached the store"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+
+        assert!(!line.contains(SECRET), "secret reached the store: {line}");
+        assert!(line.contains("[masked:"), "expected a marker, got: {line}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn supervised_service_output_is_queryable() {
         use crate::supervisor::{IdentityPolicy, NoRoutes, NoSecrets, Supervisor, Timings};
@@ -408,27 +475,7 @@ mod tests {
             std::sync::Arc::new(NoSecrets),
             std::sync::Arc::new(NoRoutes),
         );
-        let def = portman_protocol::ServiceDefinition {
-            name: "toy".into(),
-            run: vec!["/bin/sh".into(), "-c".into(), "echo toy says hi".into()],
-            dir: dir.path().to_path_buf(),
-            port: None,
-            host: None,
-            mode: portman_protocol::Mode::Http,
-            ready: portman_protocol::ReadyCheck::None,
-            depends: vec![],
-            restart: portman_protocol::RestartPolicy::Never,
-            stop_grace_ms: 300,
-            env_files: vec![],
-            env: Default::default(),
-            secrets: vec![],
-            secrets_optional: false,
-            watch: Vec::new(),
-            watch_mode: Default::default(),
-            watch_debounce_ms: 500,
-            groups: Vec::new(),
-            project: None,
-        };
+        let def = toy_def(dir.path());
         sup.sync(dir.path(), vec![def], Default::default())
             .await
             .unwrap();
@@ -445,6 +492,31 @@ mod tests {
                 "toy output never reached the store"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// A minimal supervised service definition for the end-to-end tests.
+    fn toy_def(dir: &std::path::Path) -> portman_protocol::ServiceDefinition {
+        portman_protocol::ServiceDefinition {
+            name: "toy".into(),
+            run: vec!["/bin/sh".into(), "-c".into(), "echo toy says hi".into()],
+            dir: dir.to_path_buf(),
+            port: None,
+            host: None,
+            mode: portman_protocol::Mode::Http,
+            ready: portman_protocol::ReadyCheck::None,
+            depends: vec![],
+            restart: portman_protocol::RestartPolicy::Never,
+            stop_grace_ms: 300,
+            env_files: vec![],
+            env: Default::default(),
+            secrets: vec![],
+            secrets_optional: false,
+            watch: Vec::new(),
+            watch_mode: Default::default(),
+            watch_debounce_ms: 500,
+            groups: Vec::new(),
+            project: None,
         }
     }
 

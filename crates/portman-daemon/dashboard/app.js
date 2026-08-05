@@ -1,10 +1,31 @@
 const API = '/api';
 
+// The API requires a bearer token. It arrives once as `?token=` on the URL the
+// CLI opens — a navigation cannot set a header — and is then kept in
+// sessionStorage and stripped from the address bar, so it stays out of history,
+// bookmarks and any link the page renders.
+const TOKEN = (() => {
+  const fromUrl = new URLSearchParams(location.search).get('token');
+  if (fromUrl) {
+    sessionStorage.setItem('portman-token', fromUrl);
+    history.replaceState(null, '', location.pathname + location.hash);
+    return fromUrl;
+  }
+  return sessionStorage.getItem('portman-token') || '';
+})();
+
 async function api(path, options = {}) {
   const res = await fetch(API + path, {
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
+      ...(options.headers || {}),
+    },
     ...options,
   });
+  if (res.status === 401) {
+    throw new Error('unauthorized — reopen the dashboard with: portman dashboard');
+  }
   const data = await res.json();
   if (!res.ok || data.kind === 'err') {
     throw new Error(data.message || res.statusText);

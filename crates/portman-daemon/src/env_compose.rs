@@ -41,6 +41,15 @@ pub(crate) struct BaseEnv {
     pub home: PathBuf,
 }
 
+/// The base allowlist keys `compose` always injects. These are ordinary
+/// machine paths and identity, never secret material.
+const BASE_KEYS: [&str; 4] = ["PATH", "HOME", "USER", "TMPDIR"];
+
+/// Whether `key` is one of the base allowlist keys.
+pub(crate) fn is_base_key(key: &str) -> bool {
+    BASE_KEYS.contains(&key)
+}
+
 /// Compose a service environment from declared sources only. Later sources
 /// win: base < env_files (in order) < provider values < inline env.
 ///
@@ -55,10 +64,10 @@ pub(crate) fn compose(
     inline: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>> {
     let mut env = BTreeMap::new();
-    env.insert("PATH".to_string(), path.to_string());
-    env.insert("HOME".to_string(), base.home.display().to_string());
-    env.insert("USER".to_string(), base.user.clone());
-    env.insert("TMPDIR".to_string(), "/tmp".to_string());
+    env.insert(BASE_KEYS[0].to_string(), path.to_string());
+    env.insert(BASE_KEYS[1].to_string(), base.home.display().to_string());
+    env.insert(BASE_KEYS[2].to_string(), base.user.clone());
+    env.insert(BASE_KEYS[3].to_string(), "/tmp".to_string());
 
     for file in env_files {
         apply_env_file(&mut env, file).with_context(|| format!("env_file {}", file.display()))?;

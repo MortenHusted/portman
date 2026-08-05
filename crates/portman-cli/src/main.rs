@@ -499,9 +499,27 @@ async fn cmd_dashboard() -> Result<()> {
         Ok(Response::Status { dashboard_port, .. }) => dashboard_port,
         _ => DEFAULT_DASHBOARD_PORT,
     };
-    let url = format!("http://127.0.0.1:{port}");
-    println!("{url}");
+    // The API needs a bearer token and a browser navigation cannot send a
+    // header, so it rides in once on the query string; the page moves it to
+    // sessionStorage and clears the address bar.
+    let url = match dashboard_token() {
+        Some(token) => format!("http://127.0.0.1:{port}/?token={token}"),
+        None => format!("http://127.0.0.1:{port}"),
+    };
+    println!("http://127.0.0.1:{port}");
     open_browser(&url)
+}
+
+/// The dashboard token, if this user can read it. Absent when auth is off, or
+/// when the daemon could not hand the file to the login user.
+fn dashboard_token() -> Option<String> {
+    let path = portman_core::paths::dashboard_token_path().ok()?;
+    let token = std::fs::read_to_string(&path).ok()?;
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    Some(token.to_string())
 }
 
 fn print_entries(entries: &[Entry]) {
