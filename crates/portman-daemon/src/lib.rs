@@ -15,6 +15,7 @@ mod log_store;
 mod proxy;
 mod resources;
 mod runner;
+mod secret_masker;
 mod secrets;
 mod supervisor;
 mod tcp_forward;

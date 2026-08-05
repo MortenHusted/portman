@@ -47,6 +47,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::env_compose::{self, BaseEnv};
+use crate::secret_masker::SecretMasker;
 
 /// Injectable timings so tests run in milliseconds. Defaults are production
 /// values; there is no fake-clock precedent in this repo — tests keep
@@ -436,6 +437,9 @@ struct Inner {
     identity: IdentityPolicy,
     timings: Timings,
     sink: Arc<dyn LineSink>,
+    /// Values handed to running services, so captured output can be masked
+    /// before it reaches the log store. Empty unless the daemon installed one.
+    masker: Arc<SecretMasker>,
     secrets_source: Arc<dyn SecretsSource>,
     routes: Arc<dyn RouteSink>,
     slots: Mutex<BTreeMap<String, Slot>>,
@@ -462,12 +466,41 @@ pub(crate) struct Supervisor {
 }
 
 impl Supervisor {
+    /// Test constructor: no masker, so a test sink sees exactly what the
+    /// service printed. The daemon always goes through [`Self::for_daemon`].
+    #[cfg(test)]
     pub(crate) fn new(
         state_path: PathBuf,
         base: BaseEnv,
         identity: IdentityPolicy,
         timings: Timings,
         sink: Arc<dyn LineSink>,
+        secrets_source: Arc<dyn SecretsSource>,
+        routes: Arc<dyn RouteSink>,
+    ) -> Self {
+        Self::with_masker(
+            state_path,
+            base,
+            identity,
+            timings,
+            sink,
+            SecretMasker::new(),
+            secrets_source,
+            routes,
+        )
+    }
+
+    /// As [`Self::new`], with the masker the daemon also wrapped its log sink
+    /// in — the supervisor registers each service's secret values there so
+    /// captured output is masked before it is stored.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_masker(
+        state_path: PathBuf,
+        base: BaseEnv,
+        identity: IdentityPolicy,
+        timings: Timings,
+        sink: Arc<dyn LineSink>,
+        masker: Arc<SecretMasker>,
         secrets_source: Arc<dyn SecretsSource>,
         routes: Arc<dyn RouteSink>,
     ) -> Self {
@@ -479,6 +512,7 @@ impl Supervisor {
                 identity,
                 timings,
                 sink,
+                masker,
                 secrets_source,
                 routes,
                 slots: Mutex::new(BTreeMap::new()),
@@ -502,12 +536,14 @@ impl Supervisor {
         let home = portman_core::paths::user_home().context("resolving login user home")?;
         let user = login_user_name();
         let identity = resolve_identity_policy(&user);
-        Ok(Self::new(
+        let masker = SecretMasker::new();
+        Ok(Self::with_masker(
             state_path,
             BaseEnv { user, home },
             identity,
             Timings::default(),
-            sink,
+            masker.wrap(sink),
+            masker,
             secrets_source,
             routes,
         ))
@@ -1244,6 +1280,17 @@ async fn supervise_once(
         Err(err) => return fail(format!("{err:#}")),
     };
 
+    // Register before spawn: a child can print on its first scheduling slice.
+    // Everything the service was given except the base allowlist, which is
+    // ordinary machine paths, and inline `env`, which is committed config.
+    inner.masker.register(
+        name,
+        env.iter()
+            .filter(|(key, _)| !env_compose::is_base_key(key))
+            .filter(|(key, _)| !def.env.contains_key(*key))
+            .map(|(_, value)| value.as_str()),
+    );
+
     let effective_path = env.get("PATH").map(String::as_str).unwrap_or(&path_value);
     let program = match resolve_program(&def.dir, &def.run[0], effective_path) {
         Ok(program) => program,
@@ -1398,6 +1445,9 @@ async fn supervise_once(
             reader.abort();
         }
     }
+    // Only after the readers are done: a line still in flight must not
+    // outlive the registration that masks it.
+    inner.masker.unregister(name);
     attempt
 }
 
