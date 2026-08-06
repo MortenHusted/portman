@@ -740,8 +740,11 @@ where
 }
 
 /// Where the entry came from. Treated identically by the DNS and proxy layers.
+///
+/// Wire-compatible: unknown future variants deserialize to [`Source::Unknown`]
+/// so a newer daemon can't break an older client's whole list parse.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", from = "String")]
 pub enum Source {
     Container,
     Static,
@@ -754,11 +757,30 @@ pub enum Source {
     /// `Service`, kept distinct so tooling can tell routes with no local
     /// backend from routes with one.
     Egress,
+    /// Unknown (newer daemon than this client). Preserved round-trip so a
+    /// future `portman down` can still release the entry.
+    Unknown,
+}
+
+impl From<String> for Source {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "container" => Source::Container,
+            "static" => Source::Static,
+            "service" => Source::Service,
+            "egress" => Source::Egress,
+            _ => Source::Unknown,
+        }
+    }
 }
 
 /// How the entry wants to be reached. Drives proxy behavior and CLI display.
+///
+/// Wire-compatible: unknown future variants deserialize to [`Mode::Unknown`]
+/// (the proxy treats those like [`Mode::Http`] — a plain Host-routed hop —
+/// which is also what an old CLI's unknown mode would mean in practice).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", from = "String")]
 pub enum Mode {
     /// Default. Traffic flows through portman's HTTP proxy; the proxy routes
     /// by `Host:` header to `target`.
@@ -774,6 +796,20 @@ pub enum Mode {
     /// This is the one mode the proxy branches on beyond `Tcp`; routing
     /// otherwise stays source-agnostic.
     Egress,
+    /// Unknown (newer daemon than this client). Rendered as `http` — the
+    /// proxy only special-cases `Tcp` and `Egress`, so routing stays safe.
+    Unknown,
+}
+
+impl From<String> for Mode {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "http" => Mode::Http,
+            "tcp" => Mode::Tcp,
+            "egress" => Mode::Egress,
+            _ => Mode::Unknown,
+        }
+    }
 }
 
 impl Mode {
@@ -791,6 +827,7 @@ impl Mode {
             Mode::Http => "http",
             Mode::Tcp => "tcp",
             Mode::Egress => "egress",
+            Mode::Unknown => "http",
         }
     }
 }
@@ -1092,6 +1129,52 @@ mod tests {
             }
             other => panic!("expected add_static, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unknown_source_and_mode_deserialize_lossily() {
+        // A newer daemon minting `source: "quantum"` / `mode: "wormhole"`
+        // must not break an older client's whole list parse — the CLAUDE.md
+        // wire-compat rule: protocol enums deserialize unknown → Unknown.
+        let json = r#"{
+            "kind": "service_statuses",
+            "services": [{
+                "name": "web",
+                "root": "/repo",
+                "state": "ready",
+                "detail": "",
+                "pid": 123,
+                "restarts": 0,
+                "host": "web.test",
+                "port": 3000,
+                "desired_up": true,
+                "groups": []
+            }]
+        }"#;
+        let response: Response = serde_json::from_str(json).unwrap();
+        match response {
+            Response::ServiceStatuses { services } => {
+                assert_eq!(services.len(), 1);
+                assert_eq!(services[0].name, "web");
+            }
+            other => panic!("expected service_statuses, got {other:?}"),
+        }
+
+        // The Entry variant the older CLI receives on a list query.
+        let json = r#"[
+            {"host":"a.test","target":"127.0.0.1:80","source":"quantum","mode":"wormhole"},
+            {"host":"b.test","target":"api.example.com:443","source":"egress","mode":"egress"}
+        ]"#;
+        let entries: Vec<Entry> = serde_json::from_str(json).unwrap();
+        assert_eq!(entries[0].source, Source::Unknown);
+        assert_eq!(entries[0].mode, Mode::Unknown);
+        assert_eq!(entries[1].source, Source::Egress);
+        assert_eq!(entries[1].mode, Mode::Egress);
+
+        // Unknown still round-trips to a concrete token (never panics the
+        // serializer) — rendered as "http" so an old client's own display
+        // treats it as a plain Host-routed entry.
+        assert_eq!(entries[0].mode.as_str(), "http");
     }
 
     #[test]

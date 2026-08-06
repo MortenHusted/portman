@@ -1096,12 +1096,14 @@ fn render_entries_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
                 Source::Static => "◆",
                 Source::Service => "▸",
                 Source::Egress => "⇗",
+                Source::Unknown => "?",
             };
             let src_style = match e.source {
                 Source::Container => Style::default().fg(Color::Cyan),
                 Source::Static => Style::default().fg(Color::Magenta),
                 Source::Service => Style::default().fg(Color::Green),
                 Source::Egress => Style::default().fg(Color::Yellow),
+                Source::Unknown => Style::default().fg(Color::DarkGray),
             };
             let scheme_style = match scheme {
                 "https" => Style::default().fg(Color::Green).bold(),
@@ -1653,6 +1655,7 @@ fn detail_entry(state: &State) -> (&'static str, Vec<Line<'static>>) {
         Source::Egress => {
             "egress  ([egress.*] in portman.toml — credential attached by portman)".to_string()
         }
+        Source::Unknown => "unknown source  (newer daemon)".to_string(),
     };
     lines.push(kv("  source      ", source_desc));
     lines.push(kv(
@@ -1698,6 +1701,7 @@ fn detail_entry(state: &State) -> (&'static str, Vec<Line<'static>>) {
             }
             Source::Service => "  service entries follow the service — `portman down` to remove",
             Source::Egress => "  egress routes follow the config — remove the block, `portman up`",
+            Source::Unknown => "  entry from a newer daemon — read-only here",
         },
         Style::default().fg(Color::Gray),
     )));

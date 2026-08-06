@@ -76,7 +76,7 @@ async fn handle_event(docker: &Docker, state: &DaemonState, msg: EventMessage) {
             let mode = Mode::parse_label(mode_label(actor).as_deref());
             let port = match (port_label(actor), mode) {
                 (Some(p), _) => p,
-                (None, Mode::Http | Mode::Egress) => "80".into(),
+                (None, Mode::Http | Mode::Egress | Mode::Unknown) => "80".into(),
                 (None, Mode::Tcp) => {
                     warn!(
                         %host,

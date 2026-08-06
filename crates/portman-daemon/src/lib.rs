@@ -616,7 +616,7 @@ async fn seed_from_running_containers(docker: &Docker, state: &DaemonState) {
             .cloned()
             .filter(|v| !v.is_empty())
             .or_else(|| match mode {
-                Mode::Http | Mode::Egress => Some("80".into()),
+                Mode::Http | Mode::Egress | Mode::Unknown => Some("80".into()),
                 Mode::Tcp => None,
             })
         else {
