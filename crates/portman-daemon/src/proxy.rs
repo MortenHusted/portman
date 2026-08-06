@@ -939,6 +939,45 @@ mod tests {
         );
     }
 
+    /// The bytes after the head (a request body already read into the
+    /// buffer) must survive the rewrite untouched — the rewriter emits the
+    /// head from the parsed pairs and the splice appends the body verbatim.
+    #[tokio::test]
+    async fn egress_route_preserves_body_bytes_after_the_head() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let (upstream_addr, upstream) = upstream_once(response).await;
+        let registry = Registry::new();
+        registry.upsert(egress_entry("github.api.test", upstream_addr.to_string()));
+        let proxy_addr = proxy_once_with(
+            registry,
+            StubStarter::inert(),
+            Arc::new(StubCredentials("s3cret-token")),
+            Roots::System,
+        )
+        .await;
+
+        let request =
+            b"POST /hook HTTP/1.1\r\nHost: github.api.test\r\nContent-Length: 5\r\n\r\nhello";
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(request).await.unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert!(std::str::from_utf8(&received)
+            .unwrap()
+            .starts_with("HTTP/1.1 200 OK"));
+
+        let seen = upstream.await.unwrap();
+        let seen = std::str::from_utf8(&seen).unwrap();
+        assert!(
+            seen.contains("Content-Length: 5\r\n"),
+            "the declared body length must survive: {seen:?}"
+        );
+        assert!(
+            seen.ends_with("\r\n\r\nhello"),
+            "body bytes must be appended verbatim after the rewritten head: {seen:?}"
+        );
+    }
+
     /// An egress route with no resolvable credential refuses. Forwarding
     /// unauthenticated would look like a working route while quietly
     /// dropping the guarantee the route exists to provide.
