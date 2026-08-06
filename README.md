@@ -215,7 +215,9 @@ Semantics worth knowing:
 - Route names are global like service names (a second repo claiming the
   same name is refused), and the `host` must sit under a managed TLD, like
   service routes. A changed `host` releases the old hostname; removing the
-  block unregisters the route on the next `portman up`.
+  block unregisters the route on the next `portman up`. A wildcard `host`
+  (`*.api.test`) works like static-rule wildcards: the credential is
+  attached for every one-label subdomain, always to the same `target`.
 
 A few semantics worth knowing before you rely on them:
 
