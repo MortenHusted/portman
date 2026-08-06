@@ -40,7 +40,9 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
-use portman_protocol::{ReadyCheck, RestartPolicy, SecretsProviderConfig, ServiceDefinition};
+use portman_protocol::{
+    EgressRoute, ReadyCheck, RestartPolicy, SecretsProviderConfig, ServiceDefinition,
+};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::watch;
@@ -143,6 +145,17 @@ pub(crate) trait SecretsSource: Send + Sync + 'static {
         blocks: &BTreeMap<String, SecretsProviderConfig>,
     ) -> Result<Vec<(String, String)>, SecretsError>;
 
+    /// Resolve a single `[secrets.<name>]` block to its env pairs, without a
+    /// service. Egress credential lookup names one block this way. Default:
+    /// no values (test seams).
+    async fn resolve_block(
+        &self,
+        _name: &str,
+        _config: &SecretsProviderConfig,
+    ) -> Result<Vec<(String, String)>, SecretsError> {
+        Ok(Vec::new())
+    }
+
     /// Drop any per-run value caches. Called at the sync point (`portman
     /// up`) so config edits fetch fresh values, while backoff restarts and
     /// `portman start` keep reusing the cache.
@@ -171,6 +184,12 @@ impl SecretsSource for NoSecrets {
 pub(crate) trait RouteSink: Send + Sync + 'static {
     fn register(&self, def: &ServiceDefinition);
     fn deregister(&self, def: &ServiceDefinition);
+    /// Register an authenticated-egress route. Unlike service routes there is
+    /// no local backend — the proxy forwards to an external upstream with the
+    /// named credential attached.
+    fn register_egress(&self, _route: &portman_protocol::EgressRoute) {}
+    /// Drop an egress route's registry entry.
+    fn deregister_egress(&self, _route: &portman_protocol::EgressRoute) {}
 }
 
 /// Test seam — production always wires the [`RouteBinder`].
@@ -217,6 +236,7 @@ impl RouteSink for RouteBinder {
             mode: def.mode,
             container_id: None,
             project: def.project.clone(),
+            egress: None,
         });
         if def.mode == portman_protocol::Mode::Http
             && crate::certs::tls_enabled_for_host(&self.tls_store, host)
@@ -250,12 +270,66 @@ impl RouteSink for RouteBinder {
                     mode,
                     container_id: None,
                     project,
+                    egress: None,
                 });
                 info!(service = %def.name, %host, "service route released; static rule re-seeded");
             }
             None => {
                 self.registry.remove(host);
                 info!(service = %def.name, %host, "service route removed");
+            }
+        }
+    }
+
+    fn register_egress(&self, route: &portman_protocol::EgressRoute) {
+        let managed = {
+            let guard = self.known_tlds.read().expect("known_tlds lock poisoned");
+            portman_core::tld::host_has_managed_tld(&route.host, guard.iter())
+        };
+        if !managed {
+            warn!(
+                host = %route.host,
+                "egress host is under an unmanaged TLD; no route derived — run `portman tld add <tld>` first"
+            );
+            return;
+        }
+        self.registry.upsert(portman_protocol::Entry {
+            host: route.host.clone(),
+            target: route.target.clone(),
+            source: portman_protocol::Source::Egress,
+            mode: portman_protocol::Mode::Egress,
+            container_id: None,
+            project: None,
+            egress: Some(route.spec.clone()),
+        });
+        info!(host = %route.host, target = %route.target, "derived egress route");
+    }
+
+    fn deregister_egress(&self, route: &portman_protocol::EgressRoute) {
+        let Some(entry) = self.registry.get(&route.host) else {
+            return;
+        };
+        if entry.source != portman_protocol::Source::Egress {
+            return;
+        }
+        // Same migration-window rule as service routes: a static rule for the
+        // same host outlives the egress route.
+        match self.static_store.get(&route.host) {
+            Some((target, mode, project)) => {
+                self.registry.upsert(portman_protocol::Entry {
+                    host: route.host.clone(),
+                    target,
+                    source: portman_protocol::Source::Static,
+                    mode,
+                    container_id: None,
+                    project,
+                    egress: None,
+                });
+                info!(host = %route.host, "egress route released; static rule re-seeded");
+            }
+            None => {
+                self.registry.remove(&route.host);
+                info!(host = %route.host, "egress route removed");
             }
         }
     }
@@ -333,6 +407,8 @@ struct Persisted {
     services: BTreeMap<String, PersistedService>,
     #[serde(default)]
     secrets: BTreeMap<String, PersistedSecrets>,
+    #[serde(default)]
+    egress: BTreeMap<String, PersistedEgress>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,6 +425,12 @@ struct PersistedService {
 struct PersistedSecrets {
     root: PathBuf,
     config: SecretsProviderConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedEgress {
+    root: PathBuf,
+    route: EgressRoute,
 }
 
 /// Enough identity to recognize (and only then signal) a process group that
@@ -444,6 +526,9 @@ struct Inner {
     routes: Arc<dyn RouteSink>,
     slots: Mutex<BTreeMap<String, Slot>>,
     secrets: Mutex<BTreeMap<String, PersistedSecrets>>,
+    /// Synced `[egress.*]` routes per root; registered in the registry at
+    /// sync time (no service lifecycle — they are live as soon as synced).
+    egress: Mutex<BTreeMap<String, PersistedEgress>>,
     shutdown_tx: watch::Sender<bool>,
     /// Serializes whole `sync()` calls. Classification and mutation happen
     /// under separate `slots` lock holds (stop_and_join awaits in between),
@@ -517,6 +602,7 @@ impl Supervisor {
                 routes,
                 slots: Mutex::new(BTreeMap::new()),
                 secrets: Mutex::new(BTreeMap::new()),
+                egress: Mutex::new(BTreeMap::new()),
                 shutdown_tx,
                 sync_gate: tokio::sync::Mutex::new(()),
                 persist_gate: std::sync::Mutex::new(()),
@@ -558,6 +644,7 @@ impl Supervisor {
         root: &Path,
         services: Vec<ServiceDefinition>,
         secrets: BTreeMap<String, SecretsProviderConfig>,
+        egress: BTreeMap<String, EgressRoute>,
     ) -> Result<SyncReport> {
         // One sync at a time - see Inner::sync_gate.
         let _gate = self.inner.sync_gate.lock().await;
@@ -636,6 +723,67 @@ impl Supervisor {
                 );
             }
         }
+        {
+            // Egress routes have no lifecycle of their own: syncing them IS
+            // the start, removing them is the stop. Re-seed under the same
+            // rule as secrets — this root's set replaces what it had before.
+            let mut routes = self.inner.egress.lock().expect("egress lock poisoned");
+            // A name this root is about to claim, already held by another
+            // root, would be silently clobbered by the insert below — this
+            // root's route would suddenly carry that root's key. Same
+            // global-name rule as services: refuse before mutating anything.
+            for name in egress.keys() {
+                if let Some(held) = routes.get(name) {
+                    if held.root != root {
+                        bail!(
+                            "egress route name `{name}` is already defined by {} — \
+                             egress route names are global, like service names",
+                            held.root.display()
+                        );
+                    }
+                }
+            }
+            let mut removed = Vec::new();
+            let mut release_hosts: Vec<portman_protocol::EgressRoute> = Vec::new();
+            routes.retain(|name, r| {
+                if r.root != root {
+                    return true;
+                }
+                if !egress.contains_key(name) {
+                    removed.push(r.route.clone());
+                    return false;
+                }
+                true
+            });
+            for (name, route) in &egress {
+                // A changed host leaves the OLD hostname live in the registry
+                // (still resolving, still attaching a credential) unless we
+                // release it — the same rule the service path applies when a
+                // definition moves hosts.
+                if let Some(existing) = routes.get(name) {
+                    if existing.route.host != route.host {
+                        release_hosts.push(existing.route.clone());
+                    }
+                }
+                routes.insert(
+                    name.clone(),
+                    PersistedEgress {
+                        root: root.to_path_buf(),
+                        route: route.clone(),
+                    },
+                );
+            }
+            drop(routes);
+            for route in removed {
+                self.inner.routes.deregister_egress(&route);
+            }
+            for route in release_hosts {
+                self.inner.routes.deregister_egress(&route);
+            }
+            for route in egress.values() {
+                self.inner.routes.register_egress(route);
+            }
+        }
         self.persist();
         self.inner.secrets_source.invalidate();
 
@@ -643,6 +791,45 @@ impl Supervisor {
             self.up(Some(&[name])).await?;
         }
         Ok(report)
+    }
+
+    /// Resolve the single secret value an egress route names: find the
+    /// `[secrets.*]` block config, resolve it through the provider (sharing
+    /// the service-path cache), and pick the named key out.
+    ///
+    /// Returns `None` when the block isn't synced, the provider fails, or
+    /// the key is absent — the proxy turns every one of those into a refusal
+    /// rather than forwarding an unauthenticated request.
+    pub(crate) async fn resolve_egress_value(
+        &self,
+        spec: &portman_protocol::EgressSpec,
+    ) -> Option<String> {
+        let config = {
+            let secrets = self.inner.secrets.lock().expect("secrets lock poisoned");
+            secrets.get(&spec.secrets).map(|p| p.config.clone())
+        }?;
+        let values = self
+            .inner
+            .secrets_source
+            .resolve_block(&spec.secrets, &config)
+            .await
+            .ok()?;
+        let value = values.into_iter().find(|(k, _)| k == &spec.key)?.1;
+        if value.is_empty() {
+            // A resolved-but-empty value is indistinguishable from an absent
+            // one to the upstream: an `Authorization: Bearer ` line with
+            // nothing after it. Refuse rather than "authenticate" with it.
+            return None;
+        }
+        // A proxied credential is still a credential: register it with the
+        // masker so no captured service output can carry it into the log
+        // store (services never receive egress values, but an upstream that
+        // echoes one into another service's logs shouldn't persist there).
+        self.inner.masker.register(
+            &format!("__egress__/{}/{}", spec.secrets, spec.key),
+            std::iter::once(value.as_str()),
+        );
+        Some(value)
     }
 
     /// Mark services desired-up and ensure their runner tasks exist. `None`
@@ -825,6 +1012,16 @@ impl Supervisor {
         {
             let mut blocks = self.inner.secrets.lock().expect("secrets lock poisoned");
             blocks.extend(persisted.secrets);
+        }
+        {
+            let mut routes = self.inner.egress.lock().expect("egress lock poisoned");
+            for (name, pe) in persisted.egress {
+                // Routes are stateless registry entries — re-register on
+                // restore so a daemon restart re-establishes them without
+                // waiting for the next `portman up`.
+                self.inner.routes.register_egress(&pe.route);
+                routes.insert(name, pe);
+            }
         }
 
         for (name, marker) in &markers {
@@ -1792,6 +1989,7 @@ fn persist(inner: &Arc<Inner>) {
     let persisted = {
         let slots = inner.slots.lock().expect("slots lock poisoned");
         let secrets = inner.secrets.lock().expect("secrets lock poisoned");
+        let egress = inner.egress.lock().expect("egress lock poisoned");
         Persisted {
             version: 1,
             services: slots
@@ -1809,6 +2007,7 @@ fn persist(inner: &Arc<Inner>) {
                 })
                 .collect(),
             secrets: secrets.clone(),
+            egress: egress.clone(),
         }
     };
     if let Err(err) = crate::block_on_reactor(|| write_persisted(&inner.state_path, &persisted)) {
@@ -2019,7 +2218,9 @@ mod tests {
             ],
             &workdir,
         );
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(Some(&["probe".to_string()])).await.unwrap();
         wait_for_state(&sup, "probe", StateKind::Failed, Duration::from_secs(20)).await;
         wait_for_line(&sink, |l| l.trim().parse::<u32>().is_ok()).await;
@@ -2102,7 +2303,9 @@ mod tests {
         );
 
         let svc = def("shimmy", &["mytool"], &repo);
-        sup.sync(&repo, vec![svc], Map::new()).await.unwrap();
+        sup.sync(&repo, vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(Some(&["shimmy".to_string()])).await.unwrap();
         wait_for_state(&sup, "shimmy", StateKind::Failed, Duration::from_secs(20)).await;
         wait_for_line(&sink, |l| l.starts_with("PATH=")).await;
@@ -2129,6 +2332,7 @@ mod tests {
         sup.sync(
             &repo,
             vec![def("shimmy", &["mytool"], &repo), svc2],
+            Map::new(),
             Map::new(),
         )
         .await
@@ -2168,7 +2372,9 @@ mod tests {
         let mut svc = def("porty", &["/bin/sleep", "10"], dir.path());
         svc.ready = ReadyCheck::Port(port);
         svc.restart = RestartPolicy::Never;
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(Some(&["porty".to_string()])).await.unwrap();
 
         // Not ready while nothing listens.
@@ -2259,7 +2465,9 @@ mod tests {
             &[&trigger],
         );
         svc.ready = ReadyCheck::DelayMs(50);
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(Some(&["watchy".to_string()])).await.unwrap();
         wait_for_state(&sup, "watchy", StateKind::Ready, Duration::from_secs(20)).await;
         let first = running_pid(&sup, "watchy").await;
@@ -2294,7 +2502,9 @@ mod tests {
         );
         svc.ready = ReadyCheck::DelayMs(50);
         svc.restart = RestartPolicy::Never;
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(Some(&["budget".to_string()])).await.unwrap();
         wait_for_state(&sup, "budget", StateKind::Ready, Duration::from_secs(20)).await;
 
@@ -2338,7 +2548,9 @@ mod tests {
             &[&built],
         );
         svc.restart = RestartPolicy::Never;
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(Some(&["revive".to_string()])).await.unwrap();
         wait_for_state(&sup, "revive", StateKind::Failed, Duration::from_secs(20)).await;
 
@@ -2364,7 +2576,9 @@ mod tests {
             &[&trigger],
         );
         svc.ready = ReadyCheck::DelayMs(50);
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(Some(&["sticky".to_string()])).await.unwrap();
         wait_for_state(&sup, "sticky", StateKind::Ready, Duration::from_secs(20)).await;
         sup.down(None).await.unwrap();
@@ -2397,7 +2611,9 @@ mod tests {
             &[&not_yet_built],
         );
         svc.ready = ReadyCheck::DelayMs(50);
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(Some(&["late".to_string()])).await.unwrap();
         wait_for_state(&sup, "late", StateKind::Ready, Duration::from_secs(20)).await;
         let first = running_pid(&sup, "late").await;
@@ -2436,7 +2652,7 @@ mod tests {
                 let root = root_a.clone();
                 tokio::spawn(async move {
                     let svc = def("shared-name", &["/bin/sleep", "1"], &root);
-                    sup.sync(&root, vec![svc], Map::new()).await
+                    sup.sync(&root, vec![svc], Map::new(), Map::new()).await
                 })
             };
             let tb = {
@@ -2444,7 +2660,7 @@ mod tests {
                 let root = root_b.clone();
                 tokio::spawn(async move {
                     let svc = def("shared-name", &["/bin/sleep", "1"], &root);
-                    sup.sync(&root, vec![svc], Map::new()).await
+                    sup.sync(&root, vec![svc], Map::new(), Map::new()).await
                 })
             };
             let (ra, rb) = (ta.await.unwrap(), tb.await.unwrap());
@@ -2455,7 +2671,9 @@ mod tests {
             );
             // Clean the slate: the winner forgets its claim for the next round.
             let winner_root = if ra.is_ok() { &root_a } else { &root_b };
-            sup.sync(winner_root, vec![], Map::new()).await.unwrap();
+            sup.sync(winner_root, vec![], Map::new(), Map::new())
+                .await
+                .unwrap();
         }
     }
 
@@ -2468,7 +2686,9 @@ mod tests {
         let sup = test_supervisor(&dir, CollectSink::new());
         for i in 0..25 {
             let svc = def("racer", &["/bin/sleep", "5"], dir.path());
-            sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+            sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+                .await
+                .unwrap();
             let a = {
                 let sup = sup.clone();
                 tokio::spawn(async move { sup.up(Some(&["racer".to_string()])).await })
@@ -2476,7 +2696,7 @@ mod tests {
             let b = {
                 let sup = sup.clone();
                 let root = dir.path().to_path_buf();
-                tokio::spawn(async move { sup.sync(&root, vec![], Map::new()).await })
+                tokio::spawn(async move { sup.sync(&root, vec![], Map::new(), Map::new()).await })
             };
             // Either interleaving is a legal outcome; a panicked task is not.
             assert!(a.await.is_ok(), "up panicked on iteration {i}");
@@ -2508,7 +2728,9 @@ mod tests {
         let mut svc = def("solo", &[script.to_str().unwrap()], dir.path());
         svc.env.insert("PORTMAN_TEST_RUN".into(), "1".into());
         svc.ready = ReadyCheck::DelayMs(50);
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
 
         let ups: Vec<_> = (0..8)
             .map(|_| {
@@ -2556,7 +2778,9 @@ mod tests {
         let mut svc = def("stdin-holder", &[script.to_str().unwrap()], dir.path());
         svc.ready = ReadyCheck::DelayMs(100);
         svc.restart = RestartPolicy::Never;
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(Some(&["stdin-holder".to_string()])).await.unwrap();
 
         wait_for_state(
@@ -2582,7 +2806,9 @@ mod tests {
         let mut svc = def("never-ready", &["/bin/sleep", "10"], dir.path());
         svc.ready = ReadyCheck::Port(port);
         svc.restart = RestartPolicy::Never;
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(Some(&["never-ready".to_string()])).await.unwrap();
 
         wait_for_state(
@@ -2604,7 +2830,9 @@ mod tests {
 
         let mut svc = def("crashy", &["/bin/sh", "-c", "echo attempt"], dir.path());
         svc.restart = RestartPolicy::Limit(2);
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
 
         let started = Instant::now();
         sup.up(Some(&["crashy".to_string()])).await.unwrap();
@@ -2638,7 +2866,9 @@ mod tests {
         );
         svc.stop_grace_ms = 250;
         svc.restart = RestartPolicy::Always;
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(Some(&["stubborn".to_string()])).await.unwrap();
         wait_for_state(&sup, "stubborn", StateKind::Ready, Duration::from_secs(20)).await;
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -2672,7 +2902,7 @@ mod tests {
         let mut top = def("top", &["/bin/sleep", "10"], dir.path());
         top.depends = vec!["dep".to_string()];
         top.restart = RestartPolicy::Always;
-        sup.sync(dir.path(), vec![dep, top], Map::new())
+        sup.sync(dir.path(), vec![dep, top], Map::new(), Map::new())
             .await
             .unwrap();
         sup.up(None).await.unwrap();
@@ -2701,7 +2931,9 @@ mod tests {
         let mut b = def("b", &["/bin/sleep", "10"], dir.path());
         b.depends = vec!["a".to_string()];
         b.restart = RestartPolicy::Always;
-        sup.sync(dir.path(), vec![a, b], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![a, b], Map::new(), Map::new())
+            .await
+            .unwrap();
 
         let started = sup.up(Some(&["b".to_string()])).await.unwrap();
         assert_eq!(started, vec!["a".to_string(), "b".to_string()]);
@@ -2715,7 +2947,9 @@ mod tests {
         let sup = test_supervisor(&dir, CollectSink::new());
         let mut svc = def("keeper", &["/bin/sleep", "10"], dir.path());
         svc.restart = RestartPolicy::Always;
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(None).await.unwrap();
         wait_for_state(&sup, "keeper", StateKind::Ready, Duration::from_secs(20)).await;
         sup.down(None).await.unwrap();
@@ -2749,7 +2983,12 @@ mod tests {
 
         let sup_a = patient_supervisor(&dir, CollectSink::new());
         sup_a
-            .sync(dir.path(), vec![make_def(dir.path())], Map::new())
+            .sync(
+                dir.path(),
+                vec![make_def(dir.path())],
+                Map::new(),
+                Map::new(),
+            )
             .await
             .unwrap();
         sup_a.up(None).await.unwrap();
@@ -2817,6 +3056,7 @@ mod tests {
                 },
             )]),
             secrets: Map::new(),
+            egress: Map::new(),
         };
         write_persisted(&dir.path().join("services.json"), &persisted).unwrap();
 
@@ -2861,6 +3101,7 @@ mod tests {
                 },
             )]),
             secrets: Map::new(),
+            egress: Map::new(),
         };
         write_persisted(&dir.path().join("services.json"), &persisted).unwrap();
 
@@ -2883,7 +3124,7 @@ mod tests {
         one.restart = RestartPolicy::Always;
         let mut two = def("two", &["/bin/sleep", "10"], dir.path());
         two.restart = RestartPolicy::Always;
-        sup.sync(dir.path(), vec![one.clone(), two], Map::new())
+        sup.sync(dir.path(), vec![one.clone(), two], Map::new(), Map::new())
             .await
             .unwrap();
         sup.up(None).await.unwrap();
@@ -2901,7 +3142,7 @@ mod tests {
         let mut one_v2 = one.clone();
         one_v2.run = vec!["/bin/sh".into(), "-c".into(), "echo v2; sleep 10".into()];
         let report = sup
-            .sync(dir.path(), vec![one_v2], Map::new())
+            .sync(dir.path(), vec![one_v2], Map::new(), Map::new())
             .await
             .unwrap();
         assert_eq!(report.updated, vec!["one"]);
@@ -2934,8 +3175,10 @@ mod tests {
         web.restart = RestartPolicy::Always;
         let worker = def("worker", &["/bin/sleep", "300"], &other_root);
 
-        sup.sync(&root, vec![web], Map::new()).await.unwrap();
-        sup.sync(&other_root, vec![worker], Map::new())
+        sup.sync(&root, vec![web], Map::new(), Map::new())
+            .await
+            .unwrap();
+        sup.sync(&other_root, vec![worker], Map::new(), Map::new())
             .await
             .unwrap();
         sup.up(None).await.unwrap();
@@ -2959,7 +3202,10 @@ mod tests {
             "service process must be alive before it is forgotten"
         );
 
-        let report = sup.sync(&root, Vec::new(), Map::new()).await.unwrap();
+        let report = sup
+            .sync(&root, Vec::new(), Map::new(), Map::new())
+            .await
+            .unwrap();
 
         assert_eq!(report.removed, vec!["web"]);
         assert_eq!(
@@ -2990,6 +3236,7 @@ mod tests {
             &root_a,
             vec![def("web", &["/bin/sleep", "1"], &root_a)],
             Map::new(),
+            Map::new(),
         )
         .await
         .unwrap();
@@ -2997,6 +3244,7 @@ mod tests {
             .sync(
                 &root_b,
                 vec![def("web", &["/bin/sleep", "1"], &root_b)],
+                Map::new(),
                 Map::new(),
             )
             .await
@@ -3056,7 +3304,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let (sup, registry, _static_store) = route_test_setup(&dir);
         let svc = routed_def("web", "web.internal", 34567, dir.path());
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
 
         assert!(
             registry.get("web.internal").is_none(),
@@ -3072,6 +3322,223 @@ mod tests {
             registry.get("web.internal").is_none(),
             "route removed on down"
         );
+    }
+
+    fn egress_route(host: &str) -> EgressRoute {
+        EgressRoute {
+            host: host.to_string(),
+            target: "api.github.com:443".into(),
+            spec: portman_protocol::EgressSpec {
+                secrets: "gh".into(),
+                key: "TOKEN".into(),
+                header: "Authorization".into(),
+                format: "Bearer {value}".into(),
+                upstream_host: "api.github.com".into(),
+                tls: true,
+            },
+        }
+    }
+
+    /// Egress routes have no lifecycle of their own — syncing them registers
+    /// the route immediately (there's no `up`/`down`), and removing the block
+    /// from the synced set unregisters it. A replaced target upserts in place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn egress_route_registers_on_sync_and_removes_on_resync() {
+        let dir = tempdir().unwrap();
+        let (sup, registry, _static_store) = route_test_setup(&dir);
+
+        sup.sync(
+            dir.path(),
+            vec![],
+            Map::new(),
+            Map::from([("gh".to_string(), egress_route("github.internal"))]),
+        )
+        .await
+        .unwrap();
+        let entry = registry.get("github.internal").expect("registered on sync");
+        assert_eq!(entry.source, portman_protocol::Source::Egress);
+        assert_eq!(entry.mode, portman_protocol::Mode::Egress);
+        assert_eq!(entry.target, "api.github.com:443");
+        assert!(entry.egress.as_ref().unwrap().tls);
+
+        // Re-sync with a changed target: the route is replaced in place.
+        let mut changed = egress_route("github.internal");
+        changed.target = "api.other.com:443".into();
+        changed.spec.upstream_host = "api.other.com".into();
+        sup.sync(
+            dir.path(),
+            vec![],
+            Map::new(),
+            Map::from([("gh".into(), changed)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            registry.get("github.internal").unwrap().target,
+            "api.other.com:443"
+        );
+
+        // Re-sync with the block gone: the route is unregistered.
+        sup.sync(dir.path(), vec![], Map::new(), Map::new())
+            .await
+            .unwrap();
+        assert!(
+            registry.get("github.internal").is_none(),
+            "route removed when its block is dropped"
+        );
+    }
+
+    /// Egress route names are global, like service names: a second repo
+    /// claiming the same name must be refused BEFORE any mutation, or its
+    /// insert would silently clobber the first repo's route and start
+    /// attaching the first repo's key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn egress_route_name_collision_across_roots_is_refused() {
+        let dir = tempdir().unwrap();
+        let (sup, registry, _static_store) = route_test_setup(&dir);
+
+        sup.sync(
+            dir.path(),
+            vec![],
+            Map::new(),
+            Map::from([("gh".to_string(), egress_route("github.internal"))]),
+        )
+        .await
+        .unwrap();
+        assert!(registry.get("github.internal").is_some());
+
+        let other = dir.path().join("other-repo");
+        std::fs::create_dir_all(&other).unwrap();
+        let err = sup
+            .sync(
+                &other,
+                vec![],
+                Map::new(),
+                Map::from([("gh".to_string(), egress_route("github.internal"))]),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already defined"),
+            "collision must be refused: {err}"
+        );
+        // The first root's route survives untouched.
+        let entry = registry.get("github.internal").unwrap();
+        assert_eq!(entry.source, portman_protocol::Source::Egress);
+        assert_eq!(entry.target, "api.github.com:443");
+    }
+
+    /// A route whose HOST changes must release the old hostname, or it stays
+    /// live in the registry — still resolving, still attaching a credential,
+    /// and now unreachable from the persisted map (only a daemon restart
+    /// would clear it).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn egress_host_change_releases_the_old_route() {
+        let dir = tempdir().unwrap();
+        let (sup, registry, _static_store) = route_test_setup(&dir);
+
+        sup.sync(
+            dir.path(),
+            vec![],
+            Map::new(),
+            Map::from([("gh".to_string(), egress_route("github.internal"))]),
+        )
+        .await
+        .unwrap();
+        assert!(registry.get("github.internal").is_some());
+
+        let mut moved = egress_route("other.internal");
+        moved.target = "api.other.com:443".into();
+        moved.spec.upstream_host = "api.other.com".into();
+        sup.sync(
+            dir.path(),
+            vec![],
+            Map::new(),
+            Map::from([("gh".to_string(), moved)]),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            registry.get("github.internal").is_none(),
+            "old host must be released on host change"
+        );
+        let entry = registry.get("other.internal").expect("new host routed");
+        assert_eq!(entry.target, "api.other.com:443");
+    }
+
+    /// The production credential path end to end: a synced secrets block,
+    /// resolution through the source's `resolve_block` (the entry point
+    /// egress uses, distinct from the service path), key selection, and
+    /// registration with the masker so captured output can't carry the
+    /// value into the log store.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_egress_value_resolves_key_and_registers_masker() {
+        let dir = tempdir().unwrap();
+        let sink = CollectSink::new();
+        let source = ScriptedSecrets::new(vec![Ok(vec![
+            ("GITHUB_TOKEN".to_string(), "ghs_abcdef123456".to_string()),
+            ("OTHER".to_string(), "zzz".to_string()),
+        ])]);
+        let sup = secrets_supervisor(&dir, source, sink);
+        let config = SecretsProviderConfig::OnePassword { refs: Map::new() };
+        sup.sync(
+            dir.path(),
+            vec![],
+            Map::from([("gh".to_string(), config)]),
+            Map::new(),
+        )
+        .await
+        .unwrap();
+
+        let spec = portman_protocol::EgressSpec {
+            secrets: "gh".into(),
+            key: "GITHUB_TOKEN".into(),
+            header: "Authorization".into(),
+            format: "Bearer {value}".into(),
+            upstream_host: "api.github.com".into(),
+            tls: true,
+        };
+        let value = sup.resolve_egress_value(&spec).await;
+        assert_eq!(value.as_deref(), Some("ghs_abcdef123456"));
+
+        // The resolved value must be registered with the masker under the
+        // egress pseudo-service, so any captured line echoing it is masked
+        // before it reaches the log store.
+        let masked = sup.inner.masker.mask("token ghs_abcdef123456 here");
+        assert!(!masked.contains("ghs_abcdef123456"), "{masked}");
+    }
+
+    /// A resolved-but-empty value is refused exactly like a missing key —
+    /// `Authorization: Bearer ` with nothing after it authenticates nothing
+    /// and must never be forwarded as success.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_egress_value_treats_empty_as_unavailable() {
+        let dir = tempdir().unwrap();
+        let source =
+            ScriptedSecrets::new(vec![Ok(vec![("GITHUB_TOKEN".to_string(), "".to_string())])]);
+        let sup = secrets_supervisor(&dir, source, CollectSink::new());
+        sup.sync(
+            dir.path(),
+            vec![],
+            Map::from([(
+                "gh".to_string(),
+                SecretsProviderConfig::OnePassword { refs: Map::new() },
+            )]),
+            Map::new(),
+        )
+        .await
+        .unwrap();
+
+        let spec = portman_protocol::EgressSpec {
+            secrets: "gh".into(),
+            key: "GITHUB_TOKEN".into(),
+            header: "Authorization".into(),
+            format: "Bearer {value}".into(),
+            upstream_host: "api.github.com".into(),
+            tls: true,
+        };
+        assert_eq!(sup.resolve_egress_value(&spec).await, None);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3096,10 +3563,13 @@ mod tests {
             mode: portman_protocol::Mode::Http,
             container_id: None,
             project: None,
+            egress: None,
         });
 
         let svc = routed_def("web", "web.internal", 34568, dir.path());
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(None).await.unwrap();
         let entry = registry.get("web.internal").unwrap();
         assert_eq!(entry.source, portman_protocol::Source::Service);
@@ -3117,7 +3587,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let (sup, registry, _static_store) = route_test_setup(&dir);
         let svc = routed_def("web", "web.unmanaged", 34569, dir.path());
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(None).await.unwrap();
         assert!(registry.get("web.unmanaged").is_none());
         sup.down(None).await.unwrap();
@@ -3128,12 +3600,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let (sup, registry, _static_store) = route_test_setup(&dir);
         let svc = routed_def("web", "web.internal", 34570, dir.path());
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(None).await.unwrap();
         assert!(registry.get("web.internal").is_some());
 
         // The service disappears from the config → stopped + unrouted.
-        sup.sync(dir.path(), vec![], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![], Map::new(), Map::new())
+            .await
+            .unwrap();
         assert!(registry.get("web.internal").is_none());
     }
 
@@ -3165,6 +3641,39 @@ mod tests {
             } else {
                 outcomes[0].clone()
             }
+        }
+
+        /// Egress resolution names a block directly (`resolve_egress_value`),
+        /// bypassing the service path — so the stub must script that entry
+        /// point too, or every egress test would see "no values" regardless
+        /// of what was scripted.
+        async fn resolve_block(
+            &self,
+            _name: &str,
+            _config: &SecretsProviderConfig,
+        ) -> Result<Vec<(String, String)>, SecretsError> {
+            let ignored = ServiceDefinition {
+                name: String::new(),
+                run: vec![],
+                dir: std::path::PathBuf::new(),
+                port: None,
+                host: None,
+                mode: portman_protocol::Mode::Http,
+                ready: portman_protocol::ReadyCheck::None,
+                depends: vec![],
+                restart: portman_protocol::RestartPolicy::Never,
+                stop_grace_ms: 0,
+                env_files: vec![],
+                env: std::collections::BTreeMap::new(),
+                secrets: vec![],
+                secrets_optional: false,
+                watch: vec![],
+                watch_mode: portman_protocol::WatchMode::Poll,
+                watch_debounce_ms: 0,
+                groups: vec![],
+                project: None,
+            };
+            self.resolve(&ignored, &Map::new()).await
         }
     }
 
@@ -3211,7 +3720,9 @@ mod tests {
         svc.env_files = vec![env_file];
         svc.env = Map::from([("INLINE_WINS".to_string(), "inline".to_string())]);
         svc.secrets = vec!["stub".to_string()];
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(None).await.unwrap();
         wait_for_state(&sup, "mix", StateKind::Failed, Duration::from_secs(20)).await;
         wait_for_line(&sink, |l| l.starts_with("FROM_PROVIDER=")).await;
@@ -3235,7 +3746,9 @@ mod tests {
         let mut svc = def("flaky", &["/bin/sleep", "10"], dir.path());
         svc.restart = RestartPolicy::Always;
         svc.secrets = vec!["stub".to_string()];
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(None).await.unwrap();
 
         // Two transient failures back off, the third attempt comes up.
@@ -3254,7 +3767,9 @@ mod tests {
         let mut svc = def("rejected", &["/bin/sleep", "10"], dir.path());
         svc.restart = RestartPolicy::Always; // fatal must short-circuit this
         svc.secrets = vec!["stub".to_string()];
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(None).await.unwrap();
 
         wait_for_state(&sup, "rejected", StateKind::Failed, Duration::from_secs(20)).await;
@@ -3273,7 +3788,9 @@ mod tests {
         svc.restart = RestartPolicy::Always;
         svc.secrets = vec!["stub".to_string()];
         svc.secrets_optional = true;
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(None).await.unwrap();
 
         wait_for_state(&sup, "fallback", StateKind::Ready, Duration::from_secs(20)).await;
@@ -3291,7 +3808,9 @@ mod tests {
         let sup = test_supervisor(&dir, CollectSink::new());
         let mut svc = def("boots", &["/bin/sleep", "10"], dir.path());
         svc.restart = RestartPolicy::Always;
-        sup.sync(dir.path(), vec![svc], Map::new()).await.unwrap();
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
         sup.up(None).await.unwrap();
         wait_for_state(&sup, "boots", StateKind::Ready, Duration::from_secs(20)).await;
         let pid = sup.status()[0].pid.unwrap();

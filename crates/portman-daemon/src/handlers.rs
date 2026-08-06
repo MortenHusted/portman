@@ -36,7 +36,8 @@ pub(crate) async fn dispatch(request: Request, state: &DaemonState) -> Response 
             root,
             services,
             secrets,
-        } => handle_sync_services(state, root, services, secrets).await,
+            egress,
+        } => handle_sync_services(state, root, services, secrets, egress).await,
         Request::ServiceUp { names } => handle_service_up(state, names).await,
         Request::ServiceDown { names } => handle_service_down(state, names).await,
         Request::ServiceStatus => handle_service_status(state),
@@ -89,6 +90,7 @@ async fn handle_sync_services(
     root: std::path::PathBuf,
     services: Vec<portman_protocol::ServiceDefinition>,
     secrets: std::collections::BTreeMap<String, portman_protocol::SecretsProviderConfig>,
+    egress: std::collections::BTreeMap<String, portman_protocol::EgressRoute>,
 ) -> Response {
     // Definitions arrive pre-validated by the CLI's config parser, but the
     // socket is open to any local client — re-check the basics.
@@ -100,7 +102,11 @@ async fn handle_sync_services(
             ));
         }
     }
-    match state.supervisor.sync(&root, services, secrets).await {
+    match state
+        .supervisor
+        .sync(&root, services, secrets, egress)
+        .await
+    {
         Ok(report) => Response::SyncReport {
             added: report.added,
             updated: report.updated,
@@ -403,6 +409,7 @@ fn handle_add(
         mode,
         container_id: None,
         project,
+        egress: None,
     });
     if mode == Mode::Http && state.host_tls_enabled(&host) {
         if let Err(err) = state.cert_manager.ensure(&host) {
@@ -765,6 +772,7 @@ mod tests {
                 root: dir.path().to_path_buf(),
                 services: vec![def],
                 secrets: Default::default(),
+                egress: Default::default(),
             },
             &state,
         )

@@ -151,6 +151,7 @@ mod tests {
             mode: portman_protocol::Mode::Http,
             container_id: Some(id.into()),
             project: None,
+            egress: None,
         }
     }
 
@@ -201,6 +202,7 @@ mod tests {
             mode: portman_protocol::Mode::Http,
             container_id: None,
             project: None,
+            egress: None,
         }
     }
 

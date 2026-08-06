@@ -9,6 +9,8 @@ mod dashboard;
 mod dashboard_auth;
 mod dns;
 mod docker_events;
+mod egress;
+mod egress_client;
 mod env_compose;
 mod handlers;
 mod ipc_server;
@@ -374,11 +376,21 @@ pub async fn daemon_main() -> Result<()> {
     // bridge-subnet sockets to it so an exit-node can't capture them.
     let bridge_ifindex = state.netbridge.ifindex.clone();
     let starter: Arc<dyn runner::Starter> = Arc::new(state.runner.clone());
+    // Egress credentials are resolved inside the daemon at proxy time; the
+    // proxy gains that one capability, not the whole state, mirroring how the
+    // runner reaches it. The upstream handshake verifies against the
+    // compiled-in Mozilla trust set — portman is originating TLS here.
+    let egress_credentials: crate::egress::Credentials =
+        Arc::new(crate::egress::SupervisorCredentials {
+            supervisor: supervisor.clone(),
+        });
     let http = tokio::spawn(proxy::run(
         state.registry.clone(),
         args.proxy_port,
         bridge_ifindex.clone(),
         starter.clone(),
+        egress_credentials.clone(),
+        crate::egress_client::Roots::System,
     ));
     // Loopback front for TCP-mode entries (databases etc.): keeps them
     // reachable even when a VPN/exit-node captures the target's real subnet.
@@ -548,6 +560,7 @@ fn seed_from_static_store(state: &DaemonState) {
             mode,
             container_id: None,
             project,
+            egress: None,
         });
         seeded += 1;
     }
@@ -603,7 +616,7 @@ async fn seed_from_running_containers(docker: &Docker, state: &DaemonState) {
             .cloned()
             .filter(|v| !v.is_empty())
             .or_else(|| match mode {
-                Mode::Http => Some("80".into()),
+                Mode::Http | Mode::Egress | Mode::Unknown => Some("80".into()),
                 Mode::Tcp => None,
             })
         else {
@@ -630,6 +643,7 @@ async fn seed_from_running_containers(docker: &Docker, state: &DaemonState) {
                         source: Source::Container,
                         mode,
                         container_id: Some(short(id).to_string()),
+                        egress: None,
                         project: inspect
                             .config
                             .as_ref()
