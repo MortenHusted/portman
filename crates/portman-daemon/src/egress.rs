@@ -32,9 +32,12 @@ pub(crate) trait CredentialSource: Send + Sync + 'static {
     async fn resolve(&self, spec: &EgressSpec) -> Option<String>;
 }
 
-/// No egress routes configured; every lookup misses.
+/// No egress routes configured; every lookup misses. The host-facing proxy
+/// that passes it is macOS-only, so on Linux only tests construct it.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) struct NoCredentials;
 
+#[cfg(any(target_os = "macos", test))]
 #[async_trait::async_trait]
 impl CredentialSource for NoCredentials {
     async fn resolve(&self, _spec: &EgressSpec) -> Option<String> {
