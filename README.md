@@ -164,6 +164,59 @@ paths = ["/apps/myapp", "/shared"]           # first path wins on duplicate keys
 # API_KEY = "op://vault/item/field"          # resolved via `op` + service-account token
 ```
 
+### Authenticated egress (`[egress.<name>]`)
+
+An egress route is a local hostname that proxies to an **external** upstream
+with a credential attached — the caller never holds the value. This is the
+same shape as an authenticated reverse proxy in front of a REST API: a local
+process that can reach the hostname gets an authenticated request without the
+token ever entering its environment, a config file, or a log.
+
+```toml
+[secrets.github]
+provider = "1password"
+[secrets.github.refs]
+TOKEN = "op://dev/github/token"
+
+[egress.github]
+host = "github.api.test"          # local hostname callers address (managed TLD)
+target = "api.github.com:443"     # external upstream host:port
+secrets = "github"                # [secrets.<name>] block the value comes from
+key = "TOKEN"                     # key within that block
+# header = "Authorization"        # default
+# format = "Bearer {value}"       # default; must contain {value}
+# upstream_host = "api.github.com" # Host header the upstream sees (default: target hostname)
+tls = true                        # required unless target is the local machine
+```
+
+Calling `curl http://github.api.test/user` forwards to `api.github.com` over
+TLS as `Authorization: Bearer <token>` with `Host: api.github.com`; the
+caller's own auth headers are stripped first, so the injected credential is
+the only one that arrives. Routes are reached over plain `http://` on `:80`
+— portman originates TLS to the upstream itself; the `:443` listener refuses
+egress hosts.
+
+Semantics worth knowing:
+
+- **The credential is resolved at proxy time**, per request, through the
+  same secrets cache services use, and registered with the log masker. If
+  the block, key, or value is unavailable (or the value resolves empty), the
+  route refuses with `502` before connecting — it never forwards
+  unauthenticated.
+- **TLS is required for non-loopback targets.** Sending a credential
+  cleartext across a real network boundary is refused at config load, not
+  just discouraged. Loopback targets (e.g. a local mock) may set
+  `tls = false`.
+- **The caller is not authenticated.** Any local process that can reach the
+  proxy port can use the route — that is the point. What portman refuses is
+  *cross-origin* callers: a browser page from another site (`Origin` /
+  `Sec-Fetch-Site: cross-site`) gets `403` before the credential is
+  resolved, mirroring the Start-button guard.
+- Route names are global like service names (a second repo claiming the
+  same name is refused), and the `host` must sit under a managed TLD, like
+  service routes. A changed `host` releases the old hostname; removing the
+  block unregisters the route on the next `portman up`.
+
 A few semantics worth knowing before you rely on them:
 
 **Environments are hermetic.** A service's env is a minimal base (fixed PATH, HOME, USER, TMPDIR) plus only the declared sources. Nothing is inherited from the daemon, your shell, mise, or ambient `.env` files. Composition is deterministic: base, then `env_files` in order, then secrets providers, then inline `env`, later wins. A missing `env_file` fails the start. A secrets-provider outage retries under the restart policy if it looks transient, or fails the service on auth rejection, unless `secrets_optional` opts into the env-files-only fallback (flagged in `portman status`).
