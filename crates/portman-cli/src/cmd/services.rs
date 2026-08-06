@@ -262,7 +262,14 @@ pub(crate) async fn cmd_down(
         // it as "outside a repo" sent a user with a one-character TOML typo
         // looking in entirely the wrong place.
         let config = portman_core::service_config::load(&root)?;
-        config.services.keys().cloned().collect()
+        let service_names: Vec<String> = config.services.keys().cloned().collect();
+        if service_names.is_empty() {
+            bail!(
+                "no [service.<name>] blocks in this repo — only egress routes, which \
+                 follow the config (remove the block, `portman up`); nothing to stop"
+            );
+        }
+        service_names
     } else {
         names
     };

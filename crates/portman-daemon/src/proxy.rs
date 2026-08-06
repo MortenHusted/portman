@@ -254,6 +254,37 @@ async fn handle_egress(
     let wants_html = head.wants_html;
     let headers_end = head.headers_end;
     let target = entry.target.clone();
+
+    // Any website the developer visits can fetch() an egress host — DNS
+    // answers it with the proxy's loopback address, so the browser treats it
+    // like a same-network site. Refuse before the credential is even
+    // resolved: a cross-origin caller must never spend it. Browsers send
+    // `Origin` on POSTs and `Sec-Fetch-Site` on every fetch; curl and SDKs
+    // send neither, so those keep working.
+    let cross_origin = head.origin.as_deref().is_some_and(|origin| {
+        let origin_host = origin
+            .strip_prefix("http://")
+            .or_else(|| origin.strip_prefix("https://"))
+            .map(|rest| rest.split(':').next().unwrap_or(rest).to_ascii_lowercase());
+        origin_host.as_deref() != Some(head.host.as_str())
+    }) || head.sec_fetch_site.as_deref() == Some("cross-site");
+    if cross_origin {
+        warn!(host = %head.host, ?head.origin, ?head.sec_fetch_site, "rejecting cross-origin egress request");
+        write_error(
+            &mut client,
+            403,
+            host,
+            &format!("Cross-origin requests to {host} are rejected."),
+            "portman egress routes are for local processes — call them from the command \
+             line or from pages served by this host, not from arbitrary websites.",
+            "",
+            wants_html,
+        )
+        .await
+        .ok();
+        return Ok(());
+    }
+
     let Some(spec) = entry.egress.clone() else {
         warn!(%host, "egress route has no credential spec; refusing rather than forwarding unauthenticated");
         write_error(
@@ -291,6 +322,31 @@ async fn handle_egress(
         .ok();
         return Ok(());
     };
+    let rendered = spec.render(&value);
+    if value.is_empty() || rendered.contains(['\r', '\n']) {
+        warn!(
+            host = audit.host,
+            upstream = audit.upstream,
+            secrets = audit.secrets_block,
+            key = audit.key,
+            value_len = value.len(),
+            "egress credential is empty or contains a newline; refusing rather than \
+             forwarding a broken or header-smuggling header"
+        );
+        write_error(
+            &mut client,
+            502,
+            host,
+            &format!("The credential behind {host} cannot be attached."),
+            "Check the referenced secrets block: the value resolved empty or contained a \
+             newline, which a header can never carry.",
+            "",
+            wants_html,
+        )
+        .await
+        .ok();
+        return Ok(());
+    }
     info!(
         host = audit.host,
         upstream = audit.upstream,
@@ -342,8 +398,9 @@ async fn handle_egress(
     // `rewrite_head` forces `Connection: close`, so the splice below ends
     // after this one request rather than carrying an unparsed — and
     // therefore unauthenticated — second request through.
-    let buf = rewrite_head(&buf, headers_end, &spec, &value);
-    upstream.write_all(&buf).await?;
+    let mut rewritten = rewrite_head(&head.method, &head.path, &head.headers, &spec, &value);
+    rewritten.extend_from_slice(&buf[headers_end.min(buf.len())..]);
+    upstream.write_all(&rewritten).await?;
 
     match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
         Ok((c, u)) => debug!(%host, client_bytes = c, upstream_bytes = u, "egress proxied"),
@@ -353,8 +410,11 @@ async fn handle_egress(
 }
 
 /// Everything the router needs from the request head. `method`/`path`/
-/// `origin` exist for the reserved start path — routing itself stays
-/// Host-only.
+/// `origin`/`sec_fetch_site` exist for the reserved start path and the
+/// egress cross-origin guard — routing itself stays Host-only. `headers`
+/// is the parser's view of the head (name → value, original case), which is
+/// what the egress rewrite emits from; re-tokenizing raw bytes would
+/// disagree with the parser about where a header line ends.
 struct RequestHead {
     headers_end: usize,
     host: String,
@@ -362,6 +422,8 @@ struct RequestHead {
     method: String,
     path: String,
     origin: Option<String>,
+    sec_fetch_site: Option<String>,
+    headers: Vec<(String, String)>,
 }
 
 /// Read from `client` until we've seen the end of the HTTP request headers,
@@ -413,6 +475,16 @@ async fn read_request_head(
                     method: req.method.unwrap_or("GET").to_string(),
                     path: req.path.unwrap_or("/").to_string(),
                     origin: header("origin").map(str::to_string),
+                    sec_fetch_site: header("sec-fetch-site").map(str::to_string),
+                    headers: req
+                        .headers
+                        .iter()
+                        .filter_map(|h| {
+                            std::str::from_utf8(h.value)
+                                .ok()
+                                .map(|value| (h.name.to_string(), value.to_string()))
+                        })
+                        .collect(),
                 }));
             }
             httparse::Status::Partial => {
@@ -900,6 +972,176 @@ mod tests {
         upstream.abort();
     }
 
+    /// An egress-mode entry with NO spec at all (a registry state that
+    /// shouldn't exist — the supervisor always attaches one) refuses rather
+    /// than forwarding unauthenticated.
+    #[tokio::test]
+    async fn egress_route_without_a_spec_refuses() {
+        let (upstream_addr, upstream) = upstream_once(b"HTTP/1.1 200 OK\r\n\r\n").await;
+        let registry = Registry::new();
+        registry.upsert(entry(
+            "github.api.test",
+            upstream_addr.to_string(),
+            Mode::Egress,
+        ));
+        let proxy_addr = proxy_once(registry, StubStarter::inert()).await;
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: github.api.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert!(
+            std::str::from_utf8(&received)
+                .unwrap()
+                .starts_with("HTTP/1.1 502"),
+            "expected a refusal: {:?}",
+            std::str::from_utf8(&received).unwrap()
+        );
+        upstream.abort();
+    }
+
+    /// A resolved-but-empty credential refuses — `Authorization: Bearer `
+    /// with nothing after it authenticates nothing, and forwarding it would
+    /// look like success while carrying no credential at all.
+    #[tokio::test]
+    async fn egress_route_with_an_empty_credential_refuses() {
+        let (upstream_addr, upstream) = upstream_once(b"HTTP/1.1 200 OK\r\n\r\n").await;
+        let registry = Registry::new();
+        registry.upsert(egress_entry("github.api.test", upstream_addr.to_string()));
+        let proxy_addr = proxy_once_with(
+            registry,
+            StubStarter::inert(),
+            Arc::new(StubCredentials("")),
+            Roots::System,
+        )
+        .await;
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: github.api.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert!(
+            std::str::from_utf8(&received)
+                .unwrap()
+                .starts_with("HTTP/1.1 502"),
+            "expected a refusal: {:?}",
+            std::str::from_utf8(&received).unwrap()
+        );
+        upstream.abort();
+    }
+
+    /// A cross-origin caller (any website the developer visits, via fetch)
+    /// must be refused before the credential is resolved — it must not be
+    /// able to spend the credential on an upstream side effect it can't see.
+    /// curl and SDKs send no Origin/Sec-Fetch-Site and keep working.
+    #[tokio::test]
+    async fn egress_route_refuses_cross_origin_callers() {
+        let (upstream_addr, upstream) = upstream_once(b"HTTP/1.1 200 OK\r\n\r\n").await;
+        let registry = Registry::new();
+        registry.upsert(egress_entry("github.api.test", upstream_addr.to_string()));
+        let proxy_addr = proxy_once_with(
+            registry,
+            StubStarter::inert(),
+            Arc::new(StubCredentials("s3cret-token")),
+            Roots::System,
+        )
+        .await;
+
+        // A cross-site page fetch: Origin names another site.
+        let request =
+            b"GET / HTTP/1.1\r\nHost: github.api.test\r\nOrigin: http://evil.example\r\n\r\n";
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(request).await.unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert!(
+            std::str::from_utf8(&received)
+                .unwrap()
+                .starts_with("HTTP/1.1 403"),
+            "cross-origin request must be refused: {:?}",
+            std::str::from_utf8(&received).unwrap()
+        );
+        upstream.abort();
+    }
+
+    /// Sec-Fetch-Site: cross-site — the header browsers send on every
+    /// navigation/fetch — must also refuse even without an Origin (e.g. a
+    /// GET fetch with `mode: no-cors`).
+    #[tokio::test]
+    async fn egress_route_refuses_cross_site_sec_fetch_site() {
+        let (upstream_addr, upstream) = upstream_once(b"HTTP/1.1 200 OK\r\n\r\n").await;
+        let registry = Registry::new();
+        registry.upsert(egress_entry("github.api.test", upstream_addr.to_string()));
+        let proxy_addr = proxy_once_with(
+            registry,
+            StubStarter::inert(),
+            Arc::new(StubCredentials("s3cret-token")),
+            Roots::System,
+        )
+        .await;
+
+        let request =
+            b"GET / HTTP/1.1\r\nHost: github.api.test\r\nSec-Fetch-Site: cross-site\r\n\r\n";
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(request).await.unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert!(
+            std::str::from_utf8(&received)
+                .unwrap()
+                .starts_with("HTTP/1.1 403"),
+            "cross-site fetch must be refused: {:?}",
+            std::str::from_utf8(&received).unwrap()
+        );
+        upstream.abort();
+    }
+
+    /// A bare-LF request head (httparse accepts it) must be stripped and
+    /// re-emitted like a CRLF one — the rewriter never re-tokenizes raw
+    /// bytes, so the parser's line boundaries are authoritative.
+    #[tokio::test]
+    async fn egress_route_strips_bare_lf_smuggled_headers() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let (upstream_addr, upstream) = upstream_once(response).await;
+        let registry = Registry::new();
+        registry.upsert(egress_entry("github.api.test", upstream_addr.to_string()));
+        let proxy_addr = proxy_once_with(
+            registry,
+            StubStarter::inert(),
+            Arc::new(StubCredentials("s3cret-token")),
+            Roots::System,
+        )
+        .await;
+
+        // Authorization is smuggled on a bare-LF line; httparse treats it as
+        // a real header, and the strip pass must drop it like any other.
+        let request = b"GET /user HTTP/1.1\nHost: github.api.test\nAuthorization: Bearer attacker\nAccept: */*\n\n";
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(request).await.unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert!(std::str::from_utf8(&received)
+            .unwrap()
+            .starts_with("HTTP/1.1 200 OK"));
+
+        let seen = upstream.await.unwrap();
+        let seen = std::str::from_utf8(&seen).unwrap();
+        assert!(
+            !seen.contains("attacker"),
+            "smuggled caller credential must be stripped: {seen:?}"
+        );
+        assert!(
+            seen.contains("Authorization: Bearer s3cret-token\r\n"),
+            "injected credential must be present: {seen:?}"
+        );
+    }
+
     /// A service-derived route (`Source::Service`, as the supervisor's
     /// RouteBinder registers it) proxies exactly like any other entry — the
     /// proxy never branches on source.
@@ -1192,5 +1434,47 @@ mod tests {
             seen.contains("Host: upstream.test\r\n"),
             "upstream must see its own host: {seen:?}"
         );
+    }
+
+    /// The negative control for the TLS leg: an upstream whose cert is NOT
+    /// in the configured trust set must fail the handshake and refuse —
+    /// never fall back to plaintext, never forward the credential. If a
+    /// future change disables verification, this test flips to 200 and
+    /// catches it.
+    #[tokio::test]
+    async fn egress_tls_refuses_an_untrusted_upstream() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let (upstream_addr, upstream) = tls_upstream_once(response).await;
+        let registry = Registry::new();
+        let mut entry = egress_entry("github.api.test", upstream_addr.to_string());
+        let spec = entry.egress.as_mut().unwrap();
+        spec.tls = true;
+        spec.upstream_host = "upstream.test".into();
+        registry.upsert(entry);
+        // System roots: the self-signed test cert is NOT among them, so the
+        // handshake must fail verification.
+        let proxy_addr = proxy_once_with(
+            registry,
+            StubStarter::inert(),
+            Arc::new(StubCredentials("s3cret-token")),
+            Roots::System,
+        )
+        .await;
+
+        let request = b"GET /user HTTP/1.1\r\nHost: github.api.test\r\n\r\n";
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(request).await.unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        let response = std::str::from_utf8(&received).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 502"),
+            "untrusted upstream must be refused: {response}"
+        );
+        assert!(
+            !response.contains("200 OK"),
+            "a refused handshake must never yield a success response: {response}"
+        );
+        upstream.abort();
     }
 }

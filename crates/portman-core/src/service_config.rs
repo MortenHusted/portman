@@ -586,6 +586,21 @@ fn resolve_egress(
     if !raw.format.contains("{value}") {
         bail!("`format` must contain the `{{value}}` placeholder");
     }
+    // A header line is a single line: any CR/LF the config could inject would
+    // let the credential header smuggle extra lines (or end the head early).
+    // Same for the header NAME — it must be a bare RFC 7230 token, or the
+    // rendered line could carry arbitrary bytes.
+    if raw.header.contains(['\r', '\n']) || !is_rfc7230_token(&raw.header) {
+        bail!("`header` must be a single HTTP token (no whitespace, no CR/LF)");
+    }
+    if raw.format.contains(['\r', '\n']) {
+        bail!("`format` cannot contain CR/LF — it is rendered into a header line");
+    }
+    if let Some(h) = raw.upstream_host.as_deref() {
+        if h.contains(['\r', '\n']) {
+            bail!("`upstream_host` cannot contain CR/LF");
+        }
+    }
     let upstream_host = match raw.upstream_host {
         Some(h) if !h.trim().is_empty() => h,
         Some(_) => bail!("`upstream_host` cannot be blank"),
@@ -596,6 +611,17 @@ fn resolve_egress(
             .map(|(h, _)| h.to_string())
             .unwrap_or_else(|| target.clone()),
     };
+    // The credential rides in a header line written into the TCP stream to
+    // `target`. Over a non-loopback target it crosses a real network
+    // boundary in cleartext — require TLS unless the target is the local
+    // machine, the one case where there is no wire to eavesdrop on.
+    let target_host = target.rsplit_once(':').map(|(h, _)| h).unwrap_or(&target);
+    if !raw.tls && !is_loopback_host(target_host) {
+        bail!(
+            "`tls = true` is required: target `{target_host}` is not the local \
+             machine, and an egress credential must not cross the network in cleartext"
+        );
+    }
     Ok(EgressRoute {
         host,
         target,
@@ -608,6 +634,26 @@ fn resolve_egress(
             tls: raw.tls,
         },
     })
+}
+
+/// RFC 7230 `token`: `!#$%&'*+-.^_`|~` plus alphanumerics — the only charset
+/// a header name may use.
+fn is_rfc7230_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
+}
+
+/// Is `host` (a hostname or IP literal) the local machine? Loopback
+/// addresses and the `localhost` name. Used to decide whether an egress
+/// route may ship its credential in cleartext.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim().trim_matches(['[', ']']);
+    host.eq_ignore_ascii_case("localhost") || {
+        host.parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+    }
 }
 
 /// Egress route names appear in the same places service names do — same
@@ -1712,6 +1758,7 @@ mod tests {
             target = "api.github.com:443"
             secrets = "gh"
             key = "TOKEN"
+            tls = true
             "#,
         );
         write_config(
@@ -1720,7 +1767,7 @@ mod tests {
             r#"
             [egress.github]
             host = "github.api.test"
-            target = "localhost.mock:1"
+            target = "127.0.0.1:1"
             secrets = "gh"
             key = "TOKEN"
 
@@ -1729,11 +1776,12 @@ mod tests {
             target = "extra.example.com:443"
             secrets = "gh"
             key = "TOKEN"
+            tls = true
             "#,
         );
         let cfg = load(dir.path()).unwrap();
         assert_eq!(cfg.egress.len(), 2);
-        assert_eq!(cfg.egress["github"].target, "localhost.mock:1");
+        assert_eq!(cfg.egress["github"].target, "127.0.0.1:1");
         assert!(cfg.egress.contains_key("extra"));
     }
 }

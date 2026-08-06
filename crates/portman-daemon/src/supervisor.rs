@@ -728,7 +728,23 @@ impl Supervisor {
             // the start, removing them is the stop. Re-seed under the same
             // rule as secrets — this root's set replaces what it had before.
             let mut routes = self.inner.egress.lock().expect("egress lock poisoned");
+            // A name this root is about to claim, already held by another
+            // root, would be silently clobbered by the insert below — this
+            // root's route would suddenly carry that root's key. Same
+            // global-name rule as services: refuse before mutating anything.
+            for name in egress.keys() {
+                if let Some(held) = routes.get(name) {
+                    if held.root != root {
+                        bail!(
+                            "egress route name `{name}` is already defined by {} — \
+                             egress route names are global, like service names",
+                            held.root.display()
+                        );
+                    }
+                }
+            }
             let mut removed = Vec::new();
+            let mut release_hosts: Vec<portman_protocol::EgressRoute> = Vec::new();
             routes.retain(|name, r| {
                 if r.root != root {
                     return true;
@@ -740,6 +756,15 @@ impl Supervisor {
                 true
             });
             for (name, route) in &egress {
+                // A changed host leaves the OLD hostname live in the registry
+                // (still resolving, still attaching a credential) unless we
+                // release it — the same rule the service path applies when a
+                // definition moves hosts.
+                if let Some(existing) = routes.get(name) {
+                    if existing.route.host != route.host {
+                        release_hosts.push(existing.route.clone());
+                    }
+                }
                 routes.insert(
                     name.clone(),
                     PersistedEgress {
@@ -750,6 +775,9 @@ impl Supervisor {
             }
             drop(routes);
             for route in removed {
+                self.inner.routes.deregister_egress(&route);
+            }
+            for route in release_hosts {
                 self.inner.routes.deregister_egress(&route);
             }
             for route in egress.values() {
@@ -787,6 +815,12 @@ impl Supervisor {
             .await
             .ok()?;
         let value = values.into_iter().find(|(k, _)| k == &spec.key)?.1;
+        if value.is_empty() {
+            // A resolved-but-empty value is indistinguishable from an absent
+            // one to the upstream: an `Authorization: Bearer ` line with
+            // nothing after it. Refuse rather than "authenticate" with it.
+            return None;
+        }
         // A proxied credential is still a credential: register it with the
         // masker so no captured service output can carry it into the log
         // store (services never receive egress values, but an upstream that
@@ -3354,6 +3388,159 @@ mod tests {
         );
     }
 
+    /// Egress route names are global, like service names: a second repo
+    /// claiming the same name must be refused BEFORE any mutation, or its
+    /// insert would silently clobber the first repo's route and start
+    /// attaching the first repo's key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn egress_route_name_collision_across_roots_is_refused() {
+        let dir = tempdir().unwrap();
+        let (sup, registry, _static_store) = route_test_setup(&dir);
+
+        sup.sync(
+            dir.path(),
+            vec![],
+            Map::new(),
+            Map::from([("gh".to_string(), egress_route("github.internal"))]),
+        )
+        .await
+        .unwrap();
+        assert!(registry.get("github.internal").is_some());
+
+        let other = dir.path().join("other-repo");
+        std::fs::create_dir_all(&other).unwrap();
+        let err = sup
+            .sync(
+                &other,
+                vec![],
+                Map::new(),
+                Map::from([("gh".to_string(), egress_route("github.internal"))]),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already defined"),
+            "collision must be refused: {err}"
+        );
+        // The first root's route survives untouched.
+        let entry = registry.get("github.internal").unwrap();
+        assert_eq!(entry.source, portman_protocol::Source::Egress);
+        assert_eq!(entry.target, "api.github.com:443");
+    }
+
+    /// A route whose HOST changes must release the old hostname, or it stays
+    /// live in the registry — still resolving, still attaching a credential,
+    /// and now unreachable from the persisted map (only a daemon restart
+    /// would clear it).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn egress_host_change_releases_the_old_route() {
+        let dir = tempdir().unwrap();
+        let (sup, registry, _static_store) = route_test_setup(&dir);
+
+        sup.sync(
+            dir.path(),
+            vec![],
+            Map::new(),
+            Map::from([("gh".to_string(), egress_route("github.internal"))]),
+        )
+        .await
+        .unwrap();
+        assert!(registry.get("github.internal").is_some());
+
+        let mut moved = egress_route("other.internal");
+        moved.target = "api.other.com:443".into();
+        moved.spec.upstream_host = "api.other.com".into();
+        sup.sync(
+            dir.path(),
+            vec![],
+            Map::new(),
+            Map::from([("gh".to_string(), moved)]),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            registry.get("github.internal").is_none(),
+            "old host must be released on host change"
+        );
+        let entry = registry.get("other.internal").expect("new host routed");
+        assert_eq!(entry.target, "api.other.com:443");
+    }
+
+    /// The production credential path end to end: a synced secrets block,
+    /// resolution through the source's `resolve_block` (the entry point
+    /// egress uses, distinct from the service path), key selection, and
+    /// registration with the masker so captured output can't carry the
+    /// value into the log store.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_egress_value_resolves_key_and_registers_masker() {
+        let dir = tempdir().unwrap();
+        let sink = CollectSink::new();
+        let source = ScriptedSecrets::new(vec![Ok(vec![
+            ("GITHUB_TOKEN".to_string(), "ghs_abcdef123456".to_string()),
+            ("OTHER".to_string(), "zzz".to_string()),
+        ])]);
+        let sup = secrets_supervisor(&dir, source, sink);
+        let config = SecretsProviderConfig::OnePassword { refs: Map::new() };
+        sup.sync(
+            dir.path(),
+            vec![],
+            Map::from([("gh".to_string(), config)]),
+            Map::new(),
+        )
+        .await
+        .unwrap();
+
+        let spec = portman_protocol::EgressSpec {
+            secrets: "gh".into(),
+            key: "GITHUB_TOKEN".into(),
+            header: "Authorization".into(),
+            format: "Bearer {value}".into(),
+            upstream_host: "api.github.com".into(),
+            tls: true,
+        };
+        let value = sup.resolve_egress_value(&spec).await;
+        assert_eq!(value.as_deref(), Some("ghs_abcdef123456"));
+
+        // The resolved value must be registered with the masker under the
+        // egress pseudo-service, so any captured line echoing it is masked
+        // before it reaches the log store.
+        let masked = sup.inner.masker.mask("token ghs_abcdef123456 here");
+        assert!(!masked.contains("ghs_abcdef123456"), "{masked}");
+    }
+
+    /// A resolved-but-empty value is refused exactly like a missing key —
+    /// `Authorization: Bearer ` with nothing after it authenticates nothing
+    /// and must never be forwarded as success.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_egress_value_treats_empty_as_unavailable() {
+        let dir = tempdir().unwrap();
+        let source =
+            ScriptedSecrets::new(vec![Ok(vec![("GITHUB_TOKEN".to_string(), "".to_string())])]);
+        let sup = secrets_supervisor(&dir, source, CollectSink::new());
+        sup.sync(
+            dir.path(),
+            vec![],
+            Map::from([(
+                "gh".to_string(),
+                SecretsProviderConfig::OnePassword { refs: Map::new() },
+            )]),
+            Map::new(),
+        )
+        .await
+        .unwrap();
+
+        let spec = portman_protocol::EgressSpec {
+            secrets: "gh".into(),
+            key: "GITHUB_TOKEN".into(),
+            header: "Authorization".into(),
+            format: "Bearer {value}".into(),
+            upstream_host: "api.github.com".into(),
+            tls: true,
+        };
+        assert_eq!(sup.resolve_egress_value(&spec).await, None);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn route_wins_over_static_rule_and_down_restores_it() {
         let dir = tempdir().unwrap();
@@ -3454,6 +3641,39 @@ mod tests {
             } else {
                 outcomes[0].clone()
             }
+        }
+
+        /// Egress resolution names a block directly (`resolve_egress_value`),
+        /// bypassing the service path — so the stub must script that entry
+        /// point too, or every egress test would see "no values" regardless
+        /// of what was scripted.
+        async fn resolve_block(
+            &self,
+            _name: &str,
+            _config: &SecretsProviderConfig,
+        ) -> Result<Vec<(String, String)>, SecretsError> {
+            let ignored = ServiceDefinition {
+                name: String::new(),
+                run: vec![],
+                dir: std::path::PathBuf::new(),
+                port: None,
+                host: None,
+                mode: portman_protocol::Mode::Http,
+                ready: portman_protocol::ReadyCheck::None,
+                depends: vec![],
+                restart: portman_protocol::RestartPolicy::Never,
+                stop_grace_ms: 0,
+                env_files: vec![],
+                env: std::collections::BTreeMap::new(),
+                secrets: vec![],
+                secrets_optional: false,
+                watch: vec![],
+                watch_mode: portman_protocol::WatchMode::Poll,
+                watch_debounce_ms: 0,
+                groups: vec![],
+                project: None,
+            };
+            self.resolve(&ignored, &Map::new()).await
         }
     }
 

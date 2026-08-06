@@ -161,11 +161,34 @@ impl ProviderSecretsSource {
             cache: Mutex::new(BTreeMap::new()),
         }
     }
+}
+
+#[async_trait::async_trait]
+impl SecretsSource for ProviderSecretsSource {
+    async fn resolve(
+        &self,
+        def: &ServiceDefinition,
+        blocks: &BTreeMap<String, SecretsProviderConfig>,
+    ) -> Result<Vec<(String, String)>, SecretsError> {
+        let mut values: Vec<(String, String)> = Vec::new();
+        for reference in &def.secrets {
+            let Some(config) = blocks.get(reference) else {
+                return Err(SecretsError::fatal(format!(
+                    "service references [secrets.{reference}] but no such block is synced"
+                )));
+            };
+            values.extend(self.resolve_block(reference, config).await?);
+        }
+        if !def.secrets.is_empty() {
+            warn_on_empty(def, &values);
+        }
+        Ok(values)
+    }
 
     /// One block's values, fetched (and cached) independently of any
-    /// service. The supervisor's service path loops this over `def.secrets`;
-    /// egress resolution names a single block the same way.
-    pub(crate) async fn resolve_block(
+    /// service. The supervisor's service path loops this over
+    /// `def.secrets`; egress resolution names a single block the same way.
+    async fn resolve_block(
         &self,
         name: &str,
         config: &SecretsProviderConfig,
@@ -196,37 +219,6 @@ impl ProviderSecretsSource {
             .expect("secrets cache poisoned")
             .insert(name.to_string(), fetched.clone());
         Ok(fetched)
-    }
-}
-
-#[async_trait::async_trait]
-impl SecretsSource for ProviderSecretsSource {
-    async fn resolve(
-        &self,
-        def: &ServiceDefinition,
-        blocks: &BTreeMap<String, SecretsProviderConfig>,
-    ) -> Result<Vec<(String, String)>, SecretsError> {
-        let mut values: Vec<(String, String)> = Vec::new();
-        for reference in &def.secrets {
-            let Some(config) = blocks.get(reference) else {
-                return Err(SecretsError::fatal(format!(
-                    "service references [secrets.{reference}] but no such block is synced"
-                )));
-            };
-            values.extend(self.resolve_block(reference, config).await?);
-        }
-        if !def.secrets.is_empty() {
-            warn_on_empty(def, &values);
-        }
-        Ok(values)
-    }
-
-    async fn resolve_block(
-        &self,
-        name: &str,
-        config: &SecretsProviderConfig,
-    ) -> Result<Vec<(String, String)>, SecretsError> {
-        Self::resolve_block(self, name, config).await
     }
 
     fn invalidate(&self) {

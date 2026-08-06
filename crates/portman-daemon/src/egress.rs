@@ -21,6 +21,13 @@ use portman_protocol::EgressSpec;
 /// after one request (see [`rewrite_head`]).
 const CALLER_OWNED: [&str; 4] = ["authorization", "proxy-authorization", "host", "connection"];
 
+/// Case-insensitive membership in [`CALLER_OWNED`].
+fn is_caller_owned(name: &str) -> bool {
+    CALLER_OWNED
+        .iter()
+        .any(|owned| name.eq_ignore_ascii_case(owned))
+}
+
 /// Resolves the value behind an [`EgressSpec`].
 ///
 /// Threaded into the proxy the same way the runner is, so the proxy gains one
@@ -63,9 +70,14 @@ impl CredentialSource for SupervisorCredentials {
 
 /// Rebuild a request head for an egress hop.
 ///
-/// `buf` is the raw bytes read from the client and `headers_end` the offset
-/// just past the blank line ending the head, so anything after it is body
-/// bytes already in hand and is preserved untouched.
+/// Emits from the header PAIRS the proxy's parser already saw (`headers`),
+/// never from the raw request bytes. That split is load-bearing: httparse
+/// accepts a bare `\n` line terminator, and a pass that re-tokenizes the raw
+/// text would disagree with the parser about where a header line ends — a
+/// caller could smuggle an unstripped `Authorization` through as a "folded"
+/// continuation. Emitting the parsed pairs makes the parser's line
+/// boundaries authoritative: whatever it saw as a header line, we see as a
+/// header line, and the caller-owned strip applies to every one.
 ///
 /// Four changes, and each is load-bearing:
 ///
@@ -82,50 +94,40 @@ impl CredentialSource for SupervisorCredentials {
 ///   also framing every request is a security regression, not a performance
 ///   tweak.
 /// - **the credential is appended last**, after the strip pass.
+///
+/// The request line is rebuilt from the parsed method and path (the caller's
+/// version is normalized to HTTP/1.1, the only version this proxy speaks).
 pub(crate) fn rewrite_head(
-    buf: &[u8],
-    headers_end: usize,
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
     spec: &EgressSpec,
     value: &str,
 ) -> Vec<u8> {
-    let head = &buf[..headers_end.min(buf.len())];
-    let body = buf.get(headers_end..).unwrap_or(&[]);
-    let text = String::from_utf8_lossy(head);
-
-    let mut out = String::with_capacity(text.len() + 128);
-    let mut lines = text.split("\r\n");
-
-    // The request line is copied verbatim: the path and query belong to the
-    // caller, and rewriting them would be a different feature.
-    if let Some(request_line) = lines.next() {
-        out.push_str(request_line);
-        out.push_str("\r\n");
-    }
-    for line in lines {
-        if line.is_empty() {
-            continue; // the head's trailing blank line; re-added below
-        }
-        let name = line
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
-        if CALLER_OWNED.contains(&name.as_str()) {
+    let mut out = String::with_capacity(256);
+    out.push_str(method);
+    out.push(' ');
+    out.push_str(path);
+    out.push_str(" HTTP/1.1\r\n");
+    for (name, val) in headers {
+        if is_caller_owned(name) {
             continue;
         }
-        out.push_str(line);
+        out.push_str(name);
+        out.push_str(": ");
+        out.push_str(val);
         out.push_str("\r\n");
     }
-
     out.push_str(&format!("Host: {}\r\n", spec.upstream_host));
     out.push_str("Connection: close\r\n");
-    out.push_str(&format!("{}: {}\r\n", spec.header, spec.render(value)));
+    let rendered = spec.render(value);
+    assert!(
+        !rendered.contains(['\r', '\n']),
+        "rendered credential contains a newline — refusing to emit a header-smuggling line"
+    );
+    out.push_str(&format!("{}: {}\r\n", spec.header, rendered));
     out.push_str("\r\n");
-
-    let mut bytes = out.into_bytes();
-    bytes.extend_from_slice(body);
-    bytes
+    out.into_bytes()
 }
 
 /// Everything an egress hop logs. Deliberately structural: it carries the
@@ -170,10 +172,29 @@ mod tests {
         }
     }
 
+    /// Parse `raw` the way the proxy does (httparse — accepts both CRLF and
+    /// bare-LF terminators) and hand the parsed head to `rewrite_head`, so
+    /// these tests exercise exactly the production byte path.
     fn rewrite(raw: &str) -> String {
-        let buf = raw.as_bytes();
-        let end = raw.find("\r\n\r\n").expect("head terminator") + 4;
-        String::from_utf8(rewrite_head(buf, end, &spec(), "s3cret")).expect("utf8")
+        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut req = httparse::Request::new(&mut headers);
+        let end = match req.parse(raw.as_bytes()).expect("test head parses") {
+            httparse::Status::Complete(end) => end,
+            httparse::Status::Partial => panic!("test head is partial"),
+        };
+        let _ = end;
+        let method = req.method.unwrap_or("GET").to_string();
+        let path = req.path.unwrap_or("/").to_string();
+        let pairs: Vec<(String, String)> = req
+            .headers
+            .iter()
+            .filter_map(|h| {
+                std::str::from_utf8(h.value)
+                    .ok()
+                    .map(|value| (h.name.to_string(), value.to_string()))
+            })
+            .collect();
+        String::from_utf8(rewrite_head(&method, &path, &pairs, &spec(), "s3cret")).expect("utf8")
     }
 
     #[test]
@@ -214,9 +235,9 @@ mod tests {
     }
 
     #[test]
-    fn header_matching_ignores_case_and_whitespace() {
+    fn header_matching_ignores_case() {
         let out = rewrite(
-            "GET / HTTP/1.1\r\nhost: github.api.test\r\nAUTHORIZATION : Bearer attacker\r\n\r\n",
+            "GET / HTTP/1.1\r\nhost: github.api.test\r\nAUTHORIZATION: Bearer attacker\r\n\r\n",
         );
         assert!(!out.contains("attacker"), "{out:?}");
         assert_eq!(out.matches("Host: ").count(), 1, "{out:?}");
@@ -231,21 +252,66 @@ mod tests {
     }
 
     #[test]
-    fn body_bytes_already_read_are_preserved() {
-        let raw = "POST /x HTTP/1.1\r\nHost: github.api.test\r\nContent-Length: 5\r\n\r\nhello";
-        let out = rewrite(raw);
-        assert!(out.ends_with("\r\n\r\nhello"), "{out:?}");
-        assert!(out.contains("Content-Length: 5\r\n"), "{out:?}");
-    }
-
-    #[test]
     fn the_format_template_is_honoured() {
         let mut spec = spec();
         spec.header = "X-Api-Key".into();
         spec.format = "{value}".into();
         let raw = "GET / HTTP/1.1\r\nHost: github.api.test\r\n\r\n";
-        let end = raw.len();
-        let out = String::from_utf8(rewrite_head(raw.as_bytes(), end, &spec, "abc123")).unwrap();
+        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut req = httparse::Request::new(&mut headers);
+        let _ = req.parse(raw.as_bytes()).unwrap();
+        let pairs: Vec<(String, String)> = req
+            .headers
+            .iter()
+            .filter_map(|h| {
+                std::str::from_utf8(h.value)
+                    .ok()
+                    .map(|value| (h.name.to_string(), value.to_string()))
+            })
+            .collect();
+        let out = String::from_utf8(rewrite_head("GET", "/", &pairs, &spec, "abc123")).unwrap();
         assert!(out.contains("X-Api-Key: abc123\r\n"), "{out:?}");
+    }
+
+    /// The P0 regression: httparse accepts a bare `\n` line terminator, and
+    /// the rewriter must see the same line boundaries the parser saw. A
+    /// caller smuggling `Authorization` in a bare-LF "folded" line must not
+    /// get it through — the strip pass applies to every parsed header.
+    #[test]
+    fn bare_lf_headers_are_stripped_like_crlf_ones() {
+        let out = rewrite("GET / HTTP/1.1\nHost: github.api.test\nAuthorization: Bearer attacker\nAccept: */*\n\n");
+        assert!(!out.contains("attacker"), "{out:?}");
+        assert_eq!(
+            out.matches("Authorization: ").count(),
+            1,
+            "exactly one authorization header: {out:?}"
+        );
+        assert!(out.contains("Accept: */*\r\n"), "{out:?}");
+        assert!(out.contains("Connection: close\r\n"), "{out:?}");
+    }
+
+    /// A rendered credential that contains a newline would smuggle header
+    /// lines (or end the head early); a caller-facing refusal covers it, but
+    /// the rewriter itself must refuse to emit it rather than produce a
+    /// malformed head on the wire.
+    #[test]
+    #[should_panic(expected = "newline")]
+    fn rendered_value_with_a_newline_is_refused() {
+        let mut spec = spec();
+        spec.format = "{value}".into();
+        let raw = "GET / HTTP/1.1\r\nHost: github.api.test\r\n\r\n";
+        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut req = httparse::Request::new(&mut headers);
+        let _ = req.parse(raw.as_bytes()).unwrap();
+        let pairs: Vec<(String, String)> = req
+            .headers
+            .iter()
+            .filter_map(|h| {
+                std::str::from_utf8(h.value)
+                    .ok()
+                    .map(|value| (h.name.to_string(), value.to_string()))
+            })
+            .collect();
+        let _ = rewrite_head("GET", "/", &pairs, &spec, "good\r\nX-Injected: yes");
     }
 }
