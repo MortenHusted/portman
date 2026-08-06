@@ -29,12 +29,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use portman_protocol::{
-    InfisicalApiVersion, InfisicalMode, Mode, ReadyCheck, RestartPolicy, SecretsProviderConfig,
-    ServiceDefinition, WatchMode,
+    EgressRoute, EgressSpec, InfisicalApiVersion, InfisicalMode, Mode, ReadyCheck, RestartPolicy,
+    SecretsProviderConfig, ServiceDefinition, WatchMode,
 };
 use serde::Deserialize;
 
-use crate::static_store::validate_host;
+use crate::static_store::{validate_host, validate_target};
 
 /// Committed config filename, looked up by walking ancestors from the cwd.
 pub const CONFIG_FILE: &str = "portman.toml";
@@ -51,6 +51,8 @@ pub struct ServiceConfig {
     pub services: BTreeMap<String, ServiceDefinition>,
     /// Resolved `[secrets.<name>]` provider blocks.
     pub secrets: BTreeMap<String, SecretsProviderConfig>,
+    /// Resolved `[egress.<name>]` routes, ready for the daemon to register.
+    pub egress: BTreeMap<String, EgressRoute>,
 }
 
 /// Find the config root for `start_dir`: the nearest ancestor containing
@@ -92,7 +94,8 @@ fn merge_and_resolve(
         // those shadow copies kept overriding the committed definition with
         // stale values whenever it changed. A service only the local file
         // declares stands alone (and must carry `run`). [secrets.<name>]
-        // blocks still replace wholesale — provider coordinates are one
+        // and [egress.<name>] blocks still replace wholesale — provider
+        // coordinates and a route's credential attachment are each one
         // atomic value, not a set of independent knobs.
         for (name, overlay) in local.service {
             let merged = match raw.service.remove(&name) {
@@ -102,6 +105,7 @@ fn merge_and_resolve(
             raw.service.insert(name, merged);
         }
         raw.secrets.extend(local.secrets);
+        raw.egress.extend(local.egress);
         // Scalar file-level fields: the overlay wins when it speaks.
         if local.project.is_some() {
             raw.project = local.project.clone();
@@ -168,6 +172,8 @@ struct RawConfig {
     service: BTreeMap<String, RawService>,
     #[serde(default)]
     secrets: BTreeMap<String, RawSecrets>,
+    #[serde(default)]
+    egress: BTreeMap<String, RawEgress>,
 }
 
 /// Every field is `Option` so the overlay merge can tell "not mentioned"
@@ -288,6 +294,42 @@ struct RawSecrets {
     refs: Option<BTreeMap<String, String>>,
 }
 
+/// One `[egress.<name>]` block: a local hostname the proxy answers, the
+/// upstream it forwards to, and which `[secrets.*]` value it attaches.
+/// Every field is required except `header`/`format` (sensible API-auth
+/// defaults) and `upstream_host` (defaults to the target's hostname).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEgress {
+    /// Local hostname callers address (must sit under a managed TLD).
+    host: String,
+    /// Upstream `host:port` the rewritten request lands at.
+    target: String,
+    /// `[secrets.<name>]` block the value comes from.
+    secrets: String,
+    /// Key within that block.
+    key: String,
+    /// Header carrying the credential (default `Authorization`).
+    #[serde(default = "default_egress_header")]
+    header: String,
+    /// Header value template; `{value}` is the secret (default `Bearer {value}`).
+    #[serde(default = "default_egress_format")]
+    format: String,
+    /// `Host:` presented to the upstream (default: the target's hostname).
+    upstream_host: Option<String>,
+    /// Speak TLS to the upstream (default false).
+    #[serde(default)]
+    tls: bool,
+}
+
+fn default_egress_header() -> String {
+    "Authorization".to_string()
+}
+
+fn default_egress_format() -> String {
+    "Bearer {value}".to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Resolution + validation.
 
@@ -326,10 +368,19 @@ fn resolve(root: &Path, raw: RawConfig) -> Result<ServiceConfig> {
 
     validate_depends(&services)?;
 
+    let mut egress = BTreeMap::new();
+    for (name, route) in raw.egress {
+        validate_egress_name(&name)?;
+        let resolved = resolve_egress(&name, route, &secrets)
+            .with_context(|| format!("in [egress.{name}]"))?;
+        egress.insert(name, resolved);
+    }
+
     Ok(ServiceConfig {
         root: root.to_path_buf(),
         services,
         secrets,
+        egress,
     })
 }
 
@@ -512,6 +563,57 @@ fn resolve_secrets(name: &str, raw: RawSecrets) -> Result<SecretsProviderConfig>
         }
         other => bail!("unknown secrets provider `{other}` (expected `infisical` or `1password`)"),
     }
+}
+
+/// Validate and resolve one `[egress.<name>]` block. The referenced
+/// secrets block must exist in the same config — an egress route naming a
+/// block that isn't synced would fail only at proxy time, and "looks fine
+/// until it doesn't" is exactly what config validation exists to remove.
+fn resolve_egress(
+    name: &str,
+    raw: RawEgress,
+    secrets: &BTreeMap<String, SecretsProviderConfig>,
+) -> Result<EgressRoute> {
+    let host = validate_host(&raw.host).with_context(|| format!("`host` in [egress.{name}]"))?;
+    let target =
+        validate_target(&raw.target).with_context(|| format!("`target` in [egress.{name}]"))?;
+    if !secrets.contains_key(&raw.secrets) {
+        bail!("references [secrets.{}] which does not exist", raw.secrets);
+    }
+    if raw.key.trim().is_empty() {
+        bail!("`key` cannot be empty");
+    }
+    if !raw.format.contains("{value}") {
+        bail!("`format` must contain the `{{value}}` placeholder");
+    }
+    let upstream_host = match raw.upstream_host {
+        Some(h) if !h.trim().is_empty() => h,
+        Some(_) => bail!("`upstream_host` cannot be blank"),
+        // Default: the target's hostname — the usual case where the
+        // upstream's Host and its network address agree.
+        None => target
+            .rsplit_once(':')
+            .map(|(h, _)| h.to_string())
+            .unwrap_or_else(|| target.clone()),
+    };
+    Ok(EgressRoute {
+        host,
+        target,
+        spec: EgressSpec {
+            secrets: raw.secrets,
+            key: raw.key,
+            header: raw.header,
+            format: raw.format,
+            upstream_host,
+            tls: raw.tls,
+        },
+    })
+}
+
+/// Egress route names appear in the same places service names do — same
+/// boring charset.
+fn validate_egress_name(name: &str) -> Result<()> {
+    validate_service_name(name)
 }
 
 /// Service names appear in CLI args, log queries, and dashboard URL paths —
@@ -1449,5 +1551,189 @@ mod tests {
         assert_eq!(proxy.host.as_deref(), Some("demo-rs.acme.internal"));
         assert_eq!(proxy.ready, ReadyCheck::Port(3062));
         assert_eq!(proxy.depends, vec!["demo-rs-logrelay", "demo-rs-sublog"]);
+    }
+
+    /// The `[egress.*]` block in its full form: every field lands where the
+    /// daemon expects it, and the two optional knobs (`tls`, explicit
+    /// `upstream_host`) take effect.
+    #[test]
+    fn egress_block_resolves_with_defaults_and_overrides() {
+        let dir = tempdir().unwrap();
+        write_config(
+            dir.path(),
+            CONFIG_FILE,
+            r#"
+            [secrets.gh]
+            provider = "1password"
+            [secrets.gh.refs]
+            TOKEN = "op://dev/github/token"
+
+            [egress.github]
+            host = "github.api.test"
+            target = "api.github.com:443"
+            secrets = "gh"
+            key = "TOKEN"
+            tls = true
+
+            [egress.local]
+            host = "local.api.test"
+            target = "127.0.0.1:9999"
+            secrets = "gh"
+            key = "TOKEN"
+            header = "X-Api-Key"
+            format = "{value}"
+            upstream_host = "internal.upstream"
+            "#,
+        );
+        let cfg = load(dir.path()).unwrap();
+        assert_eq!(cfg.egress.len(), 2);
+
+        let github = &cfg.egress["github"];
+        assert_eq!(github.host, "github.api.test");
+        assert_eq!(github.target, "api.github.com:443");
+        assert_eq!(github.spec.secrets, "gh");
+        assert_eq!(github.spec.key, "TOKEN");
+        // Defaults: Authorization / Bearer / hostname of the target / no TLS.
+        assert_eq!(github.spec.header, "Authorization");
+        assert_eq!(github.spec.format, "Bearer {value}");
+        assert_eq!(github.spec.upstream_host, "api.github.com");
+        assert!(github.spec.tls);
+
+        let local = &cfg.egress["local"];
+        assert_eq!(local.spec.header, "X-Api-Key");
+        assert_eq!(local.spec.format, "{value}");
+        assert_eq!(local.spec.upstream_host, "internal.upstream");
+        assert!(!local.spec.tls);
+    }
+
+    /// An egress route naming a secrets block that isn't in the config
+    /// fails at load time with the block named — not at proxy time with a
+    /// 502 the user then has to chase.
+    #[test]
+    fn egress_referencing_missing_secrets_block_rejected() {
+        let dir = tempdir().unwrap();
+        write_config(
+            dir.path(),
+            CONFIG_FILE,
+            r#"
+            [egress.github]
+            host = "github.api.test"
+            target = "api.github.com:443"
+            secrets = "nope"
+            key = "TOKEN"
+            "#,
+        );
+        let err = format!("{:?}", load(dir.path()).unwrap_err());
+        assert!(err.contains("[secrets.nope]"), "{err}");
+        assert!(err.contains("does not exist"), "{err}");
+    }
+
+    /// Strict parsing: a typo'd field names the key; a missing required
+    /// field names the block; a `format` without `{value}` is rejected
+    /// (rendering it would produce a constant header with no secret in it —
+    /// a route that looks configured while sending nothing).
+    #[test]
+    fn egress_block_validation_rejects_malformed_blocks() {
+        let dir = tempdir().unwrap();
+        let base = r#"
+            [secrets.gh]
+            provider = "1password"
+            [secrets.gh.refs]
+            TOKEN = "op://dev/github/token"
+        "#;
+
+        write_config(
+            dir.path(),
+            CONFIG_FILE,
+            &format!(
+                "{base}
+                [egress.g]
+                host = \"g.test\"
+                target = \"api.example.com:443\"
+                secrets = \"gh\"
+                key = \"TOKEN\"
+                upstrem_host = \"oops\"
+                "
+            ),
+        );
+        let err = format!("{:?}", load(dir.path()).unwrap_err());
+        assert!(err.contains("upstrem_host"), "{err}");
+
+        write_config(
+            dir.path(),
+            CONFIG_FILE,
+            &format!(
+                "{base}
+                [egress.g]
+                host = \"g.test\"
+                secrets = \"gh\"
+                key = \"TOKEN\"
+                "
+            ),
+        );
+        let err = format!("{:?}", load(dir.path()).unwrap_err());
+        assert!(err.contains("target"), "{err}");
+
+        write_config(
+            dir.path(),
+            CONFIG_FILE,
+            &format!(
+                "{base}
+                [egress.g]
+                host = \"g.test\"
+                target = \"api.example.com:443\"
+                secrets = \"gh\"
+                key = \"TOKEN\"
+                format = \"Bearer constant\"
+                "
+            ),
+        );
+        let err = format!("{:?}", load(dir.path()).unwrap_err());
+        assert!(err.contains("value"), "{err}");
+    }
+
+    /// A local `[egress.*]` overlay merges wholesale with committed
+    /// egress blocks, exactly like `[secrets.*]`: same name = the local
+    /// block replaces the committed one; new names stand alone.
+    #[test]
+    fn egress_overlay_replaces_wholesale() {
+        let dir = tempdir().unwrap();
+        write_config(
+            dir.path(),
+            CONFIG_FILE,
+            r#"
+            [secrets.gh]
+            provider = "1password"
+            [secrets.gh.refs]
+            TOKEN = "op://dev/github/token"
+
+            [egress.github]
+            host = "github.api.test"
+            target = "api.github.com:443"
+            secrets = "gh"
+            key = "TOKEN"
+            "#,
+        );
+        write_config(
+            dir.path(),
+            LOCAL_CONFIG_FILE,
+            r#"
+            [egress.github]
+            host = "github.api.test"
+            target = "localhost.mock:1"
+            secrets = "gh"
+            key = "TOKEN"
+
+            [egress.extra]
+            host = "extra.api.test"
+            target = "extra.example.com:443"
+            secrets = "gh"
+            key = "TOKEN"
+            "#,
+        );
+        let cfg = load(dir.path()).unwrap();
+        assert_eq!(cfg.egress.len(), 2);
+        assert_eq!(cfg.egress["github"].target, "localhost.mock:1");
+        assert!(cfg.egress.contains_key("extra"));
     }
 }

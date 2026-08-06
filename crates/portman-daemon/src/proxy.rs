@@ -229,8 +229,27 @@ async fn handle_connection(
             .ok();
             return Ok(());
         };
+        if spec.tls {
+            // A route that declares TLS must not be forwarded in plaintext:
+            // the upstream would reject the connection or (worse) a wrong
+            // listener would see the credential. Refuse loudly instead.
+            warn!(%host, target = %target, "egress route has tls = true but this proxy does not originate TLS yet");
+            write_error(
+                &mut client,
+                502,
+                &host,
+                &format!("{host} requires TLS origination, which is not available."),
+                "This build forwards egress routes over plaintext only; remove `tls = true` \
+                 or point the route at a plaintext upstream.",
+                "",
+                wants_html,
+            )
+            .await
+            .ok();
+            return Ok(());
+        }
         let audit = EgressAudit::from_spec(&host, &target, spec);
-        let Some(value) = credentials.resolve(spec) else {
+        let Some(value) = credentials.resolve(spec).await else {
             warn!(
                 host = audit.host,
                 upstream = audit.upstream,
@@ -655,16 +674,18 @@ mod tests {
     /// Hands out one fixed value, standing in for a resolved secrets block.
     struct StubCredentials(&'static str);
 
+    #[async_trait::async_trait]
     impl crate::egress::CredentialSource for StubCredentials {
-        fn resolve(&self, _spec: &portman_protocol::EgressSpec) -> Option<String> {
+        async fn resolve(&self, _spec: &portman_protocol::EgressSpec) -> Option<String> {
             Some(self.0.to_string())
         }
     }
 
     struct NoSuchCredential;
 
+    #[async_trait::async_trait]
     impl crate::egress::CredentialSource for NoSuchCredential {
-        fn resolve(&self, _spec: &portman_protocol::EgressSpec) -> Option<String> {
+        async fn resolve(&self, _spec: &portman_protocol::EgressSpec) -> Option<String> {
             None
         }
     }
@@ -677,6 +698,7 @@ mod tests {
             header: "Authorization".into(),
             format: "Bearer {value}".into(),
             upstream_host: "api.github.com".into(),
+            tls: false,
         });
         e
     }

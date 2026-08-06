@@ -88,9 +88,9 @@ pub(crate) fn load_repo_services() -> Result<portman_core::service_config::Servi
 
 pub(crate) async fn cmd_up(names: Vec<String>) -> Result<()> {
     let config = load_repo_services()?;
-    if config.services.is_empty() {
+    if config.services.is_empty() && config.egress.is_empty() {
         bail!(
-            "no [service.<name>] blocks defined in {}",
+            "no [service.<name>] or [egress.<name>] blocks defined in {}",
             config.root.display()
         );
     }
@@ -114,6 +114,7 @@ pub(crate) async fn cmd_up(names: Vec<String>) -> Result<()> {
         root: config.root.clone(),
         services: config.services.values().cloned().collect(),
         secrets: config.secrets.clone(),
+        egress: config.egress.clone(),
     })
     .await?;
     match resp {
@@ -231,6 +232,7 @@ pub(crate) async fn cmd_down(
             root: root.clone(),
             services: Vec::new(),
             secrets: std::collections::BTreeMap::new(),
+            egress: std::collections::BTreeMap::new(),
         })
         .await?;
         return match resp {

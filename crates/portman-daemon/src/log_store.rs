@@ -433,9 +433,14 @@ mod tests {
             "echo \"token is $SECRET_TOKEN\"".into(),
         ];
         def.env_files = vec![env_file];
-        sup.sync(dir.path(), vec![def], Default::default())
-            .await
-            .unwrap();
+        sup.sync(
+            dir.path(),
+            vec![def],
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
         sup.up(None).await.unwrap();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -476,9 +481,14 @@ mod tests {
             std::sync::Arc::new(NoRoutes),
         );
         let def = toy_def(dir.path());
-        sup.sync(dir.path(), vec![def], Default::default())
-            .await
-            .unwrap();
+        sup.sync(
+            dir.path(),
+            vec![def],
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
         sup.up(None).await.unwrap();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);

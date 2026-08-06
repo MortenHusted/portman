@@ -259,6 +259,10 @@ pub enum Request {
         services: Vec<ServiceDefinition>,
         #[serde(default)]
         secrets: std::collections::BTreeMap<String, SecretsProviderConfig>,
+        /// `[egress.<name>]` routes from the same config files. Wire-defaults
+        /// so an older CLI syncing against a newer daemon stays valid.
+        #[serde(default)]
+        egress: std::collections::BTreeMap<String, EgressRoute>,
     },
     /// Start services by name (dependencies come up with them). Empty =
     /// every known service.
@@ -525,6 +529,11 @@ pub struct EgressSpec {
     pub format: String,
     /// `Host:` to present to the upstream, e.g. `api.github.com`.
     pub upstream_host: String,
+    /// Speak TLS to the upstream (default off: plaintext targets like
+    /// `127.0.0.1:3000` or test fakes). Real APIs are `https`, so real
+    /// egress routes set this — the proxy then originates TLS to `target`.
+    #[serde(default)]
+    pub tls: bool,
 }
 
 impl EgressSpec {
@@ -534,6 +543,20 @@ impl EgressSpec {
     pub fn render(&self, value: &str) -> String {
         self.format.replace("{value}", value)
     }
+}
+
+/// One `[egress.<name>]` route as synced from repo config: where local
+/// callers reach the proxy, which upstream answers, and which credential
+/// gets attached on the way out. Names a secret; never carries one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EgressRoute {
+    /// Hostname local callers address (under a managed TLD).
+    pub host: String,
+    /// Upstream `host:port` the rewritten request is forwarded to.
+    pub target: String,
+    /// Credential attachment (block, key, header, format, upstream Host,
+    /// and whether the hop is TLS).
+    pub spec: EgressSpec,
 }
 
 /// One row of the TldList response.
@@ -726,6 +749,11 @@ pub enum Source {
     /// appears on `portman up`, disappears on `portman down` (re-seeding any
     /// static rule that still exists for the host).
     Service,
+    /// Declared by a repo config's `[egress.<name>]` block; appears on
+    /// `portman up`, disappears when the block is removed. Same lifecycle as
+    /// `Service`, kept distinct so tooling can tell routes with no local
+    /// backend from routes with one.
+    Egress,
 }
 
 /// How the entry wants to be reached. Drives proxy behavior and CLI display.
@@ -1136,6 +1164,21 @@ mod tests {
                     mode: InfisicalMode::Native,
                 },
             )]),
+            egress: std::collections::BTreeMap::from([(
+                "github".to_string(),
+                EgressRoute {
+                    host: "github.api.test".into(),
+                    target: "api.github.com:443".into(),
+                    spec: EgressSpec {
+                        secrets: "pacer".into(),
+                        key: "GITHUB_TOKEN".into(),
+                        header: "Authorization".into(),
+                        format: "Bearer {value}".into(),
+                        upstream_host: "api.github.com".into(),
+                        tls: true,
+                    },
+                },
+            )]),
         };
         let json = serde_json::to_string(&request).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -1144,11 +1187,14 @@ mod tests {
                 root,
                 services,
                 secrets,
+                egress,
             } => {
                 assert_eq!(root, std::path::PathBuf::from("/repo"));
                 assert_eq!(services.len(), 1);
                 assert_eq!(services[0].ready, ReadyCheck::Port(3000));
                 assert!(secrets.contains_key("pacer"));
+                assert_eq!(egress["github"].spec.key, "GITHUB_TOKEN");
+                assert!(egress["github"].spec.tls);
             }
             other => panic!("expected sync_services, got {other:?}"),
         }

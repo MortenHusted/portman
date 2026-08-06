@@ -374,7 +374,7 @@ async fn handle_config_post(stream: TcpStream, state: DaemonState, body: &[u8]) 
     let services: Vec<_> = config.services.into_values().collect();
     match state
         .supervisor
-        .sync(&edit.root, services, config.secrets)
+        .sync(&edit.root, services, config.secrets, config.egress)
         .await
     {
         Ok(report) => {

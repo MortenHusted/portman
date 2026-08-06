@@ -553,6 +553,7 @@ fn print_entries(entries: &[Entry]) {
             Source::Container => "container",
             Source::Static => "static",
             Source::Service => "service",
+            Source::Egress => "egress",
         };
         let container = e.container_id.as_deref().unwrap_or("-");
         println!(

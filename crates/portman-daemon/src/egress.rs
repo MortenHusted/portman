@@ -24,18 +24,37 @@ const CALLER_OWNED: [&str; 4] = ["authorization", "proxy-authorization", "host",
 /// Resolves the value behind an [`EgressSpec`].
 ///
 /// Threaded into the proxy the same way the runner is, so the proxy gains one
-/// capability rather than the whole daemon state.
+/// capability rather than the whole daemon state. Async because the value may
+/// come from a remote provider (Infisical/1Password), resolved at proxy time.
+#[async_trait::async_trait]
 pub(crate) trait CredentialSource: Send + Sync + 'static {
     /// The secret named by `spec`, or `None` if the block or key is unknown.
-    fn resolve(&self, spec: &EgressSpec) -> Option<String>;
+    async fn resolve(&self, spec: &EgressSpec) -> Option<String>;
 }
 
 /// No egress routes configured; every lookup misses.
 pub(crate) struct NoCredentials;
 
+#[async_trait::async_trait]
 impl CredentialSource for NoCredentials {
-    fn resolve(&self, _spec: &EgressSpec) -> Option<String> {
+    async fn resolve(&self, _spec: &EgressSpec) -> Option<String> {
         None
+    }
+}
+
+/// Production credential source: delegates to the supervisor, which owns the
+/// synced `[secrets.*]` blocks and the provider cache. Kept as a separate
+/// type (rather than threading the whole `Supervisor` through the proxy) so
+/// the proxy depends on one narrow capability, matching how it gets the
+/// runner.
+pub(crate) struct SupervisorCredentials {
+    pub(crate) supervisor: crate::supervisor::Supervisor,
+}
+
+#[async_trait::async_trait]
+impl CredentialSource for SupervisorCredentials {
+    async fn resolve(&self, spec: &EgressSpec) -> Option<String> {
+        self.supervisor.resolve_egress_value(spec).await
     }
 }
 
@@ -144,6 +163,7 @@ mod tests {
             header: "Authorization".into(),
             format: "Bearer {value}".into(),
             upstream_host: "api.github.com".into(),
+            tls: false,
         }
     }
 

@@ -378,7 +378,10 @@ pub async fn daemon_main() -> Result<()> {
     // Egress credentials are resolved inside the daemon at proxy time; the
     // proxy gains that one capability, not the whole state, mirroring how the
     // runner reaches it.
-    let egress_credentials: crate::egress::Credentials = Arc::new(crate::egress::NoCredentials);
+    let egress_credentials: crate::egress::Credentials =
+        Arc::new(crate::egress::SupervisorCredentials {
+            supervisor: supervisor.clone(),
+        });
     let http = tokio::spawn(proxy::run(
         state.registry.clone(),
         args.proxy_port,
