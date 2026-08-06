@@ -130,6 +130,25 @@ async fn handle(
         return Ok(());
     }
 
+    // Egress routes are reached over :80 (DNS always answers them with the
+    // host proxy); the :443 path terminates our OWN certs and has nothing
+    // meaningful to do with a route whose upstream is elsewhere. Refuse
+    // rather than forwarding bytes to a target that expects the rewritten
+    // head it only gets from the HTTP proxy.
+    if entry.mode == Mode::Egress {
+        warn!(%host, target = %entry.target, "rejecting HTTPS request to egress host");
+        write_status(
+            &mut tls,
+            502,
+            &format!(
+                "`{host}` is an egress route — call it over plain http:// (the proxy attaches the credential on the way out)."
+            ),
+        )
+        .await
+        .ok();
+        return Ok(());
+    }
+
     let target = entry.target.clone();
     debug!(%host, %target, "tls proxying");
 

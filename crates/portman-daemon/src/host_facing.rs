@@ -171,6 +171,7 @@ fn spawn_http(
                 bridge.clone(),
                 starter.clone(),
                 credentials,
+                crate::egress_client::Roots::System,
             )
             .await
             {

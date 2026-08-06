@@ -10,6 +10,7 @@ mod dashboard_auth;
 mod dns;
 mod docker_events;
 mod egress;
+mod egress_client;
 mod env_compose;
 mod handlers;
 mod ipc_server;
@@ -377,7 +378,8 @@ pub async fn daemon_main() -> Result<()> {
     let starter: Arc<dyn runner::Starter> = Arc::new(state.runner.clone());
     // Egress credentials are resolved inside the daemon at proxy time; the
     // proxy gains that one capability, not the whole state, mirroring how the
-    // runner reaches it.
+    // runner reaches it. The upstream handshake verifies against the
+    // compiled-in Mozilla trust set — portman is originating TLS here.
     let egress_credentials: crate::egress::Credentials =
         Arc::new(crate::egress::SupervisorCredentials {
             supervisor: supervisor.clone(),
@@ -388,6 +390,7 @@ pub async fn daemon_main() -> Result<()> {
         bridge_ifindex.clone(),
         starter.clone(),
         egress_credentials.clone(),
+        crate::egress_client::Roots::System,
     ));
     // Loopback front for TCP-mode entries (databases etc.): keeps them
     // reachable even when a VPN/exit-node captures the target's real subnet.

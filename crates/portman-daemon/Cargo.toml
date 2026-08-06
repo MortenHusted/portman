@@ -25,6 +25,9 @@ httparse = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
+# Egress TLS origination: the compiled-in Mozilla trust set. Already in the
+# lock file via reqwest's rustls-tls features; no new supply chain.
+webpki-roots = "1"
 rust-embed = { version = "8", features = ["include-exclude"] }
 mime_guess = "2"
 serde = { workspace = true }
