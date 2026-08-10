@@ -27,14 +27,24 @@ pub(crate) async fn cmd_status(repo: bool) -> Result<()> {
             bridge_assessment: _bridge_assessment,
             bridge_enabled: _bridge_enabled,
             bridge_mode: _bridge_mode,
-            dashboard_port,
+            dashboard_port: _,
         } => {
             println!("daemon version:  {version}");
             println!("running for:     {running_since}");
             println!("dns port:        {dns_port} (127.0.0.1)");
             println!("http proxy:      {proxy_port} (127.0.0.1)");
             println!("tls proxy:       {tls_port} (127.0.0.1)");
-            println!("dashboard:       http://127.0.0.1:{dashboard_port}");
+            if proxy_port == 80 {
+                println!(
+                    "dashboard:       http://{}",
+                    portman_core::registry::DASHBOARD_HOST
+                );
+            } else {
+                println!(
+                    "dashboard:       http://{}:{proxy_port}",
+                    portman_core::registry::DASHBOARD_HOST
+                );
+            }
             println!("socket:          {socket_path}");
             println!("data dir:        {data_dir}");
             println!("cert dir:        {cert_dir}");

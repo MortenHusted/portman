@@ -90,7 +90,7 @@ curl http://myapp.test/
 portman logs web -f
 ```
 
-The dashboard is at `http://127.0.0.1:7341` (`portman dashboard` opens it).
+The dashboard is at `http://portman.localhost` (`portman dashboard` opens it).
 
 ## Uninstall
 
