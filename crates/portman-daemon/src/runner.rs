@@ -262,7 +262,12 @@ mod tests {
             project: None,
         };
         supervisor
-            .sync(dir.path(), vec![def], Default::default())
+            .sync(
+                dir.path(),
+                vec![def],
+                Default::default(),
+                Default::default(),
+            )
             .await
             .unwrap();
 

@@ -93,8 +93,9 @@ impl DnsHandler {
         let raw = match entry.mode {
             // HTTP/HTTPS flows must land on Portman's local proxy. The proxy
             // then uses the Host header to reach entry.target, including
-            // non-default ports.
-            Mode::Http => HOST_PROXY_IP,
+            // non-default ports. An unknown mode routes the same way — the
+            // proxy only special-cases Tcp and Egress.
+            Mode::Http | Mode::Egress | Mode::Unknown => HOST_PROXY_IP,
             // TCP mode host-facing: answer with the entry's dedicated loopback
             // front, where portman's TCP forwarder relays to the target. This
             // keeps the route on loopback, immune to a VPN/exit-node that
@@ -238,6 +239,7 @@ mod tests {
             mode,
             container_id: None,
             project: None,
+            egress: None,
         }
     }
 

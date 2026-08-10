@@ -12,6 +12,10 @@ use std::sync::{Arc, RwLock};
 
 use portman_protocol::Entry;
 
+/// Stable browser route for portman's own dashboard. `.localhost` is
+/// resolved by the operating system, so this route needs no managed TLD.
+pub const DASHBOARD_HOST: &str = "portman.localhost";
+
 /// Cloneable handle to the shared registry — all clones point at the same data.
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
@@ -25,18 +29,27 @@ impl Registry {
 
     /// Insert or replace the entry for `entry.host`. Returns the previous entry, if any.
     pub fn upsert(&self, entry: Entry) -> Option<Entry> {
-        self.inner
-            .write()
-            .expect("registry lock poisoned")
-            .insert(entry.host.clone(), entry)
+        let mut guard = self.inner.write().expect("registry lock poisoned");
+        if let Some(existing) = guard.get(&entry.host) {
+            if existing.source == portman_protocol::Source::Builtin
+                && entry.source != portman_protocol::Source::Builtin
+            {
+                return Some(existing.clone());
+            }
+        }
+        guard.insert(entry.host.clone(), entry)
     }
 
     /// Remove and return the entry for `host`, if present.
     pub fn remove(&self, host: &str) -> Option<Entry> {
-        self.inner
-            .write()
-            .expect("registry lock poisoned")
-            .remove(host)
+        let mut guard = self.inner.write().expect("registry lock poisoned");
+        if guard
+            .get(host)
+            .is_some_and(|entry| entry.source == portman_protocol::Source::Builtin)
+        {
+            return None;
+        }
+        guard.remove(host)
     }
 
     /// Remove any entries whose `container_id` matches. Used on container
@@ -151,6 +164,19 @@ mod tests {
             mode: portman_protocol::Mode::Http,
             container_id: Some(id.into()),
             project: None,
+            egress: None,
+        }
+    }
+
+    fn builtin(host: &str) -> Entry {
+        Entry {
+            host: host.into(),
+            target: "127.0.0.1:7341".into(),
+            source: Source::Builtin,
+            mode: portman_protocol::Mode::Http,
+            container_id: None,
+            project: None,
+            egress: None,
         }
     }
 
@@ -162,6 +188,22 @@ mod tests {
         let mut hosts: Vec<String> = r.list().into_iter().map(|e| e.host).collect();
         hosts.sort();
         assert_eq!(hosts, vec!["a.test", "b.test"]);
+    }
+
+    #[test]
+    fn builtin_entries_cannot_be_replaced_or_removed() {
+        let registry = Registry::new();
+        registry.upsert(builtin(DASHBOARD_HOST));
+        registry.upsert(container(DASHBOARD_HOST, "abc"));
+
+        let entry = registry.get(DASHBOARD_HOST).unwrap();
+        assert_eq!(entry.source, Source::Builtin);
+        assert_eq!(entry.target, "127.0.0.1:7341");
+        assert!(registry.remove(DASHBOARD_HOST).is_none());
+        assert_eq!(
+            registry.get(DASHBOARD_HOST).unwrap().source,
+            Source::Builtin
+        );
     }
 
     #[test]
@@ -201,6 +243,7 @@ mod tests {
             mode: portman_protocol::Mode::Http,
             container_id: None,
             project: None,
+            egress: None,
         }
     }
 

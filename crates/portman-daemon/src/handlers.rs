@@ -36,7 +36,8 @@ pub(crate) async fn dispatch(request: Request, state: &DaemonState) -> Response 
             root,
             services,
             secrets,
-        } => handle_sync_services(state, root, services, secrets).await,
+            egress,
+        } => handle_sync_services(state, root, services, secrets, egress).await,
         Request::ServiceUp { names } => handle_service_up(state, names).await,
         Request::ServiceDown { names } => handle_service_down(state, names).await,
         Request::ServiceStatus => handle_service_status(state),
@@ -89,6 +90,7 @@ async fn handle_sync_services(
     root: std::path::PathBuf,
     services: Vec<portman_protocol::ServiceDefinition>,
     secrets: std::collections::BTreeMap<String, portman_protocol::SecretsProviderConfig>,
+    egress: std::collections::BTreeMap<String, portman_protocol::EgressRoute>,
 ) -> Response {
     // Definitions arrive pre-validated by the CLI's config parser, but the
     // socket is open to any local client — re-check the basics.
@@ -100,7 +102,11 @@ async fn handle_sync_services(
             ));
         }
     }
-    match state.supervisor.sync(&root, services, secrets).await {
+    match state
+        .supervisor
+        .sync(&root, services, secrets, egress)
+        .await
+    {
         Ok(report) => Response::SyncReport {
             added: report.added,
             updated: report.updated,
@@ -370,7 +376,11 @@ fn handle_add(
         Err(e) => return err(e.to_string()),
     };
 
-    if !state.host_tld_is_managed(&host) {
+    if host == portman_core::registry::DASHBOARD_HOST {
+        return err(format!("`{host}` is portman's built-in dashboard route"));
+    }
+
+    if !state.host_is_routable(&host) {
         return err(format!(
             "host `{host}` is under an unmanaged TLD; run `portman tld add <tld>` first"
         ));
@@ -388,6 +398,12 @@ fn handle_add(
              Register the concrete names instead."
         ));
     }
+    if portman_core::tld::host_is_localhost(&host) && mode == Mode::Tcp {
+        return err(format!(
+            "`{host}` uses .localhost, which portman only supports in HTTP mode — \
+             the operating system always resolves it to loopback"
+        ));
+    }
 
     if let Err(e) =
         state
@@ -403,6 +419,7 @@ fn handle_add(
         mode,
         container_id: None,
         project,
+        egress: None,
     });
     if mode == Mode::Http && state.host_tls_enabled(&host) {
         if let Err(err) = state.cert_manager.ensure(&host) {
@@ -465,6 +482,11 @@ async fn handle_tld_add(
         Ok(t) => t,
         Err(e) => return err(e.to_string()),
     };
+    if tld == "localhost" {
+        return err(
+            "`.localhost` is built in; use an HTTP hostname such as app.localhost directly",
+        );
+    }
 
     // Typed on the wire now, but `le` stays non-actionable until it ships —
     // the same rejection `parse_mode` used to give the stringly request.
@@ -510,12 +532,15 @@ fn handle_tld_remove(state: &DaemonState, tld: String) -> Response {
         Ok(t) => t,
         Err(e) => return err(e.to_string()),
     };
+    if tld == "localhost" {
+        return err("`.localhost` is built in and cannot be removed");
+    }
     state.tld_remove(&tld);
     let orphans: Vec<String> = state
         .registry
         .list()
         .into_iter()
-        .filter(|e| !state.host_tld_is_managed(&e.host))
+        .filter(|e| !state.host_is_routable(&e.host))
         .map(|e| e.host)
         .collect();
     for host in &orphans {
@@ -685,6 +710,81 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn localhost_http_routes_need_no_managed_tld() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+
+        let response = dispatch(
+            Request::AddStatic {
+                host: "app.localhost".into(),
+                target: "127.0.0.1:3000".into(),
+                mode: Mode::Http,
+                service: None,
+                project: None,
+            },
+            &state,
+        )
+        .await;
+
+        assert!(matches!(response, Response::Ok), "{response:?}");
+        assert_eq!(
+            state.registry.get("app.localhost").unwrap().target,
+            "127.0.0.1:3000"
+        );
+        assert!(state.known_tlds.read().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn localhost_tcp_routes_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+
+        let response = dispatch(
+            Request::AddStatic {
+                host: "db.localhost".into(),
+                target: "127.0.0.1:5432".into(),
+                mode: Mode::Tcp,
+                service: None,
+                project: None,
+            },
+            &state,
+        )
+        .await;
+
+        match response {
+            Response::Err { message } => assert!(message.contains("HTTP mode"), "{message}"),
+            other => panic!("expected err, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn builtin_dashboard_route_is_reserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        crate::seed_builtin_routes(&state);
+
+        let response = dispatch(
+            Request::AddStatic {
+                host: portman_core::registry::DASHBOARD_HOST.into(),
+                target: "127.0.0.1:9999".into(),
+                mode: Mode::Http,
+                service: None,
+                project: None,
+            },
+            &state,
+        )
+        .await;
+
+        assert!(matches!(response, Response::Err { .. }), "{response:?}");
+        let route = state
+            .registry
+            .get(portman_core::registry::DASHBOARD_HOST)
+            .unwrap();
+        assert_eq!(route.source, portman_core::Source::Builtin);
+        assert_eq!(route.target, "127.0.0.1:7341");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn service_up_unknown_name_returns_err() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(&dir);
@@ -765,6 +865,7 @@ mod tests {
                 root: dir.path().to_path_buf(),
                 services: vec![def],
                 secrets: Default::default(),
+                egress: Default::default(),
             },
             &state,
         )

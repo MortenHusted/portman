@@ -177,43 +177,48 @@ impl SecretsSource for ProviderSecretsSource {
                     "service references [secrets.{reference}] but no such block is synced"
                 )));
             };
-            if let Some(cached) = self
-                .cache
-                .lock()
-                .expect("secrets cache poisoned")
-                .get(reference)
-            {
-                values.extend(cached.iter().cloned());
-                continue;
-            }
-            let fetched = match config {
-                SecretsProviderConfig::Infisical { .. } => {
-                    let creds = self.credentials.infisical().ok_or_else(|| {
-                        SecretsError::fatal(
-                            "no Infisical machine identity stored — run `portman secrets set-infisical`",
-                        )
-                    })?;
-                    self.infisical.fetch(config, &creds).await?
-                }
-                SecretsProviderConfig::OnePassword { refs } => {
-                    let creds = self.credentials.onepassword().ok_or_else(|| {
-                        SecretsError::fatal(
-                            "no 1Password service-account token stored — run `portman secrets set-op`",
-                        )
-                    })?;
-                    onepassword::resolve(refs, &creds).await?
-                }
-            };
-            self.cache
-                .lock()
-                .expect("secrets cache poisoned")
-                .insert(reference.clone(), fetched.clone());
-            values.extend(fetched);
+            values.extend(self.resolve_block(reference, config).await?);
         }
         if !def.secrets.is_empty() {
             warn_on_empty(def, &values);
         }
         Ok(values)
+    }
+
+    /// One block's values, fetched (and cached) independently of any
+    /// service. The supervisor's service path loops this over
+    /// `def.secrets`; egress resolution names a single block the same way.
+    async fn resolve_block(
+        &self,
+        name: &str,
+        config: &SecretsProviderConfig,
+    ) -> Result<Vec<(String, String)>, SecretsError> {
+        if let Some(cached) = self.cache.lock().expect("secrets cache poisoned").get(name) {
+            return Ok(cached.clone());
+        }
+        let fetched = match config {
+            SecretsProviderConfig::Infisical { .. } => {
+                let creds = self.credentials.infisical().ok_or_else(|| {
+                    SecretsError::fatal(
+                        "no Infisical machine identity stored — run `portman secrets set-infisical`",
+                    )
+                })?;
+                self.infisical.fetch(config, &creds).await?
+            }
+            SecretsProviderConfig::OnePassword { refs } => {
+                let creds = self.credentials.onepassword().ok_or_else(|| {
+                    SecretsError::fatal(
+                        "no 1Password service-account token stored — run `portman secrets set-op`",
+                    )
+                })?;
+                onepassword::resolve(refs, &creds).await?
+            }
+        };
+        self.cache
+            .lock()
+            .expect("secrets cache poisoned")
+            .insert(name.to_string(), fetched.clone());
+        Ok(fetched)
     }
 
     fn invalidate(&self) {

@@ -239,7 +239,8 @@ fn header_value<'b>(req: &HttpRequest<'_, 'b>, name: &str) -> Option<&'b str> {
 
 /// Accept only loopback `Host` values, so a page served from a rebound hostname
 /// (DNS rebinding) can't drive the control API. The dashboard binds 127.0.0.1,
-/// so legitimate clients send `127.0.0.1` or `localhost` (optionally with a port).
+/// so legitimate clients send a loopback literal, `localhost`, or portman's
+/// protected built-in dashboard name (optionally with a port).
 fn host_is_local(host: Option<&str>) -> bool {
     let Some(host) = host.map(str::trim) else {
         return false;
@@ -250,7 +251,10 @@ fn host_is_local(host: Option<&str>) -> bool {
         _ => host,
     };
     let bare = bare.trim_start_matches('[').trim_end_matches(']');
-    matches!(bare, "127.0.0.1" | "localhost" | "::1")
+    matches!(
+        bare,
+        "127.0.0.1" | "localhost" | "::1" | portman_core::registry::DASHBOARD_HOST
+    )
 }
 
 /// For state-changing requests, reject a cross-origin `Origin` (CSRF). A
@@ -374,7 +378,7 @@ async fn handle_config_post(stream: TcpStream, state: DaemonState, body: &[u8]) 
     let services: Vec<_> = config.services.into_values().collect();
     match state
         .supervisor
-        .sync(&edit.root, services, config.secrets)
+        .sync(&edit.root, services, config.secrets, config.egress)
         .await
     {
         Ok(report) => {
@@ -638,6 +642,8 @@ mod tests {
             "127.0.0.1:7341",
             "localhost",
             "localhost:7341",
+            "portman.localhost",
+            "portman.localhost:80",
             "[::1]:7341",
         ] {
             assert!(host_is_local(Some(h)), "should accept {h}");
@@ -662,6 +668,7 @@ mod tests {
     fn origin_only_trusts_loopback() {
         assert!(origin_is_local("http://127.0.0.1:7341"));
         assert!(origin_is_local("http://localhost:7341"));
+        assert!(origin_is_local("http://portman.localhost"));
         assert!(!origin_is_local("http://evil.com"));
         assert!(!origin_is_local("https://localhost.evil.com"));
         assert!(!origin_is_local("null"));

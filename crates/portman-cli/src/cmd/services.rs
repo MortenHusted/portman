@@ -27,14 +27,24 @@ pub(crate) async fn cmd_status(repo: bool) -> Result<()> {
             bridge_assessment: _bridge_assessment,
             bridge_enabled: _bridge_enabled,
             bridge_mode: _bridge_mode,
-            dashboard_port,
+            dashboard_port: _,
         } => {
             println!("daemon version:  {version}");
             println!("running for:     {running_since}");
             println!("dns port:        {dns_port} (127.0.0.1)");
             println!("http proxy:      {proxy_port} (127.0.0.1)");
             println!("tls proxy:       {tls_port} (127.0.0.1)");
-            println!("dashboard:       http://127.0.0.1:{dashboard_port}");
+            if proxy_port == 80 {
+                println!(
+                    "dashboard:       http://{}",
+                    portman_core::registry::DASHBOARD_HOST
+                );
+            } else {
+                println!(
+                    "dashboard:       http://{}:{proxy_port}",
+                    portman_core::registry::DASHBOARD_HOST
+                );
+            }
             println!("socket:          {socket_path}");
             println!("data dir:        {data_dir}");
             println!("cert dir:        {cert_dir}");
@@ -88,9 +98,9 @@ pub(crate) fn load_repo_services() -> Result<portman_core::service_config::Servi
 
 pub(crate) async fn cmd_up(names: Vec<String>) -> Result<()> {
     let config = load_repo_services()?;
-    if config.services.is_empty() {
+    if config.services.is_empty() && config.egress.is_empty() {
         bail!(
-            "no [service.<name>] blocks defined in {}",
+            "no [service.<name>] or [egress.<name>] blocks defined in {}",
             config.root.display()
         );
     }
@@ -114,6 +124,7 @@ pub(crate) async fn cmd_up(names: Vec<String>) -> Result<()> {
         root: config.root.clone(),
         services: config.services.values().cloned().collect(),
         secrets: config.secrets.clone(),
+        egress: config.egress.clone(),
     })
     .await?;
     match resp {
@@ -231,6 +242,7 @@ pub(crate) async fn cmd_down(
             root: root.clone(),
             services: Vec::new(),
             secrets: std::collections::BTreeMap::new(),
+            egress: std::collections::BTreeMap::new(),
         })
         .await?;
         return match resp {
@@ -260,7 +272,14 @@ pub(crate) async fn cmd_down(
         // it as "outside a repo" sent a user with a one-character TOML typo
         // looking in entirely the wrong place.
         let config = portman_core::service_config::load(&root)?;
-        config.services.keys().cloned().collect()
+        let service_names: Vec<String> = config.services.keys().cloned().collect();
+        if service_names.is_empty() {
+            bail!(
+                "no [service.<name>] blocks in this repo — only egress routes, which \
+                 follow the config (remove the block, `portman up`); nothing to stop"
+            );
+        }
+        service_names
     } else {
         names
     };

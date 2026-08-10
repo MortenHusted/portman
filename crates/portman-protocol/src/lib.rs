@@ -259,6 +259,10 @@ pub enum Request {
         services: Vec<ServiceDefinition>,
         #[serde(default)]
         secrets: std::collections::BTreeMap<String, SecretsProviderConfig>,
+        /// `[egress.<name>]` routes from the same config files. Wire-defaults
+        /// so an older CLI syncing against a newer daemon stays valid.
+        #[serde(default)]
+        egress: std::collections::BTreeMap<String, EgressRoute>,
     },
     /// Start services by name (dependencies come up with them). Empty =
     /// every known service.
@@ -501,6 +505,58 @@ pub struct Entry {
     /// file's `project` on service-derived routes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Credential to attach when proxying to `target`. Only meaningful for
+    /// [`Mode::Egress`]; `None` everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressSpec>,
+}
+
+/// Which credential the proxy attaches to a request on its way out, and how.
+///
+/// This names a secret; it never carries one. The daemon resolves the named
+/// `[secrets.<block>]` key at proxy time, so the value exists only inside the
+/// daemon and never in a config file, a registry dump, or a caller's
+/// environment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EgressSpec {
+    /// `[secrets.<block>]` the value comes from.
+    pub secrets: String,
+    /// Key within that block.
+    pub key: String,
+    /// Header to set, e.g. `Authorization`.
+    pub header: String,
+    /// Value template; `{value}` is replaced with the resolved secret.
+    pub format: String,
+    /// `Host:` to present to the upstream, e.g. `api.github.com`.
+    pub upstream_host: String,
+    /// Speak TLS to the upstream (default off: plaintext targets like
+    /// `127.0.0.1:3000` or test fakes). Real APIs are `https`, so real
+    /// egress routes set this — the proxy then originates TLS to `target`.
+    #[serde(default)]
+    pub tls: bool,
+}
+
+impl EgressSpec {
+    /// Render the header value. Kept here so the substitution rule has one
+    /// definition rather than one per call site.
+    #[must_use]
+    pub fn render(&self, value: &str) -> String {
+        self.format.replace("{value}", value)
+    }
+}
+
+/// One `[egress.<name>]` route as synced from repo config: where local
+/// callers reach the proxy, which upstream answers, and which credential
+/// gets attached on the way out. Names a secret; never carries one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EgressRoute {
+    /// Hostname local callers address (under a managed TLD).
+    pub host: String,
+    /// Upstream `host:port` the rewritten request is forwarded to.
+    pub target: String,
+    /// Credential attachment (block, key, header, format, upstream Host,
+    /// and whether the hop is TLS).
+    pub spec: EgressSpec,
 }
 
 /// One row of the TldList response.
@@ -684,20 +740,51 @@ where
 }
 
 /// Where the entry came from. Treated identically by the DNS and proxy layers.
+///
+/// Wire-compatible: unknown future variants deserialize to [`Source::Unknown`]
+/// so a newer daemon can't break an older client's whole list parse.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", from = "String")]
 pub enum Source {
+    /// A route owned by the daemon itself rather than user configuration.
+    /// Built-ins cannot be removed or replaced by another route source.
+    Builtin,
     Container,
     Static,
     /// Derived from a supervised service's `host` + `port` declaration;
     /// appears on `portman up`, disappears on `portman down` (re-seeding any
     /// static rule that still exists for the host).
     Service,
+    /// Declared by a repo config's `[egress.<name>]` block; appears on
+    /// `portman up`, disappears when the block is removed. Same lifecycle as
+    /// `Service`, kept distinct so tooling can tell routes with no local
+    /// backend from routes with one.
+    Egress,
+    /// Unknown (newer daemon than this client). Preserved round-trip so a
+    /// future `portman down` can still release the entry.
+    Unknown,
+}
+
+impl From<String> for Source {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "builtin" => Source::Builtin,
+            "container" => Source::Container,
+            "static" => Source::Static,
+            "service" => Source::Service,
+            "egress" => Source::Egress,
+            _ => Source::Unknown,
+        }
+    }
 }
 
 /// How the entry wants to be reached. Drives proxy behavior and CLI display.
+///
+/// Wire-compatible: unknown future variants deserialize to [`Mode::Unknown`]
+/// (the proxy treats those like [`Mode::Http`] — a plain Host-routed hop —
+/// which is also what an old CLI's unknown mode would mean in practice).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", from = "String")]
 pub enum Mode {
     /// Default. Traffic flows through portman's HTTP proxy; the proxy routes
     /// by `Host:` header to `target`.
@@ -706,6 +793,27 @@ pub enum Mode {
     /// Raw TCP — fronted on a dedicated loopback address that relays to
     /// `target`. Required for Postgres, MySQL, Redis, gRPC without Host, etc.
     Tcp,
+    /// Authenticated egress: the proxy rewrites the request head and attaches
+    /// the credential named by [`Entry::egress`] before forwarding to an
+    /// external `target`, so the caller never holds it.
+    ///
+    /// This is the one mode the proxy branches on beyond `Tcp`; routing
+    /// otherwise stays source-agnostic.
+    Egress,
+    /// Unknown (newer daemon than this client). Rendered as `http` — the
+    /// proxy only special-cases `Tcp` and `Egress`, so routing stays safe.
+    Unknown,
+}
+
+impl From<String> for Mode {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "http" => Mode::Http,
+            "tcp" => Mode::Tcp,
+            "egress" => Mode::Egress,
+            _ => Mode::Unknown,
+        }
+    }
 }
 
 impl Mode {
@@ -722,6 +830,8 @@ impl Mode {
         match self {
             Mode::Http => "http",
             Mode::Tcp => "tcp",
+            Mode::Egress => "egress",
+            Mode::Unknown => "http",
         }
     }
 }
@@ -1026,6 +1136,55 @@ mod tests {
     }
 
     #[test]
+    fn unknown_source_and_mode_deserialize_lossily() {
+        // A newer daemon minting `source: "quantum"` / `mode: "wormhole"`
+        // must not break an older client's whole list parse — the CLAUDE.md
+        // wire-compat rule: protocol enums deserialize unknown → Unknown.
+        let json = r#"{
+            "kind": "service_statuses",
+            "services": [{
+                "name": "web",
+                "root": "/repo",
+                "state": "ready",
+                "detail": "",
+                "pid": 123,
+                "restarts": 0,
+                "host": "web.test",
+                "port": 3000,
+                "desired_up": true,
+                "groups": []
+            }]
+        }"#;
+        let response: Response = serde_json::from_str(json).unwrap();
+        match response {
+            Response::ServiceStatuses { services } => {
+                assert_eq!(services.len(), 1);
+                assert_eq!(services[0].name, "web");
+            }
+            other => panic!("expected service_statuses, got {other:?}"),
+        }
+
+        // The Entry variant the older CLI receives on a list query.
+        let json = r#"[
+            {"host":"a.test","target":"127.0.0.1:80","source":"quantum","mode":"wormhole"},
+            {"host":"b.test","target":"api.example.com:443","source":"egress","mode":"egress"},
+            {"host":"portman.localhost","target":"127.0.0.1:7341","source":"builtin","mode":"http"}
+        ]"#;
+        let entries: Vec<Entry> = serde_json::from_str(json).unwrap();
+        assert_eq!(entries[0].source, Source::Unknown);
+        assert_eq!(entries[0].mode, Mode::Unknown);
+        assert_eq!(entries[1].source, Source::Egress);
+        assert_eq!(entries[1].mode, Mode::Egress);
+        assert_eq!(entries[2].source, Source::Builtin);
+        assert_eq!(entries[2].mode, Mode::Http);
+
+        // Unknown still round-trips to a concrete token (never panics the
+        // serializer) — rendered as "http" so an old client's own display
+        // treats it as a plain Host-routed entry.
+        assert_eq!(entries[0].mode.as_str(), "http");
+    }
+
+    #[test]
     fn start_service_round_trips() {
         let json = serde_json::to_string(&Request::StartService {
             host: "db.test".into(),
@@ -1095,6 +1254,21 @@ mod tests {
                     mode: InfisicalMode::Native,
                 },
             )]),
+            egress: std::collections::BTreeMap::from([(
+                "github".to_string(),
+                EgressRoute {
+                    host: "github.api.test".into(),
+                    target: "api.github.com:443".into(),
+                    spec: EgressSpec {
+                        secrets: "pacer".into(),
+                        key: "GITHUB_TOKEN".into(),
+                        header: "Authorization".into(),
+                        format: "Bearer {value}".into(),
+                        upstream_host: "api.github.com".into(),
+                        tls: true,
+                    },
+                },
+            )]),
         };
         let json = serde_json::to_string(&request).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -1103,11 +1277,14 @@ mod tests {
                 root,
                 services,
                 secrets,
+                egress,
             } => {
                 assert_eq!(root, std::path::PathBuf::from("/repo"));
                 assert_eq!(services.len(), 1);
                 assert_eq!(services[0].ready, ReadyCheck::Port(3000));
                 assert!(secrets.contains_key("pacer"));
+                assert_eq!(egress["github"].spec.key, "GITHUB_TOKEN");
+                assert!(egress["github"].spec.tls);
             }
             other => panic!("expected sync_services, got {other:?}"),
         }

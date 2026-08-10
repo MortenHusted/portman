@@ -9,6 +9,8 @@ mod dashboard;
 mod dashboard_auth;
 mod dns;
 mod docker_events;
+mod egress;
+mod egress_client;
 mod env_compose;
 mod handlers;
 mod ipc_server;
@@ -50,7 +52,7 @@ use anyhow::{Context, Result};
 use bollard::Docker;
 use clap::Parser;
 use portman_core::paths::{cert_dir, static_rules_path, tls_settings_path, user_home};
-use portman_core::tld::{host_has_managed_tld, scan_managed_tlds};
+use portman_core::tld::{host_is_routable, scan_managed_tlds};
 use portman_core::{Entry, LoopbackAllocator, Mode, Registry, Source, StaticStore, TlsStore};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -178,9 +180,9 @@ pub(crate) struct DaemonState {
 }
 
 impl DaemonState {
-    pub(crate) fn host_tld_is_managed(&self, host: &str) -> bool {
+    pub(crate) fn host_is_routable(&self, host: &str) -> bool {
         let guard = self.known_tlds.read().expect("known_tlds lock poisoned");
-        host_has_managed_tld(host, guard.iter())
+        host_is_routable(host, guard.iter())
     }
 
     /// Does `host` fall under a TLD whose TLS mode is not `off`?
@@ -323,6 +325,7 @@ pub async fn daemon_main() -> Result<()> {
         started: Instant::now(),
     };
 
+    seed_builtin_routes(&state);
     seed_from_static_store(&state);
     seed_from_running_containers(&docker, &state).await;
 
@@ -374,11 +377,21 @@ pub async fn daemon_main() -> Result<()> {
     // bridge-subnet sockets to it so an exit-node can't capture them.
     let bridge_ifindex = state.netbridge.ifindex.clone();
     let starter: Arc<dyn runner::Starter> = Arc::new(state.runner.clone());
+    // Egress credentials are resolved inside the daemon at proxy time; the
+    // proxy gains that one capability, not the whole state, mirroring how the
+    // runner reaches it. The upstream handshake verifies against the
+    // compiled-in Mozilla trust set — portman is originating TLS here.
+    let egress_credentials: crate::egress::Credentials =
+        Arc::new(crate::egress::SupervisorCredentials {
+            supervisor: supervisor.clone(),
+        });
     let http = tokio::spawn(proxy::run(
         state.registry.clone(),
         args.proxy_port,
         bridge_ifindex.clone(),
         starter.clone(),
+        egress_credentials.clone(),
+        crate::egress_client::Roots::System,
     ));
     // Loopback front for TCP-mode entries (databases etc.): keeps them
     // reachable even when a VPN/exit-node captures the target's real subnet.
@@ -447,6 +460,18 @@ fn provision_certs_for_existing(state: &DaemonState) {
             }
         }
     }
+}
+
+fn seed_builtin_routes(state: &DaemonState) {
+    state.registry.upsert(Entry {
+        host: portman_core::registry::DASHBOARD_HOST.into(),
+        target: format!("127.0.0.1:{}", state.dashboard_port),
+        source: Source::Builtin,
+        mode: Mode::Http,
+        container_id: None,
+        project: None,
+        egress: None,
+    });
 }
 
 pub(crate) async fn rehydrate_registry_for_managed_tlds(state: &DaemonState) {
@@ -536,8 +561,18 @@ fn seed_from_static_store(state: &DaemonState) {
     let mut seeded = 0usize;
     let mut skipped = 0usize;
     for (host, target, mode, project) in rules {
-        if !state.host_tld_is_managed(&host) {
+        if host == portman_core::registry::DASHBOARD_HOST {
+            warn!(%host, "skipping static rule: hostname is reserved for portman's dashboard");
+            skipped += 1;
+            continue;
+        }
+        if !state.host_is_routable(&host) {
             warn!(%host, "skipping static rule: TLD is not managed; run `portman tld add <tld>` first");
+            skipped += 1;
+            continue;
+        }
+        if mode == Mode::Tcp && portman_core::tld::host_is_localhost(&host) {
+            warn!(%host, "skipping static rule: .localhost is HTTP-only because the operating system fixes it to loopback");
             skipped += 1;
             continue;
         }
@@ -548,6 +583,7 @@ fn seed_from_static_store(state: &DaemonState) {
             mode,
             container_id: None,
             project,
+            egress: None,
         });
         seeded += 1;
     }
@@ -592,18 +628,28 @@ async fn seed_from_running_containers(docker: &Docker, state: &DaemonState) {
                 continue;
             }
         };
-        if !state.host_tld_is_managed(&host) {
+        if host == portman_core::registry::DASHBOARD_HOST {
+            warn!(%host, "skipping container: hostname is reserved for portman's dashboard");
+            skipped += 1;
+            continue;
+        }
+        if !state.host_is_routable(&host) {
             warn!(%host, "skipping container: TLD is not managed; run `portman tld add <tld>` first");
             skipped += 1;
             continue;
         }
         let mode = Mode::parse_label(labels.get("dev.portman.mode").map(String::as_str));
+        if mode == Mode::Tcp && portman_core::tld::host_is_localhost(&host) {
+            warn!(%host, "skipping container: .localhost is HTTP-only because the operating system fixes it to loopback");
+            skipped += 1;
+            continue;
+        }
         let Some(port) = labels
             .get("dev.portman.port")
             .cloned()
             .filter(|v| !v.is_empty())
             .or_else(|| match mode {
-                Mode::Http => Some("80".into()),
+                Mode::Http | Mode::Egress | Mode::Unknown => Some("80".into()),
                 Mode::Tcp => None,
             })
         else {
@@ -630,6 +676,7 @@ async fn seed_from_running_containers(docker: &Docker, state: &DaemonState) {
                         source: Source::Container,
                         mode,
                         container_id: Some(short(id).to_string()),
+                        egress: None,
                         project: inspect
                             .config
                             .as_ref()

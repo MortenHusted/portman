@@ -3,7 +3,6 @@
 
 use crate::cmd::{locate_repo_root, run, run_sudo, sudo_write};
 use anyhow::{bail, Context, Result};
-use portman_core::paths::DEFAULT_DASHBOARD_PORT;
 use std::process::Command as StdCommand;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
@@ -107,7 +106,7 @@ pub(crate) async fn cmd_install_macos() -> Result<()> {
     wait_for_old_daemon_exit();
     run_sudo(&["launchctl", "bootstrap", "system", DAEMON_PLIST_PATH])?;
 
-    print_install_success(&log_dir, DEFAULT_DASHBOARD_PORT);
+    print_install_success(&log_dir);
     Ok(())
 }
 
@@ -136,7 +135,7 @@ pub(crate) async fn cmd_install_linux() -> Result<()> {
     // upgrade must actually swap onto the new binary.
     run_sudo(&["systemctl", "restart", "portman-daemon"])?;
 
-    print_install_success(log_dir, DEFAULT_DASHBOARD_PORT);
+    print_install_success(log_dir);
     Ok(())
 }
 
@@ -166,12 +165,15 @@ pub(crate) fn install_binaries(
     Ok(())
 }
 
-pub(crate) fn print_install_success(log_dir: &std::path::Path, dashboard_port: u16) {
+pub(crate) fn print_install_success(log_dir: &std::path::Path) {
     println!(
         "\nportman installed. Daemon autostarts on boot. Logs in {}.",
         log_dir.display()
     );
-    println!("Open the dashboard: http://127.0.0.1:{dashboard_port}  (or run `portman dashboard`)");
+    println!(
+        "Open the dashboard: http://{}  (or run `portman dashboard`)",
+        portman_core::registry::DASHBOARD_HOST
+    );
     println!("Uninstall with: portman uninstall");
 }
 

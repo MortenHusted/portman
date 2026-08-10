@@ -1092,14 +1092,20 @@ fn render_entries_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
         .map(|e| {
             let scheme = state.scheme_of(e);
             let src = match e.source {
+                Source::Builtin => "⌂",
                 Source::Container => "●",
                 Source::Static => "◆",
                 Source::Service => "▸",
+                Source::Egress => "⇗",
+                Source::Unknown => "?",
             };
             let src_style = match e.source {
+                Source::Builtin => Style::default().fg(Color::Blue),
                 Source::Container => Style::default().fg(Color::Cyan),
                 Source::Static => Style::default().fg(Color::Magenta),
                 Source::Service => Style::default().fg(Color::Green),
+                Source::Egress => Style::default().fg(Color::Yellow),
+                Source::Unknown => Style::default().fg(Color::DarkGray),
             };
             let scheme_style = match scheme {
                 "https" => Style::default().fg(Color::Green).bold(),
@@ -1642,18 +1648,25 @@ fn detail_entry(state: &State) -> (&'static str, Vec<Line<'static>>) {
 
     // Metadata — source + TLD
     let source_desc = match entry.source {
+        Source::Builtin => "built-in  (owned by the portman daemon)".to_string(),
         Source::Container => {
             let cid = entry.container_id.clone().unwrap_or_default();
             format!("container  ({cid})")
         }
         Source::Static => "static rule  (added via `portman add`)".to_string(),
         Source::Service => "service  (derived from portman.toml — `portman up`/`down`)".to_string(),
+        Source::Egress => {
+            "egress  ([egress.*] in portman.toml — credential attached by portman)".to_string()
+        }
+        Source::Unknown => "unknown source  (newer daemon)".to_string(),
     };
     lines.push(kv("  source      ", source_desc));
     lines.push(kv(
         "  mode        ",
         if is_tcp {
             "tcp  (raw, portman-out-of-path)"
+        } else if entry.mode == Mode::Egress {
+            "egress  (upstream authenticated on the way out)"
         } else {
             "http  (proxied by Host header)"
         }
@@ -1685,11 +1698,14 @@ fn detail_entry(state: &State) -> (&'static str, Vec<Line<'static>>) {
     )));
     lines.push(Line::from(Span::styled(
         match entry.source {
+            Source::Builtin => "  built-in route — always available while portman is running",
             Source::Static => "  [d] remove this rule",
             Source::Container => {
                 "  container entries follow the container — `docker stop` to remove"
             }
             Source::Service => "  service entries follow the service — `portman down` to remove",
+            Source::Egress => "  egress routes follow the config — remove the block, `portman up`",
+            Source::Unknown => "  entry from a newer daemon — read-only here",
         },
         Style::default().fg(Color::Gray),
     )));

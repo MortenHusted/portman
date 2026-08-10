@@ -1039,7 +1039,9 @@ function renderRoutes() {
       : '';
     const removeBtn = e.source === 'static'
       ? `<button type="button" class="danger tiny remove-btn" data-host="${esc(e.host)}">Remove</button>`
-      : `<button type="button" class="secondary tiny start-btn" data-host="${esc(e.host)}">Start</button>`;
+      : e.source === 'builtin'
+        ? ''
+        : `<button type="button" class="secondary tiny start-btn" data-host="${esc(e.host)}">Start</button>`;
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${hostCell}${flag}</td>
@@ -1127,7 +1129,9 @@ function renderStatus(status) {
   }
   el('version').textContent = 'v' + status.version;
   el('daemon-ports').textContent = `dns :${status.dns_port} · http :${status.proxy_port} · tls :${status.tls_port}`;
-  el('dashboard-url').textContent = `http://127.0.0.1:${status.dashboard_port}`;
+  el('dashboard-url').textContent = status.proxy_port === 80
+    ? 'http://portman.localhost'
+    : `http://portman.localhost:${status.proxy_port}`;
 
   const pill = el('bridge-pill');
   const assessment = status.bridge_assessment || 'unknown';
