@@ -23,7 +23,7 @@ Beyond networking, portman owns the **service definition itself**: per-repo `por
 ## Toolchain
 
 - **Daemon: Rust.** `tokio` async runtime. Key crates: `bollard` (Docker API), `boringtun` (Cloudflare WireGuard), `hickory-dns` (DNS server), `httparse` + byte-level tokio streams (HTTP/TLS proxy). `pingora`/`hyper` remain future options if the proxy needs higher-level HTTP behavior.
-- **UI: Embedded web dashboard** at `http://127.0.0.1:7341` plus ratatui TUI. Single UI codebase for macOS and Linux.
+- **UI: Embedded web dashboard** at `http://portman.localhost` plus ratatui TUI. The built-in route proxies to the loopback-only dashboard listener. Single UI codebase for macOS and Linux.
 - **IPC: Unix socket** at `~/Library/Application Support/portman/portman.sock`, length-prefixed JSON frames (`portman_protocol::transport`).
 - **Two processes, never one monolith.** Daemon owns all privileged / long-lived state; UI is a thin client.
 
@@ -58,14 +58,14 @@ Three things are first-class:
 
 All sources produce the same internal record: `{hostname, ip, port, source}`. DNS and proxy don't know or care which source or TLD it came from. Keep this abstraction clean.
 
-**TLD registration is explicit, not auto.** A container with `dev.portman.host=foo.crm` where `.crm` is not a managed TLD is *ignored with a warning*. Rationale: `/etc/resolver/` writes are a shared-resource change and can clobber Tailscale/VPN split-DNS. Users must opt in per TLD via `portman tld add`. This is the safety rail.
+**TLD registration is explicit, not auto.** A container with `dev.portman.host=foo.crm` where `.crm` is not a managed TLD is *ignored with a warning*. Rationale: `/etc/resolver/` writes are a shared-resource change and can clobber Tailscale/VPN split-DNS. Users must opt in per TLD via `portman tld add`. The one exception is HTTP-only `.localhost`: the operating system already resolves it to loopback, so Portman routes it without installing a resolver.
 
 ## TLD selection — what's safe on macOS
 
 | TLD | Status |
 |-----|--------|
 | `.test` | RFC 2606 reserved. **Recommended default.** Safe everywhere. |
-| `.localhost` | Always resolves to 127.0.0.1 — can't route to other IPs. Not useful. |
+| `.localhost` | Native HTTP-only Portman route. The OS resolves it to loopback and the proxy dispatches by Host; no resolver file needed. Not available for TCP mode. |
 | `.example`, `.invalid` | Reserved, fine technically, weird naming. |
 | `.internal` | ICANN-reserved (2024) but mDNSResponder intercepts queries similarly to `.local` on some macOS builds. Verify before relying on it. |
 | `.local` | **Do not use.** Bonjour/mDNS-reserved. mDNSResponder always wins. |

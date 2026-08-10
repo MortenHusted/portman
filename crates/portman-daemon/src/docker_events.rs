@@ -65,7 +65,15 @@ async fn handle_event(docker: &Docker, state: &DaemonState, msg: EventMessage) {
                     return;
                 }
             };
-            if !state.host_tld_is_managed(&host) {
+            if host == portman_core::registry::DASHBOARD_HOST {
+                warn!(
+                    %host,
+                    id = short(id),
+                    "ignoring container: hostname is reserved for portman's dashboard"
+                );
+                return;
+            }
+            if !state.host_is_routable(&host) {
                 warn!(
                     %host,
                     id = short(id),
@@ -74,6 +82,14 @@ async fn handle_event(docker: &Docker, state: &DaemonState, msg: EventMessage) {
                 return;
             }
             let mode = Mode::parse_label(mode_label(actor).as_deref());
+            if mode == Mode::Tcp && portman_core::tld::host_is_localhost(&host) {
+                warn!(
+                    %host,
+                    id = short(id),
+                    "ignoring container: .localhost is HTTP-only because the operating system fixes it to loopback"
+                );
+                return;
+            }
             let port = match (port_label(actor), mode) {
                 (Some(p), _) => p,
                 (None, Mode::Http | Mode::Egress | Mode::Unknown) => "80".into(),

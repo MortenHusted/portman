@@ -746,6 +746,9 @@ where
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", from = "String")]
 pub enum Source {
+    /// A route owned by the daemon itself rather than user configuration.
+    /// Built-ins cannot be removed or replaced by another route source.
+    Builtin,
     Container,
     Static,
     /// Derived from a supervised service's `host` + `port` declaration;
@@ -765,6 +768,7 @@ pub enum Source {
 impl From<String> for Source {
     fn from(s: String) -> Self {
         match s.as_str() {
+            "builtin" => Source::Builtin,
             "container" => Source::Container,
             "static" => Source::Static,
             "service" => Source::Service,
@@ -1163,13 +1167,16 @@ mod tests {
         // The Entry variant the older CLI receives on a list query.
         let json = r#"[
             {"host":"a.test","target":"127.0.0.1:80","source":"quantum","mode":"wormhole"},
-            {"host":"b.test","target":"api.example.com:443","source":"egress","mode":"egress"}
+            {"host":"b.test","target":"api.example.com:443","source":"egress","mode":"egress"},
+            {"host":"portman.localhost","target":"127.0.0.1:7341","source":"builtin","mode":"http"}
         ]"#;
         let entries: Vec<Entry> = serde_json::from_str(json).unwrap();
         assert_eq!(entries[0].source, Source::Unknown);
         assert_eq!(entries[0].mode, Mode::Unknown);
         assert_eq!(entries[1].source, Source::Egress);
         assert_eq!(entries[1].mode, Mode::Egress);
+        assert_eq!(entries[2].source, Source::Builtin);
+        assert_eq!(entries[2].mode, Mode::Http);
 
         // Unknown still round-trips to a concrete token (never panics the
         // serializer) — rendered as "http" so an old client's own display

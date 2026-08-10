@@ -19,7 +19,6 @@ use cmd::secrets::{cmd_secrets_set_infisical, cmd_secrets_set_op};
 use cmd::services::{cmd_down, cmd_logs, cmd_status, cmd_up};
 use cmd::tld::{cmd_tld_add, cmd_tld_list, cmd_tld_remove};
 use fmt::{format_bytes, format_rate, open_browser, truncate};
-use portman_core::paths::DEFAULT_DASHBOARD_PORT;
 use portman_protocol::{
     ContainerResourceUsage, Entry, Mode, Request, ResourceUsageSnapshot, Response, Source,
 };
@@ -495,18 +494,26 @@ async fn cmd_remove(host: String) -> Result<()> {
 }
 
 async fn cmd_dashboard() -> Result<()> {
-    let port = match request(Request::Status).await {
-        Ok(Response::Status { dashboard_port, .. }) => dashboard_port,
-        _ => DEFAULT_DASHBOARD_PORT,
+    let proxy_port = match request(Request::Status).await {
+        Ok(Response::Status { proxy_port, .. }) => proxy_port,
+        _ => 80,
+    };
+    let base = if proxy_port == 80 {
+        format!("http://{}", portman_core::registry::DASHBOARD_HOST)
+    } else {
+        format!(
+            "http://{}:{proxy_port}",
+            portman_core::registry::DASHBOARD_HOST
+        )
     };
     // The API needs a bearer token and a browser navigation cannot send a
     // header, so it rides in once on the query string; the page moves it to
     // sessionStorage and clears the address bar.
     let url = match dashboard_token() {
-        Some(token) => format!("http://127.0.0.1:{port}/?token={token}"),
-        None => format!("http://127.0.0.1:{port}"),
+        Some(token) => format!("{base}/?token={token}"),
+        None => base.clone(),
     };
-    println!("http://127.0.0.1:{port}");
+    println!("{base}");
     open_browser(&url)
 }
 
@@ -550,6 +557,7 @@ fn print_entries(entries: &[Entry]) {
     );
     for e in entries {
         let source = match e.source {
+            Source::Builtin => "builtin",
             Source::Container => "container",
             Source::Static => "static",
             Source::Service => "service",

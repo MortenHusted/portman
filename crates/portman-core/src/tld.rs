@@ -223,6 +223,25 @@ where
     })
 }
 
+/// Whether `host` uses the RFC 6761 loopback namespace. These names need no
+/// resolver integration: operating systems resolve `localhost` and every
+/// name below it to loopback themselves.
+pub fn host_is_localhost(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    host == "localhost" || host.ends_with(".localhost")
+}
+
+/// Whether portman may route `host` without asking the user to install a
+/// resolver. Managed TLDs use portman's DNS server; `.localhost` uses the
+/// operating system's built-in loopback resolution.
+pub fn host_is_routable<I>(host: &str, tlds: I) -> bool
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    host_is_localhost(host) || host_has_managed_tld(host, tlds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +288,23 @@ mod tests {
         assert!(host_has_managed_tld("crm.dev.acme.example.com", tlds));
         assert!(!host_has_managed_tld("crm.example.com", tlds));
         assert!(!host_has_managed_tld("crm.staging.acme.example.com", tlds));
+    }
+
+    #[test]
+    fn localhost_names_route_without_a_managed_tld() {
+        assert!(host_is_routable(
+            "app.localhost",
+            std::iter::empty::<&str>()
+        ));
+        assert!(host_is_routable(
+            "API.DEMO.LOCALHOST",
+            std::iter::empty::<&str>()
+        ));
+        assert!(!host_is_routable(
+            "localhost.example.com",
+            std::iter::empty::<&str>()
+        ));
+        assert!(!host_is_routable("app.test", std::iter::empty::<&str>()));
     }
 
     #[test]

@@ -1092,6 +1092,7 @@ fn render_entries_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
         .map(|e| {
             let scheme = state.scheme_of(e);
             let src = match e.source {
+                Source::Builtin => "⌂",
                 Source::Container => "●",
                 Source::Static => "◆",
                 Source::Service => "▸",
@@ -1099,6 +1100,7 @@ fn render_entries_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
                 Source::Unknown => "?",
             };
             let src_style = match e.source {
+                Source::Builtin => Style::default().fg(Color::Blue),
                 Source::Container => Style::default().fg(Color::Cyan),
                 Source::Static => Style::default().fg(Color::Magenta),
                 Source::Service => Style::default().fg(Color::Green),
@@ -1646,6 +1648,7 @@ fn detail_entry(state: &State) -> (&'static str, Vec<Line<'static>>) {
 
     // Metadata — source + TLD
     let source_desc = match entry.source {
+        Source::Builtin => "built-in  (owned by the portman daemon)".to_string(),
         Source::Container => {
             let cid = entry.container_id.clone().unwrap_or_default();
             format!("container  ({cid})")
@@ -1695,6 +1698,7 @@ fn detail_entry(state: &State) -> (&'static str, Vec<Line<'static>>) {
     )));
     lines.push(Line::from(Span::styled(
         match entry.source {
+            Source::Builtin => "  built-in route — always available while portman is running",
             Source::Static => "  [d] remove this rule",
             Source::Container => {
                 "  container entries follow the container — `docker stop` to remove"

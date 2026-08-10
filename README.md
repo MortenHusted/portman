@@ -11,7 +11,7 @@ portman exists because OrbStack's networking is genuinely nice, and I wanted tho
 1. **Automatic DNS.** A container labelled `dev.portman.host=myapp.test` resolves as soon as it starts, and stops resolving when it stops.
 2. **No port-forwarding.** On macOS, a WireGuard-based bridge makes container IPs routable from the host, so you reach the container's own port. On Linux the kernel already does this.
 3. **Host services too.** Apps running directly on the host (Rails, Node, your own binaries) get the same hostnames, TLS, supervision, and visibility as containers.
-4. **A dashboard.** Everything that's running, where it routes, and what it's consuming, at `http://127.0.0.1:7341`.
+4. **A dashboard.** Everything that's running, where it routes, and what it's consuming, at `http://portman.localhost`.
 
 ## Quickstart
 
@@ -74,7 +74,7 @@ Optional extras: a Docker runtime if you want container routing, and [`mkcert`](
 ```bash
 portman install          # installs binaries + root LaunchDaemon, builds the bridge setup image
 portman tld add test
-portman dashboard        # opens http://127.0.0.1:7341
+portman dashboard        # opens http://portman.localhost
 ```
 
 `portman uninstall` removes the launchd service and binaries. portman's data dir (`~/Library/Application Support/portman`) holds `static.json`, `tls.json`, `certs/`, and, for the service runner, `services.json` (definitions + desired state), `logs.db` (captured service output), and `credentials.json` (secrets-provider machine credentials, 0600). Delete it yourself if you want a clean slate.
@@ -97,7 +97,7 @@ Local-dev networking needs privileges. Here is exactly what portman takes and wh
 
 - The daemon runs as root (a LaunchDaemon on macOS), because binding `:80`/`:443` and owning the bridge requires it. Supervised services are spawned as your login user, never as root, each in its own process group with a hermetic environment.
 - The CLI performs the privileged filesystem writes (`/etc/resolver/<tld>`, launchd plists) via explicit `sudo`, with marker checks so portman only ever overwrites files portman wrote. A resolver file managed by something else (a VPN's split-DNS, say) is a refusal, not a clobber.
-- TLD registration is opt-in per TLD. A container label under an unmanaged TLD is ignored with a warning rather than silently reshaping your DNS.
+- TLD registration is opt-in per TLD. A container label under an unmanaged TLD is ignored with a warning rather than silently reshaping your DNS. `.localhost` is the exception: the operating system already resolves it to loopback, so HTTP routes such as `app.localhost` need no resolver install.
 - The IPC socket (`portman.sock`) is mode 0660 and peer-credential-gated to root and the owning user. The dashboard binds loopback only and validates Host/Origin.
 - The dashboard's `/api/*` routes require a bearer token (0600 in the daemon's data dir, owned by your login user). Loopback keeps the network out, not other local processes, and those routes read captured logs and write repo config. `portman dashboard` passes the token to the browser; scripts send `Authorization: Bearer $(cat …/dashboard-token)`. `--dashboard-auth=false` turns it off for development.
 - Secrets never live in repo config. `portman.toml` carries provider coordinates only; machine credentials (Infisical universal-auth, 1Password service accounts) are stored 0600 in the daemon's data dir, written via `portman secrets set-*` reading from stdin.
@@ -179,7 +179,7 @@ provider = "1password"
 TOKEN = "op://dev/github/token"
 
 [egress.github]
-host = "github.api.test"          # local hostname callers address (managed TLD)
+host = "github.api.test"          # local hostname (managed TLD or .localhost)
 target = "api.github.com:443"     # external upstream host:port
 secrets = "github"                # [secrets.<name>] block the value comes from
 key = "TOKEN"                     # key within that block
@@ -213,8 +213,8 @@ Semantics worth knowing:
   `Sec-Fetch-Site: cross-site`) gets `403` before the credential is
   resolved, mirroring the Start-button guard.
 - Route names are global like service names (a second repo claiming the
-  same name is refused), and the `host` must sit under a managed TLD, like
-  service routes. A changed `host` releases the old hostname; removing the
+  same name is refused), and the `host` must sit under a managed TLD or
+  `.localhost`, like service routes. A changed `host` releases the old hostname; removing the
   block unregisters the route on the next `portman up`. A wildcard `host`
   (`*.api.test`) works like static-rule wildcards: the credential is
   attached for every one-label subdomain, always to the same `target`.
@@ -225,7 +225,7 @@ A few semantics worth knowing before you rely on them:
 
 **Watch means an intentional respawn, not a crash.** A service that declares `watch` respawns when any of those paths changes; rebuild the binary and portman cycles it. A watch hit spends no restart budget, skips pending backoff, and revives a service that had reached `Failed`. The one state it won't act on is a service you stopped yourself: `portman down` is sticky until you bring it back up. `poll` is the default backend because builds replace their output by rename, which native watchers follow to the old inode. Polling compares mtime at whole-second resolution, so use `native` if you need finer.
 
-**Supervision survives the daemon.** Services run as your login user in their own process group and restart with exponential backoff. Desired state persists across daemon restarts; orphaned process groups from an unclean daemon exit are identity-checked, terminated, and respawned, never adopted. Captured stdout/stderr lands in a queryable store with retention. Service names are global across repos, and the `host` field is gated on managed TLDs exactly like `portman add`.
+**Supervision survives the daemon.** Services run as your login user in their own process group and restart with exponential backoff. Desired state persists across daemon restarts; orphaned process groups from an unclean daemon exit are identity-checked, terminated, and respawned, never adopted. Captured stdout/stderr lands in a queryable store with retention. Service names are global across repos, and the `host` field accepts managed TLDs or resolver-free `.localhost` names exactly like `portman add`.
 
 ## Static rules and wildcards
 
@@ -233,10 +233,17 @@ Anything not in a `portman.toml` can still get a hostname:
 
 ```bash
 portman add myapp.test 127.0.0.1:3070        # HTTP, routed by Host header
+portman add admin.localhost 127.0.0.1:9000   # HTTP, no `portman tld add` needed
 portman add db.test 172.17.0.2:5432 --tcp    # TCP, dedicated loopback front
 portman add api.test 127.0.0.1:9000 --project acme   # joins the dashboard's project filter
 portman remove myapp.test
 ```
+
+`.localhost` routes are HTTP-only. The operating system fixes every name in
+that namespace to loopback, which is exactly where Portman's Host-routing
+proxy listens; it cannot supply the distinct loopback fronts TCP mode needs.
+Portman's own protected built-in route uses the same mechanism:
+`http://portman.localhost` proxies to the dashboard.
 
 A rule can cover a whole label with `*`, so a fleet of names reaches one backend without registering each:
 
@@ -293,7 +300,7 @@ Development runs through [mise](https://mise.jdx.dev):
 mise install        # pinned Rust
 mise run ci         # fmt + clippy -D warnings + tests + setup-image check (the CI gate)
 mise run daemon     # run the daemon locally
-mise run dashboard  # open http://127.0.0.1:7341
+mise run dashboard  # open http://portman.localhost
 ```
 
 GitHub Actions runs the same checks on Ubuntu and macOS, plus the Ubuntu end-to-end job.

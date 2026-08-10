@@ -161,7 +161,7 @@ or require a running local workload for useful comparison.
 | Container resources | Protocol defaults tests; daemon CPU/memory/network/block-IO calculation tests; per-second counter-rate test; Swift release build | `portman resources`, open Swift Resources pane, compare top rows with `docker stats --no-stream` and confirm network/block IO display as rates rather than lifetime totals | Manual comparison gate |
 | Container-facing DNS/proxy | DNS loopback rewrite test; host-facing service bind-plan test for `192.168.99.1:53/:80/:443`; host-facing retry test | Run disposable container on a routed network, query `@192.168.99.1`, then `curl http://<managed-host>` and `curl https://<managed-host>` where TLS is enabled | Manual gate |
 | Setup image | Shell syntax check; runtime ownership tests | Docker build/run in a disposable context, inspect `wg show chip0` and `ip addr show chip0` | Manual gate |
-| Web dashboard | `portman dashboard` | Open dashboard, verify status, entries, static add/remove, TLD list, resource usage | Manual gate |
+| Web dashboard | `portman dashboard`; dashboard Host/Origin tests; protected registry-entry test | Open `http://portman.localhost`, verify status, entries, static add/remove, TLD list, resource usage | Manual gate |
 
 ## Risk Register
 

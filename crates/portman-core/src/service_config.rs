@@ -413,6 +413,16 @@ fn resolve_service(
     };
 
     let host = raw.host.as_deref().map(validate_host).transpose()?;
+    if host.as_deref() == Some(crate::registry::DASHBOARD_HOST) {
+        bail!(
+            "`{}` is portman's built-in dashboard route",
+            crate::registry::DASHBOARD_HOST
+        );
+    }
+    let mode = raw.mode.unwrap_or_default();
+    if mode == Mode::Tcp && host.as_deref().is_some_and(crate::tld::host_is_localhost) {
+        bail!("`.localhost` service hosts are HTTP-only because the operating system always resolves them to loopback");
+    }
     if raw.host.is_some() && raw.port.is_none() {
         bail!("`host` requires `port` — portman needs to know where to route {name}");
     }
@@ -478,7 +488,7 @@ fn resolve_service(
         dir,
         port: raw.port,
         host,
-        mode: raw.mode.unwrap_or_default(),
+        mode,
         ready,
         depends: raw.depends.unwrap_or_default(),
         restart,
@@ -575,6 +585,9 @@ fn resolve_egress(
     secrets: &BTreeMap<String, SecretsProviderConfig>,
 ) -> Result<EgressRoute> {
     let host = validate_host(&raw.host).with_context(|| format!("`host` in [egress.{name}]"))?;
+    if host == crate::registry::DASHBOARD_HOST {
+        bail!("`{host}` is portman's built-in dashboard route");
+    }
     let target =
         validate_target(&raw.target).with_context(|| format!("`target` in [egress.{name}]"))?;
     if !secrets.contains_key(&raw.secrets) {
@@ -824,6 +837,26 @@ mod tests {
             }
             other => panic!("expected infisical, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn localhost_service_routes_are_http_only() {
+        let dir = tempdir().unwrap();
+        write_config(
+            dir.path(),
+            CONFIG_FILE,
+            r#"
+            [service.db]
+            run = "postgres"
+            port = 5432
+            host = "db.localhost"
+            mode = "tcp"
+            "#,
+        );
+
+        let error = format!("{:#}", load(dir.path()).unwrap_err());
+        assert!(error.contains(".localhost"), "{error}");
+        assert!(error.contains("HTTP-only"), "{error}");
     }
 
     #[test]

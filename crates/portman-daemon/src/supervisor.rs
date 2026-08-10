@@ -201,9 +201,9 @@ impl RouteSink for NoRoutes {
     fn deregister(&self, _def: &ServiceDefinition) {}
 }
 
-/// The production [`RouteSink`]: gates on managed TLDs exactly like static
-/// rules, upserts `Source::Service` entries the DNS / proxy / TCP-forwarder
-/// consume unchanged, and provisions certs for TLS-enabled TLDs.
+/// The production [`RouteSink`]: accepts managed TLDs plus the resolver-free
+/// `.localhost` namespace, upserts `Source::Service` entries the DNS / proxy /
+/// TCP-forwarder consume unchanged, and provisions certs for TLS-enabled TLDs.
 pub(crate) struct RouteBinder {
     pub registry: portman_core::Registry,
     pub static_store: Arc<portman_core::StaticStore>,
@@ -217,9 +217,13 @@ impl RouteSink for RouteBinder {
         let (Some(host), Some(port)) = (&def.host, def.port) else {
             return;
         };
+        if host == portman_core::registry::DASHBOARD_HOST {
+            warn!(service = %def.name, %host, "service hostname is reserved for portman's dashboard; no route derived");
+            return;
+        }
         let managed = {
             let guard = self.known_tlds.read().expect("known_tlds lock poisoned");
-            portman_core::tld::host_has_managed_tld(host, guard.iter())
+            portman_core::tld::host_is_routable(host, guard.iter())
         };
         if !managed {
             warn!(
@@ -227,6 +231,10 @@ impl RouteSink for RouteBinder {
                 %host,
                 "service host is under an unmanaged TLD; no route derived — run `portman tld add <tld>` first"
             );
+            return;
+        }
+        if def.mode == portman_protocol::Mode::Tcp && portman_core::tld::host_is_localhost(host) {
+            warn!(service = %def.name, %host, "service .localhost route is HTTP-only; no route derived");
             return;
         }
         self.registry.upsert(portman_protocol::Entry {
@@ -282,9 +290,13 @@ impl RouteSink for RouteBinder {
     }
 
     fn register_egress(&self, route: &portman_protocol::EgressRoute) {
+        if route.host == portman_core::registry::DASHBOARD_HOST {
+            warn!(host = %route.host, "egress hostname is reserved for portman's dashboard; no route derived");
+            return;
+        }
         let managed = {
             let guard = self.known_tlds.read().expect("known_tlds lock poisoned");
-            portman_core::tld::host_has_managed_tld(&route.host, guard.iter())
+            portman_core::tld::host_is_routable(&route.host, guard.iter())
         };
         if !managed {
             warn!(
