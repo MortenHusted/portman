@@ -222,6 +222,7 @@ impl DaemonState {
 /// thin shim (one brew formula, two binaries).
 pub async fn daemon_main() -> Result<()> {
     init_tracing();
+    raise_fd_limit();
     let args = Args::parse();
 
     let docker = connect_docker(&args).context("connecting to docker")?;
@@ -484,6 +485,43 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+/// Soft cap for open descriptors the daemon asks for. Well above what the
+/// proxy, the pipes of every supervised service, the poll watchers, SQLite,
+/// and the listeners add up to, and inherited by every supervised child.
+const FD_LIMIT_TARGET: u64 = 65_536;
+
+/// launchd starts daemons with a 256-descriptor soft limit (systemd: 1024).
+/// The daemon holds three pipes per supervised service plus two sockets per
+/// proxied request, a poll watcher per `watch` service, SQLite, and the
+/// listeners — a few dozen services exhaust 256, after which proxy connects
+/// and watcher scans fail with EMFILE. Supervised children inherit the limit
+/// too, so the terminal-vs-portman gap (`ulimit -n` is usually raised in a
+/// login shell) is closed here rather than in every service. Best effort:
+/// a failure leaves the inherited limit in place and is logged, not fatal.
+fn raise_fd_limit() {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+    let (soft, hard) = match getrlimit(Resource::RLIMIT_NOFILE) {
+        Ok(limits) => limits,
+        Err(err) => {
+            warn!(%err, "cannot read RLIMIT_NOFILE; keeping the inherited limit");
+            return;
+        }
+    };
+    let target = FD_LIMIT_TARGET.min(hard);
+    if soft >= target {
+        return;
+    }
+    match setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
+        Ok(()) => info!(from = soft, to = target, "raised open-file limit"),
+        Err(err) => warn!(
+            %err,
+            soft,
+            hard,
+            "cannot raise RLIMIT_NOFILE; keeping the inherited limit"
+        ),
+    }
+}
+
 fn connect_docker(args: &Args) -> Result<Docker> {
     if let Some(path) = args.docker_socket.as_deref() {
         info!(socket = path, "using configured docker socket");
@@ -722,4 +760,22 @@ fn pick_ip(inspect: &bollard::models::ContainerInspectResponse) -> Option<String
 
 fn short(id: &str) -> &str {
     &id[..id.len().min(12)]
+}
+
+#[cfg(test)]
+mod fd_limit_tests {
+    use super::*;
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+
+    /// launchd hands daemons a 256 soft limit; the daemon must not run with it.
+    #[test]
+    fn startup_raises_a_launchd_sized_soft_limit() {
+        let (_, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+        setrlimit(Resource::RLIMIT_NOFILE, 256, hard).unwrap();
+
+        raise_fd_limit();
+
+        let (soft, _) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+        assert_eq!(soft, FD_LIMIT_TARGET.min(hard));
+    }
 }
