@@ -5,9 +5,10 @@
 //! `tokio::io::copy_bidirectional` back and forth. The initial bytes we had
 //! to read to find the Host line get prepended to the upstream stream.
 //!
-//! WebSocket upgrades, HTTP/1.1 keep-alive within a single connection, and
-//! long-lived streaming responses all work because we're byte-level
-//! transparent after the Host lookup.
+//! Every request head on the connection is rewritten on its way upstream to
+//! carry `X-Forwarded-Proto`/`X-Forwarded-For` (see `relay`); the response
+//! direction is byte-transparent, and an `Upgrade` hands the whole connection
+//! over to a raw splice, so WebSockets and streaming responses keep working.
 //!
 //! **Privilege:** binding `:80` needs root on macOS. The daemon therefore
 //! must run under `sudo`. On `EACCES` the error includes the `sudo -E`
@@ -25,6 +26,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::egress::{rewrite_head, Credentials, EgressAudit};
 use crate::egress_client::{self, Roots};
+use crate::relay::{self, Scheme};
 use crate::runner::Starter;
 use crate::upstream::{self, BridgeIfIndex};
 
@@ -101,6 +103,7 @@ async fn handle_connection(
     credentials: Credentials,
     roots: Roots,
 ) -> Result<()> {
+    let peer = client.peer_addr().context("client peer address")?.ip();
     let mut buf = Vec::with_capacity(4096);
     let head = match tokio::time::timeout(
         HEADER_READ_TIMEOUT,
@@ -223,10 +226,8 @@ async fn handle_connection(
     };
 
     // The bytes we read to find the Host header belong to the client's
-    // request. Forward them to upstream before we start byte-splicing.
-    upstream.write_all(&buf).await?;
-
-    match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+    // request; the relay re-parses them as the first head it rewrites.
+    match relay::relay(&mut client, &mut upstream, buf, Scheme::Http, peer).await {
         Ok((c, u)) => debug!(%host, client_bytes = c, upstream_bytes = u, "proxied"),
         Err(err) => debug!(%host, %err, "proxy io ended"),
     }
@@ -887,7 +888,14 @@ mod tests {
         assert!(std::str::from_utf8(&received)
             .unwrap()
             .starts_with("HTTP/1.1 200 OK"));
-        assert_eq!(upstream.await.unwrap(), request);
+        // The head reaches the upstream with the forwarded headers appended;
+        // everything the client sent is still there, in order.
+        let seen = upstream.await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&seen).unwrap(),
+            "GET /path HTTP/1.1\r\nHost: App.Test:80\r\nConnection: close\r\n\
+             X-Forwarded-Proto: http\r\nX-Forwarded-For: 127.0.0.1\r\n\r\n"
+        );
     }
 
     /// The tracer bullet: a caller that holds no credential reaches an

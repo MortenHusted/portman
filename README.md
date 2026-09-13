@@ -271,6 +271,8 @@ portman tld add test --tls mkcert  # every hostname under .test gets HTTPS
 
 Certs are issued automatically as hostnames appear, including one wildcard cert per wildcard rule, so the cert covers exactly what the route covers. mkcert has an inherent limit worth knowing: the CA lives in your trust store, so container-to-container HTTPS needs the CA mounted into each container. A Let's Encrypt DNS-01 mode for real domains is designed but not yet implemented.
 
+The proxy terminates TLS and speaks plain HTTP to the backend, so every request it forwards carries `X-Forwarded-Proto` (`https` on `:443`, `http` on `:80`) and `X-Forwarded-For`. Frameworks that read them (Rails, Django, Phoenix, …) see the scheme the browser used, so CSRF origin checks, `request.ssl?`-style checks, and generated URLs come out right without configuration. A client-supplied `X-Forwarded-Proto` is replaced, not trusted; the header lands on every request of a keep-alive connection, and WebSocket upgrades still pass through untouched.
+
 ## Containers calling the host
 
 For host services from inside a container, Docker's normal callback name works: `host.docker.internal:<port>`. On macOS with the native bridge enabled, portman also exposes container-facing DNS/HTTP/TLS on `192.168.99.1`. See [`docs/release-readiness.md`](./docs/release-readiness.md).
