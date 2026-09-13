@@ -142,12 +142,18 @@ async fn handle_forget_services(state: &DaemonState, names: Vec<String>) -> Resp
 }
 
 fn handle_service_status(state: &DaemonState) -> Response {
+    let mut repos: std::collections::BTreeMap<std::path::PathBuf, Option<std::path::PathBuf>> =
+        Default::default();
     let services = state
         .supervisor
         .status()
         .into_iter()
         .map(|s| portman_protocol::ServiceStatusInfo {
             name: s.name,
+            repo: repos
+                .entry(s.root.clone())
+                .or_insert_with(|| portman_core::service_config::enclosing_repo(&s.root))
+                .clone(),
             root: Some(s.root),
             state: s.state.wire(),
             detail: s.detail,

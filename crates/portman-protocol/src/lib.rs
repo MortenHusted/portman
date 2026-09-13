@@ -455,6 +455,11 @@ pub struct ServiceStatusInfo {
     /// Config root that owns this service. Missing when talking to an older daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<std::path::PathBuf>,
+    /// The git checkout `root` sits in, when there is one. UI labels that
+    /// fall back to a directory name use this, not `root`: a config kept
+    /// under `tmp/` or `.config/` still belongs to its repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<std::path::PathBuf>,
     pub state: ServiceState,
     /// Human detail: last error, backoff note. Empty when healthy.
     #[serde(default)]
@@ -1325,6 +1330,7 @@ mod tests {
             services: vec![ServiceStatusInfo {
                 name: "web".into(),
                 root: Some("/tmp/project".into()),
+                repo: Some("/tmp/project".into()),
                 state: ServiceState::Ready,
                 detail: String::new(),
                 pid: Some(42),

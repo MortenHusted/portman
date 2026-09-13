@@ -65,6 +65,17 @@ pub fn discover_root(start_dir: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// The git checkout `root` sits in, when there is one: the nearest ancestor
+/// (`root` itself included) holding a `.git` directory or file — worktrees
+/// carry a file. A config nested somewhere inside a repo still belongs to
+/// that repo for display purposes; the config directory's own name says
+/// nothing about it.
+pub fn enclosing_repo(root: &Path) -> Option<PathBuf> {
+    root.ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
 /// Load and merge the config at `root` (a directory, as returned by
 /// [`discover_root`]). At least one of the two files must exist.
 pub fn load(root: &Path) -> Result<ServiceConfig> {
@@ -746,6 +757,23 @@ fn resolve_path(root: &Path, raw: &str) -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn enclosing_repo_walks_up_to_the_checkout_or_nothing() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        let nested = repo.join("tmp/workspace/portman");
+        std::fs::create_dir_all(&nested).unwrap();
+        // A worktree checkout carries `.git` as a file, not a directory.
+        std::fs::write(repo.join(".git"), "gitdir: elsewhere").unwrap();
+
+        assert_eq!(enclosing_repo(&nested), Some(repo.clone()));
+        assert_eq!(enclosing_repo(&repo), Some(repo));
+
+        let loose = dir.path().join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        assert_eq!(enclosing_repo(&loose), None);
+    }
 
     fn write_config(dir: &Path, name: &str, content: &str) {
         std::fs::write(dir.join(name), content).unwrap();
