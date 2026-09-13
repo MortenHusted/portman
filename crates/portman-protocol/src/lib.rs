@@ -275,6 +275,13 @@ pub enum Request {
         #[serde(default)]
         names: Vec<String>,
     },
+    /// Stop services by name and drop their definitions — the per-service
+    /// form of `portman down --forget`. The next `portman up` in the owning
+    /// repo re-syncs them; a root whose checkout is gone stays forgotten.
+    /// Names are required: there is no "forget everything".
+    ForgetServices {
+        names: Vec<String>,
+    },
     /// List supervised services and their states.
     ServiceStatus,
     /// Cursor read of a service's captured output. `after_id: None` returns
@@ -1197,6 +1204,17 @@ mod tests {
             Response::Started { detail } => assert!(detail.is_empty()),
             other => panic!("expected started, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn forget_services_round_trips() {
+        let json = serde_json::to_string(&Request::ForgetServices {
+            names: vec!["web".into(), "jobs".into()],
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"kind":"forget_services","names":["web","jobs"]}"#);
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Request::ForgetServices { names } if names == ["web", "jobs"]));
     }
 
     #[test]

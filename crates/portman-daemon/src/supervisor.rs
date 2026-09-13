@@ -915,6 +915,43 @@ impl Supervisor {
         Ok(targets)
     }
 
+    /// Stop the named services and drop their definitions — the per-service
+    /// form of a sync that omits them. Refuses to leave a kept service with
+    /// a dangling dependency: its next `up` would only report "unknown
+    /// service", far from the action that caused it.
+    pub(crate) async fn forget(&self, names: &[String]) -> Result<Vec<String>> {
+        if names.is_empty() {
+            bail!("forget needs service names — there is no forget-everything");
+        }
+        // Rewrites the slot set, like sync — serialise with it.
+        let _gate = self.inner.sync_gate.lock().await;
+        let targets = self.expand_targets(Some(names), false)?;
+        {
+            let slots = self.inner.slots.lock().expect("slots lock poisoned");
+            for (name, slot) in slots.iter() {
+                if targets.contains(name) {
+                    continue;
+                }
+                if let Some(dep) = slot.def.depends.iter().find(|d| targets.contains(d)) {
+                    bail!("cannot forget `{dep}`: `{name}` depends on it — forget `{name}` too, or first");
+                }
+            }
+        }
+        for name in &targets {
+            self.stop_and_join(name).await;
+        }
+        {
+            let mut slots = self.inner.slots.lock().expect("slots lock poisoned");
+            for name in &targets {
+                if let Some(slot) = slots.remove(name) {
+                    self.inner.routes.deregister(&slot.def);
+                }
+            }
+        }
+        self.persist();
+        Ok(targets)
+    }
+
     /// Stop every running service without touching desired state, so boot
     /// restore brings them back (R7: clean daemon shutdown/restart).
     pub(crate) async fn shutdown_all(&self) {
@@ -3173,6 +3210,80 @@ mod tests {
         );
 
         sup.down(None).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forget_stops_and_drops_only_the_named_services() {
+        let dir = tempdir().unwrap();
+        let sup = test_supervisor(&dir, CollectSink::new());
+
+        let mut one = def("one", &["/bin/sleep", "10"], dir.path());
+        one.restart = RestartPolicy::Always;
+        let mut two = def("two", &["/bin/sleep", "10"], dir.path());
+        two.restart = RestartPolicy::Always;
+        sup.sync(dir.path(), vec![one, two], Map::new(), Map::new())
+            .await
+            .unwrap();
+        sup.up(None).await.unwrap();
+        wait_for_state(&sup, "one", StateKind::Ready, Duration::from_secs(20)).await;
+        wait_for_state(&sup, "two", StateKind::Ready, Duration::from_secs(20)).await;
+        let two_pid = sup
+            .status()
+            .iter()
+            .find(|s| s.name == "two")
+            .unwrap()
+            .pid
+            .unwrap();
+
+        let forgotten = sup.forget(&["two".to_string()]).await.unwrap();
+        assert_eq!(forgotten, vec!["two"]);
+        assert!(sup.status().iter().all(|s| s.name != "two"));
+        assert!(
+            nix::sys::signal::kill(Pid::from_raw(two_pid as i32), None).is_err(),
+            "forgotten service process must be stopped"
+        );
+        assert!(
+            !std::fs::read_to_string(dir.path().join("services.json"))
+                .unwrap()
+                .contains("\"two\""),
+            "forgotten definition must not come back at boot restore"
+        );
+        let one = sup.status().into_iter().find(|s| s.name == "one").unwrap();
+        assert_eq!(
+            one.state,
+            StateKind::Ready,
+            "the kept sibling keeps running"
+        );
+
+        assert!(sup.forget(&[]).await.is_err());
+        assert!(sup.forget(&["nope".to_string()]).await.is_err());
+
+        sup.down(None).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forget_refuses_to_strand_a_dependent() {
+        let dir = tempdir().unwrap();
+        let sup = test_supervisor(&dir, CollectSink::new());
+
+        let db = def("db", &["/bin/sleep", "10"], dir.path());
+        let mut web = def("web", &["/bin/sleep", "10"], dir.path());
+        web.depends = vec!["db".into()];
+        sup.sync(dir.path(), vec![db, web], Map::new(), Map::new())
+            .await
+            .unwrap();
+
+        let err = sup.forget(&["db".to_string()]).await.unwrap_err();
+        assert!(err.to_string().contains("`web` depends on it"), "{err}");
+        assert_eq!(sup.status().len(), 2, "a refused forget changes nothing");
+
+        // Forgetting the dependent with its dependency is fine, in any order.
+        let forgotten = sup
+            .forget(&["db".to_string(), "web".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(forgotten, vec!["db", "web"]);
+        assert!(sup.status().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
