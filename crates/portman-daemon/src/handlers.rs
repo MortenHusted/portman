@@ -142,28 +142,37 @@ async fn handle_forget_services(state: &DaemonState, names: Vec<String>) -> Resp
 }
 
 fn handle_service_status(state: &DaemonState) -> Response {
-    let mut repos: std::collections::BTreeMap<std::path::PathBuf, Option<std::path::PathBuf>> =
-        Default::default();
+    // Per-root facts read from the filesystem: looked up once per root per
+    // call, since the dashboard polls this and roots repeat across services.
+    struct RootFacts {
+        repo: Option<std::path::PathBuf>,
+        config_missing: bool,
+    }
+    let mut roots: std::collections::BTreeMap<std::path::PathBuf, RootFacts> = Default::default();
     let services = state
         .supervisor
         .status()
         .into_iter()
-        .map(|s| portman_protocol::ServiceStatusInfo {
-            name: s.name,
-            repo: repos
-                .entry(s.root.clone())
-                .or_insert_with(|| portman_core::service_config::enclosing_repo(&s.root))
-                .clone(),
-            root: Some(s.root),
-            state: s.state.wire(),
-            detail: s.detail,
-            pid: s.pid,
-            restarts: s.restarts,
-            host: s.host,
-            port: s.port,
-            desired_up: s.desired_up,
-            groups: s.groups,
-            project: s.project,
+        .map(|s| {
+            let facts = roots.entry(s.root.clone()).or_insert_with(|| RootFacts {
+                repo: portman_core::service_config::enclosing_repo(&s.root),
+                config_missing: !portman_core::service_config::config_exists(&s.root),
+            });
+            portman_protocol::ServiceStatusInfo {
+                name: s.name,
+                repo: facts.repo.clone(),
+                config_missing: facts.config_missing,
+                root: Some(s.root),
+                state: s.state.wire(),
+                detail: s.detail,
+                pid: s.pid,
+                restarts: s.restarts,
+                host: s.host,
+                port: s.port,
+                desired_up: s.desired_up,
+                groups: s.groups,
+                project: s.project,
+            }
         })
         .collect();
     Response::ServiceStatuses { services }

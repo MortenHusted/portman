@@ -253,7 +253,17 @@ function resetAlerts() { alerts.length = 0; }
 function pushAlert(title, bodyHtml, severe) {
   alerts.push(`<div class="alert${severe ? ' severe' : ''}"><span class="alert-title">${esc(title)}</span>${bodyHtml}</div>`);
 }
-function renderAlerts() { el('alerts').innerHTML = alerts.join(''); }
+function renderAlerts() {
+  el('alerts').innerHTML = alerts.join('');
+  el('alerts').querySelectorAll('.forget-root').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const root = btn.dataset.root;
+      const names = services.filter(s => s.root === root).map(s => s.name);
+      btn.disabled = true;
+      forgetServices(names, `Forget all ${names.length} services owned by ${root}?\n\nIts config is gone, so nothing can start them again.`);
+    });
+  });
+}
 
 function targetCollisions(entries) {
   const byTarget = new Map();
@@ -277,6 +287,30 @@ function alertCollisions() {
   pushAlert(
     `${collisions.length} target${collisions.length > 1 ? 's' : ''} claimed by more than one hostname`,
     `<div class="alert-body">Only one process can own a port. If these are different apps, every extra hostname is serving whichever app won the bind.</div><ul>${items}</ul>`
+  );
+}
+
+// A synced root whose config is gone (checkout deleted or moved without
+// `portman down --forget`) can never `portman up` again. Its definitions
+// only ever sit stopped or failed, so offer the forget right where the
+// problem is visible.
+function alertOrphanedRoots() {
+  const byRoot = new Map();
+  for (const s of services) {
+    if (!s.config_missing || !s.root) continue;
+    if (!byRoot.has(s.root)) byRoot.set(s.root, []);
+    byRoot.get(s.root).push(s.name);
+  }
+  if (!byRoot.size) return;
+  const roots = [...byRoot.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  const items = roots
+    .map(([root, names]) =>
+      `<li><span class="mono">${esc(root)}</span> — ${names.length} service${names.length > 1 ? 's' : ''} `
+      + `<button type="button" class="danger tiny forget-root" data-root="${esc(root)}">Forget</button></li>`)
+    .join('');
+  pushAlert(
+    `${roots.length} synced root${roots.length > 1 ? 's' : ''} no longer ${roots.length > 1 ? 'have' : 'has'} a portman config`,
+    `<div class="alert-body">The checkout was deleted or moved without forgetting its services. Nothing will start them again; Forget drops their definitions.</div><ul>${items}</ul>`
   );
 }
 
@@ -1247,6 +1281,7 @@ async function refresh() {
 
     renderStatus(status);
     alertCollisions();
+    alertOrphanedRoots();
     renderProjectFilter();
     renderKpis();
     renderGroups();
