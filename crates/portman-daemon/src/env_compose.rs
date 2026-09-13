@@ -18,7 +18,8 @@
 //!     predictable.
 //!
 //! A missing or unreadable `env_file` **fails the composition** (and thus the
-//! service start). A declared source that silently vanishes would make the
+//! service start, terminally: the supervisor treats it as a config error and
+//! does not retry). A declared source that silently vanishes would make the
 //! env depend on filesystem state in a way the config no longer describes —
 //! the same reasoning the predecessor tooling used ("local env file
 //! missing … run: mise run local:setup"). Secrets-provider failure policy is

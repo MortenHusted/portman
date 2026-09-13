@@ -1257,8 +1257,9 @@ enum Attempt {
     Restart,
     /// The attempt ended (spawn error, readiness timeout, or process exit).
     Failure { detail: String, ran: Duration },
-    /// A non-retryable failure (e.g. secrets auth rejection): Failed
-    /// immediately, regardless of the restart policy (R15).
+    /// A non-retryable failure (secrets auth rejection, a missing or
+    /// unreadable `env_file`): Failed immediately, regardless of the
+    /// restart policy (R15).
     Fatal { detail: String },
 }
 
@@ -1523,7 +1524,15 @@ async fn supervise_once(
         &def.env,
     ) {
         Ok(env) => env,
-        Err(err) => return fail(format!("{err:#}")),
+        // A declared env source that is missing or unreadable is a config
+        // error: nothing about retrying changes it, and a 30s backoff loop
+        // only inflates the restart count. Land in Failed until the next
+        // `portman up` re-syncs the config.
+        Err(err) => {
+            return Attempt::Fatal {
+                detail: format!("{err:#}"),
+            }
+        }
     };
 
     // Register before spawn: a child can print on its first scheduling slice.
@@ -3879,6 +3888,25 @@ mod tests {
         let status = sup.status().remove(0);
         assert!(status.restarts >= 2, "expected backoff retries: {status:?}");
         sup.down(None).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_env_file_lands_failed_without_retrying() {
+        let dir = tempdir().unwrap();
+        let sup = test_supervisor(&dir, CollectSink::new());
+
+        let mut svc = def("envless", &["/bin/sleep", "10"], dir.path());
+        svc.restart = RestartPolicy::Always; // a config error must short-circuit this
+        svc.env_files = vec![dir.path().join("gone.env")];
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
+        sup.up(None).await.unwrap();
+
+        wait_for_state(&sup, "envless", StateKind::Failed, Duration::from_secs(20)).await;
+        let status = sup.status().remove(0);
+        assert!(status.detail.contains("gone.env"), "{status:?}");
+        assert_eq!(status.restarts, 0, "a missing env_file must not loop");
     }
 
     #[tokio::test(flavor = "multi_thread")]
