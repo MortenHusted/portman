@@ -61,8 +61,15 @@ pub struct ServiceConfig {
 pub fn discover_root(start_dir: &Path) -> Option<PathBuf> {
     start_dir
         .ancestors()
-        .find(|dir| dir.join(CONFIG_FILE).is_file() || dir.join(LOCAL_CONFIG_FILE).is_file())
+        .find(|dir| config_exists(dir))
         .map(Path::to_path_buf)
+}
+
+/// Does `root` still hold a `portman.toml` or `portman.local.toml`? A synced
+/// root that no longer does was deleted or moved underneath the daemon —
+/// `portman up` can never run there again, so its definitions are orphans.
+pub fn config_exists(root: &Path) -> bool {
+    root.join(CONFIG_FILE).is_file() || root.join(LOCAL_CONFIG_FILE).is_file()
 }
 
 /// The git checkout `root` sits in, when there is one: the nearest ancestor

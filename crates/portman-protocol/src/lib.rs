@@ -460,6 +460,11 @@ pub struct ServiceStatusInfo {
     /// under `tmp/` or `.config/` still belongs to its repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<std::path::PathBuf>,
+    /// `root` no longer holds a portman config: the checkout was deleted or
+    /// moved without forgetting its services. Nothing will start them again;
+    /// they are waiting to be forgotten.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub config_missing: bool,
     pub state: ServiceState,
     /// Human detail: last error, backoff note. Empty when healthy.
     #[serde(default)]
@@ -1331,6 +1336,7 @@ mod tests {
                 name: "web".into(),
                 root: Some("/tmp/project".into()),
                 repo: Some("/tmp/project".into()),
+                config_missing: false,
                 state: ServiceState::Ready,
                 detail: String::new(),
                 pid: Some(42),
