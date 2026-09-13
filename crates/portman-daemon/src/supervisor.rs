@@ -1399,6 +1399,11 @@ fn backoff_delay(t: &Timings, consecutive_failures: u32) -> Duration {
 
 /// Wait until every dependency reports Ready. Returns Stop if a stop arrives
 /// first (or a dependency slot vanished under us — sync will re-drive).
+///
+/// A dependency that reaches Failed is surfaced on the dependent as Failed
+/// too, naming it: "pending" hid that nothing would happen on its own. The
+/// dependent keeps waiting, so a watch hit or `portman up` that revives the
+/// dependency still carries it through.
 async fn wait_for_deps(
     inner: &Arc<Inner>,
     name: &str,
@@ -1420,10 +1425,32 @@ async fn wait_for_deps(
             })
             .collect()
     };
+    let mut showing = StateKind::Pending;
     for (dep, mut rx) in deps {
         loop {
-            if *rx.borrow_and_update() == StateKind::Ready {
+            let dep_state = *rx.borrow_and_update();
+            if dep_state == StateKind::Ready {
                 break;
+            }
+            let show = if dep_state == StateKind::Failed {
+                StateKind::Failed
+            } else {
+                StateKind::Pending
+            };
+            if show != showing {
+                showing = show;
+                let detail = match show {
+                    StateKind::Failed => {
+                        let why = detail_of(inner, &dep);
+                        if why.is_empty() {
+                            format!("dependency `{dep}` failed")
+                        } else {
+                            format!("dependency `{dep}` failed: {why}")
+                        }
+                    }
+                    _ => String::new(),
+                };
+                set_state(inner, name, show, detail);
             }
             debug!(service = name, waiting_on = %dep, "waiting for dependency");
             tokio::select! {
@@ -1937,6 +1964,14 @@ fn set_state(inner: &Arc<Inner>, name: &str, kind: StateKind, detail: String) {
             "service state"
         );
     }
+}
+
+fn detail_of(inner: &Arc<Inner>, name: &str) -> String {
+    let slots = inner.slots.lock().expect("slots lock poisoned");
+    slots
+        .get(name)
+        .map(|slot| slot.cell.lock().expect("cell lock poisoned").detail.clone())
+        .unwrap_or_default()
 }
 
 fn clear_running_marker(inner: &Arc<Inner>, name: &str) {
@@ -2976,6 +3011,50 @@ mod tests {
         assert_eq!(states["top"], StateKind::Pending);
 
         wait_for_state(&sup, "top", StateKind::Ready, Duration::from_secs(20)).await;
+        sup.down(None).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dependent_surfaces_a_failed_dependency_and_resumes_when_it_recovers() {
+        let dir = tempdir().unwrap();
+        let sup = test_supervisor(&dir, CollectSink::new());
+
+        // `db` is a config error (missing env_file): Failed at once, no retry.
+        let mut db = def("db", &["/bin/sleep", "10"], dir.path());
+        db.restart = RestartPolicy::Always;
+        db.env_files = vec![dir.path().join("gone.env")];
+        let mut web = def("web", &["/bin/sleep", "10"], dir.path());
+        web.depends = vec!["db".to_string()];
+        web.restart = RestartPolicy::Always;
+        sup.sync(dir.path(), vec![db.clone(), web], Map::new(), Map::new())
+            .await
+            .unwrap();
+        sup.up(None).await.unwrap();
+
+        wait_for_state(&sup, "db", StateKind::Failed, Duration::from_secs(20)).await;
+        wait_for_state(&sup, "web", StateKind::Failed, Duration::from_secs(20)).await;
+        let web = sup.status().into_iter().find(|s| s.name == "web").unwrap();
+        assert!(
+            web.detail.contains("dependency `db` failed") && web.detail.contains("gone.env"),
+            "{web:?}"
+        );
+        assert_eq!(web.restarts, 0, "the dependent never attempted a spawn");
+
+        // Fix the config: the re-sync restarts `db`, and `web` follows.
+        db.env_files.clear();
+        let web_def = {
+            let mut w = def("web", &["/bin/sleep", "10"], dir.path());
+            w.depends = vec!["db".to_string()];
+            w.restart = RestartPolicy::Always;
+            w
+        };
+        sup.sync(dir.path(), vec![db, web_def], Map::new(), Map::new())
+            .await
+            .unwrap();
+        wait_for_state(&sup, "db", StateKind::Ready, Duration::from_secs(20)).await;
+        wait_for_state(&sup, "web", StateKind::Ready, Duration::from_secs(20)).await;
+        let web = sup.status().into_iter().find(|s| s.name == "web").unwrap();
+        assert!(web.detail.is_empty(), "{web:?}");
         sup.down(None).await.unwrap();
     }
 
