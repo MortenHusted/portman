@@ -40,6 +40,7 @@ pub(crate) async fn dispatch(request: Request, state: &DaemonState) -> Response 
         } => handle_sync_services(state, root, services, secrets, egress).await,
         Request::ServiceUp { names } => handle_service_up(state, names).await,
         Request::ServiceDown { names } => handle_service_down(state, names).await,
+        Request::ForgetServices { names } => handle_forget_services(state, names).await,
         Request::ServiceStatus => handle_service_status(state),
         Request::LogsQuery {
             service,
@@ -128,6 +129,13 @@ async fn handle_service_up(state: &DaemonState, names: Vec<String>) -> Response 
 async fn handle_service_down(state: &DaemonState, names: Vec<String>) -> Response {
     let names = if names.is_empty() { None } else { Some(names) };
     match state.supervisor.down(names.as_deref()).await {
+        Ok(_) => handle_service_status(state),
+        Err(e) => err(format!("{e:#}")),
+    }
+}
+
+async fn handle_forget_services(state: &DaemonState, names: Vec<String>) -> Response {
+    match state.supervisor.forget(&names).await {
         Ok(_) => handle_service_status(state),
         Err(e) => err(format!("{e:#}")),
     }

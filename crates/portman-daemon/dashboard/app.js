@@ -538,6 +538,14 @@ function renderInspector() {
 
   el('insp-config').hidden = !svc.root;
 
+  // Forget root mirrors `portman down --forget`: everything the same config
+  // root owns. Only offered when there is more than this one service.
+  const rootMates = svc.root ? services.filter(s => s.root === svc.root) : [];
+  const forgetRoot = el('insp-forget-root');
+  el('insp-forget').hidden = false;
+  forgetRoot.hidden = rootMates.length < 2;
+  forgetRoot.textContent = `Forget root (${rootMates.length})`;
+
   const toggle = el('insp-toggle');
   const running = svc.desired_up;
   toggle.textContent = running ? 'Stop' : 'Start';
@@ -588,6 +596,8 @@ function renderContainerInspector(c) {
   el('insp-restart').hidden = true;
   el('insp-toggle').hidden = true;
   el('insp-config').hidden = true;
+  el('insp-forget').hidden = true;
+  el('insp-forget-root').hidden = true;
   el('log-block').hidden = true;
   el('insp-action-note').textContent = '';
   el('insp-detail').hidden = !c.error;
@@ -645,6 +655,42 @@ async function serviceAction(action) {
     note.textContent = err.message;
   }
 }
+
+/// Stop + drop definitions. The service disappears from the list, so the
+/// inspector empties on the next refresh; `portman up` in the repo brings it
+/// back. This is how a stack whose checkout is already gone leaves the daemon.
+async function forgetServices(names, question) {
+  if (!window.confirm(question)) return;
+  const note = el('insp-action-note');
+  note.textContent = 'forgetting…';
+  try {
+    await api('/services/forget', { method: 'POST', body: JSON.stringify({ names }) });
+    note.textContent = '';
+    refresh();
+  } catch (err) {
+    note.textContent = err.message;
+  }
+}
+
+el('insp-forget').addEventListener('click', () => {
+  const svc = selectedService();
+  if (!svc) return;
+  forgetServices(
+    [svc.name],
+    `Forget ${svc.name}?\n\nStops it and drops its definition from the daemon. `
+      + `Run portman up in ${svc.root || 'its repo'} to bring it back.`,
+  );
+});
+el('insp-forget-root').addEventListener('click', () => {
+  const svc = selectedService();
+  if (!svc || !svc.root) return;
+  const names = services.filter(s => s.root === svc.root).map(s => s.name);
+  forgetServices(
+    names,
+    `Forget all ${names.length} services owned by ${svc.root}?\n\n`
+      + `Same as portman down --forget --root there: stops them and drops their definitions.`,
+  );
+});
 
 el('insp-restart').addEventListener('click', () => serviceAction('restart'));
 el('insp-toggle').addEventListener('click', () => {

@@ -166,8 +166,20 @@ async fn handle_connection(mut stream: TcpStream, state: DaemonState) -> Result<
         // Batch lifecycle: a JSON body of names, straight onto the same IPC
         // requests `portman up a b c` uses. This is how a whole group stops
         // in one action instead of N round-trips.
-        ("POST", "/api/services/up") => handle_batch(stream, state, body, true).await,
-        ("POST", "/api/services/down") => handle_batch(stream, state, body, false).await,
+        ("POST", "/api/services/up") => {
+            handle_batch(stream, state, body, |names| Request::ServiceUp { names }).await
+        }
+        ("POST", "/api/services/down") => {
+            handle_batch(stream, state, body, |names| Request::ServiceDown { names }).await
+        }
+        // Forget is batch-only: the inspector sends one name, or every name
+        // a config root owns — the dashboard's `portman down --forget`.
+        ("POST", "/api/services/forget") => {
+            handle_batch(stream, state, body, |names| Request::ForgetServices {
+                names,
+            })
+            .await
+        }
         // Supervisor lifecycle, keyed by *service name*. `up`/`down` map
         // straight onto the IPC requests `portman up`/`down` use; `restart`
         // is down-then-up server-side so the dashboard can't half-do it.
@@ -429,7 +441,12 @@ fn err_response(message: &str) -> Response {
     }
 }
 
-async fn handle_batch(stream: TcpStream, state: DaemonState, body: &[u8], up: bool) -> Result<()> {
+async fn handle_batch(
+    stream: TcpStream,
+    state: DaemonState,
+    body: &[u8],
+    request: fn(Vec<String>) -> Request,
+) -> Result<()> {
     #[derive(serde::Deserialize)]
     struct Batch {
         names: Vec<String>,
@@ -457,16 +474,11 @@ async fn handle_batch(stream: TcpStream, state: DaemonState, body: &[u8], up: bo
         )
         .await;
     }
-    let request = if up {
-        Request::ServiceUp {
-            names: parsed.names,
-        }
-    } else {
-        Request::ServiceDown {
-            names: parsed.names,
-        }
-    };
-    api_json(stream, handlers::dispatch(request, &state).await).await
+    api_json(
+        stream,
+        handlers::dispatch(request(parsed.names), &state).await,
+    )
+    .await
 }
 
 async fn handle_add_static(stream: TcpStream, state: DaemonState, body: &[u8]) -> Result<()> {
