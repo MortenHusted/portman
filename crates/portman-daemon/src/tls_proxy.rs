@@ -1,6 +1,8 @@
 //! TLS proxy on `:443`. Does SNI-based cert selection via [`CertManager`],
 //! then terminates TLS and runs the same Host-header routing logic as the
-//! plain HTTP proxy.
+//! plain HTTP proxy. Requests reach the backend stamped with
+//! `X-Forwarded-Proto: https`, so a framework behind an https entry knows the
+//! browser's origin scheme even though it is spoken plain HTTP.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,6 +17,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 use crate::certs::{CertManager, SniResolver};
+use crate::relay::{self, Scheme};
 use crate::upstream::{self, BridgeIfIndex};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -83,6 +86,7 @@ async fn handle(
     registry: Registry,
     bridge: BridgeIfIndex,
 ) -> Result<()> {
+    let peer = client.peer_addr().context("client peer address")?.ip();
     // Apply a short handshake timeout so a slow or misbehaving client can't
     // hang a task forever.
     let mut tls = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(client))
@@ -175,8 +179,7 @@ async fn handle(
         }
     };
 
-    upstream.write_all(&buf).await?;
-    match tokio::io::copy_bidirectional(&mut tls, &mut upstream).await {
+    match relay::relay(&mut tls, &mut upstream, buf, Scheme::Https, peer).await {
         Ok((c, u)) => debug!(%host, client_bytes = c, upstream_bytes = u, "tls proxied"),
         Err(err) => debug!(%host, %err, "tls proxy io ended"),
     }

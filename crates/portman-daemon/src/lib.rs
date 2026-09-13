@@ -16,6 +16,7 @@ mod handlers;
 mod ipc_server;
 mod log_store;
 mod proxy;
+mod relay;
 mod resources;
 mod runner;
 mod secret_masker;
