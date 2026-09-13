@@ -69,10 +69,16 @@ let routesExpanded = false;
 const ROW_LIMIT = 6;
 const ROUTE_LIMIT = 8;
 
+// Directory-name fallback for labels: the repo the config lives in, not the
+// config directory itself — a config under tmp/ would otherwise label every
+// such stack "tmp". Older daemons send no `repo`; then root is the best guess.
+function repoNameOf(s) {
+  return String(s.repo || s.root || '').split('/').filter(Boolean).pop();
+}
+
 function groupsOf(s) {
   if (s.groups && s.groups.length) return s.groups;
-  const base = String(s.root || '').split('/').filter(Boolean).pop();
-  return [base || 'ungrouped'];
+  return [repoNameOf(s) || 'ungrouped'];
 }
 
 // --- Project filter --------------------------------------------------------
@@ -83,8 +89,7 @@ let projectFilter = localStorage.getItem('portman.projectFilter') || '';
 
 function projectOf(s) {
   if (s.project) return s.project;
-  const base = String(s.root || '').split('/').filter(Boolean).pop();
-  return base || 'unassigned';
+  return repoNameOf(s) || 'unassigned';
 }
 
 function containerProjectOf(c) {

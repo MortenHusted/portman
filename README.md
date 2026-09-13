@@ -140,7 +140,7 @@ secrets_optional = true  # provider failure ⇒ start from env_files only, flagg
 watch = ["dist/bin/server", "conf/*.toml"]  # respawn when these change (relative to `dir`)
 watch_mode = "poll"      # "poll" (default) or "native" (FSEvents/inotify)
 watch_debounce_ms = 500  # quiet period after the last change before respawning
-groups = ["backend"]     # free-form tags for dashboard/TUI grouping
+groups = ["backend"]     # free-form tags for dashboard grouping (default: the repo's directory name)
 
 [service.db]
 run = ["postgres", "-D", "data"]
