@@ -14,6 +14,10 @@
         <span class="wordmark">portman</span>
         <span id="version" class="version"></span>
       </div>
+      <nav class="nav" aria-label="Pages">
+        <a href="#" class="nav-link active" data-page="overview">Overview</a>
+        <a href="#secrets" class="nav-link" data-page="secrets">Secrets</a>
+      </nav>
       <div class="topbar-status">
         <span class="pill"><span id="status-dot" class="dot offline"></span><span id="status-label">offline</span></span>
         <span class="pill" id="bridge-pill" hidden><span id="bridge-label"></span></span>
@@ -21,6 +25,7 @@
       </div>
     </header>
 
+    <div id="page-overview" class="page">
     <div id="alerts"></div>
 
     <section class="kpis" id="kpis">
@@ -96,58 +101,6 @@
             <p id="add-error" class="error" hidden></p>
           </div>
         </section>
-
-        <section id="sec-secrets" hidden>
-          <div class="section-head">
-            <h2>Secrets</h2>
-            <span id="secrets-count" class="count"></span>
-          </div>
-          <div class="card" id="secrets-card">
-            <div class="provider-strip">
-              <div class="provider-row">
-                <span class="provider-name">Infisical</span>
-                <span id="provider-infisical-state" class="provider-state"></span>
-                <div class="grow"></div>
-                <button type="button" id="provider-infisical-btn" class="secondary tiny">Set…</button>
-              </div>
-              <form id="provider-infisical-form" class="provider-form" autocomplete="off" hidden>
-                <input id="infisical-client-id" type="text" placeholder="machine identity client id" required aria-label="Infisical client id" spellcheck="false">
-                <input id="infisical-client-secret" type="password" placeholder="client secret" required aria-label="Infisical client secret" autocomplete="new-password">
-                <button type="submit" class="primary tiny">Save</button>
-                <button type="button" class="secondary tiny provider-cancel" data-provider="infisical">Cancel</button>
-                <span class="provider-error error" hidden></span>
-              </form>
-              <div class="provider-row">
-                <span class="provider-name">1Password</span>
-                <span id="provider-1password-state" class="provider-state"></span>
-                <div class="grow"></div>
-                <button type="button" id="provider-1password-btn" class="secondary tiny">Set…</button>
-              </div>
-              <form id="provider-1password-form" class="provider-form" autocomplete="off" hidden>
-                <input id="onepassword-token" type="password" placeholder="service-account token" required aria-label="1Password service-account token" autocomplete="new-password">
-                <button type="submit" class="primary tiny">Save</button>
-                <button type="button" class="secondary tiny provider-cancel" data-provider="1password">Cancel</button>
-                <span class="provider-error error" hidden></span>
-              </form>
-            </div>
-            <div id="secrets-empty" class="empty card-empty" hidden>No local secrets yet. Set one below, then reference it from a <code>[secrets.&lt;name&gt;] provider = "local"</code> block.</div>
-            <div class="table-scroll" id="secrets-table-wrap">
-              <table class="table" id="secrets-table">
-                <thead>
-                  <tr><th>Key</th><th>Used by</th><th class="col-mode">Status</th><th class="col-actions"></th></tr>
-                </thead>
-                <tbody id="secrets-body"></tbody>
-              </table>
-            </div>
-            <form id="secret-form" class="add-row" autocomplete="off">
-              <input id="secret-key" type="text" placeholder="GITHUB_TOKEN" required aria-label="Key" pattern="[A-Za-z_][A-Za-z0-9_]*" title="Letters, digits and _ — cannot start with a digit" spellcheck="false">
-              <span class="arrow" aria-hidden="true">=</span>
-              <input id="secret-value" type="password" placeholder="value — write-only, never shown again" required aria-label="Value" autocomplete="new-password">
-              <button type="submit" id="secret-submit">Set</button>
-            </form>
-            <p id="secret-error" class="error" hidden></p>
-          </div>
-        </section>
       </div>
 
       <aside class="inspector-rail">
@@ -221,6 +174,164 @@
         </div>
       </aside>
     </main>
+    </div>
+
+    <div id="page-secrets" class="page secrets-page" hidden>
+      <div class="secrets-layout">
+        <div class="secrets-main">
+          <section id="sec-blocks">
+            <div class="section-head">
+              <h2>Secret blocks</h2>
+              <span id="blocks-count" class="count"></span>
+              <div class="grow"></div>
+              <button type="button" id="block-new" class="primary tiny">New block</button>
+            </div>
+            <p class="section-note">A block is what a <code>portman.toml</code> refers to: <code>secrets = ["name"]</code> puts its values in a service's env, <code>[egress] secrets = "name"</code> attaches one of them to outbound requests. Blocks defined here are available to every repo; blocks a repo declares itself are listed with their root.</p>
+            <div class="card" id="blocks-card">
+              <div id="blocks-empty" class="empty card-empty" hidden>No blocks yet. Define one here, or declare <code>[secrets.&lt;name&gt;]</code> in a repo's <code>portman.toml</code>.</div>
+              <div class="table-scroll" id="blocks-table-wrap">
+                <table class="table" id="blocks-table">
+                  <thead>
+                    <tr><th>Name</th><th>Provider</th><th>Definition</th><th>Used by</th><th class="col-actions"></th></tr>
+                  </thead>
+                  <tbody id="blocks-body"></tbody>
+                </table>
+              </div>
+            </div>
+            <form id="block-editor" class="card block-editor" autocomplete="off" hidden>
+              <div class="block-editor-head">
+                <span id="block-editor-title" class="block-editor-title">New block</span>
+                <div class="grow"></div>
+                <button type="button" id="block-cancel" class="secondary tiny">Cancel</button>
+              </div>
+              <div class="field-row">
+                <label class="field">
+                  <span class="field-label">Name</span>
+                  <input id="block-name" type="text" placeholder="mine" required pattern="[A-Za-z0-9._-]{1,64}" spellcheck="false">
+                </label>
+                <label class="field">
+                  <span class="field-label">Provider</span>
+                  <select id="block-provider">
+                    <option value="local">local — portman's vault</option>
+                    <option value="1password">1password — op:// references</option>
+                    <option value="infisical">infisical — project folder(s)</option>
+                  </select>
+                </label>
+              </div>
+              <div id="block-fields-local" class="block-fields">
+                <label class="field">
+                  <span class="field-label">Keys this block yields</span>
+                  <input id="block-keys" type="text" placeholder="GITHUB_TOKEN OPENROUTER_API_KEY" spellcheck="false">
+                  <span class="field-hint">Space- or comma-separated env names. Values come from the vault on this page; a key without a value fails the service until it is set.</span>
+                </label>
+                <div id="block-keys-chips" class="chips"></div>
+              </div>
+              <div id="block-fields-1password" class="block-fields" hidden>
+                <div class="field-label">Env key ← 1Password reference</div>
+                <div id="block-refs"></div>
+                <button type="button" id="block-ref-add" class="secondary tiny">+ Add reference</button>
+                <span class="field-hint">Resolved through <code>op</code> with the stored service-account token.</span>
+              </div>
+              <div id="block-fields-infisical" class="block-fields" hidden>
+                <div class="field-row">
+                  <label class="field">
+                    <span class="field-label">URL</span>
+                    <input id="block-inf-url" type="text" placeholder="https://secrets.example.com" spellcheck="false">
+                  </label>
+                  <label class="field">
+                    <span class="field-label">Project id</span>
+                    <input id="block-inf-project" type="text" placeholder="00000000-0000-0000-0000-000000000000" spellcheck="false">
+                  </label>
+                </div>
+                <div class="field-row">
+                  <label class="field">
+                    <span class="field-label">Environment</span>
+                    <input id="block-inf-env" type="text" placeholder="dev" spellcheck="false">
+                  </label>
+                  <label class="field">
+                    <span class="field-label">Paths (first wins on duplicate keys)</span>
+                    <input id="block-inf-paths" type="text" placeholder="/apps/myapp, /shared" spellcheck="false">
+                  </label>
+                </div>
+                <div class="field-row">
+                  <label class="field">
+                    <span class="field-label">API version</span>
+                    <select id="block-inf-api"><option value="v3">v3 (default, self-hosted)</option><option value="v4">v4</option></select>
+                  </label>
+                  <label class="field">
+                    <span class="field-label">Mode</span>
+                    <select id="block-inf-mode"><option value="native">native (HTTP)</option><option value="cli">cli (infisical export)</option></select>
+                  </label>
+                </div>
+              </div>
+              <div class="actions block-editor-actions">
+                <button type="submit" id="block-save" class="primary">Save block</button>
+                <span id="block-error" class="error" hidden></span>
+              </div>
+            </form>
+          </section>
+        </div>
+
+        <div class="secrets-side">
+          <section id="sec-providers">
+            <div class="section-head"><h2>Provider credentials</h2></div>
+            <div class="card">
+              <div class="provider-row">
+                <span class="provider-name">Infisical</span>
+                <span id="provider-infisical-state" class="provider-state"></span>
+                <div class="grow"></div>
+                <button type="button" id="provider-infisical-btn" class="secondary tiny">Set…</button>
+              </div>
+              <form id="provider-infisical-form" class="provider-form" autocomplete="off" hidden>
+                <input id="infisical-client-id" type="text" placeholder="machine identity client id" required aria-label="Infisical client id" spellcheck="false">
+                <input id="infisical-client-secret" type="password" placeholder="client secret" required aria-label="Infisical client secret" autocomplete="new-password">
+                <button type="submit" class="primary tiny">Save</button>
+                <button type="button" class="secondary tiny provider-cancel" data-provider="infisical">Cancel</button>
+                <span class="provider-error error" hidden></span>
+              </form>
+              <div class="provider-row">
+                <span class="provider-name">1Password</span>
+                <span id="provider-1password-state" class="provider-state"></span>
+                <div class="grow"></div>
+                <button type="button" id="provider-1password-btn" class="secondary tiny">Set…</button>
+              </div>
+              <form id="provider-1password-form" class="provider-form" autocomplete="off" hidden>
+                <input id="onepassword-token" type="password" placeholder="service-account token" required aria-label="1Password service-account token" autocomplete="new-password">
+                <button type="submit" class="primary tiny">Save</button>
+                <button type="button" class="secondary tiny provider-cancel" data-provider="1password">Cancel</button>
+                <span class="provider-error error" hidden></span>
+              </form>
+            </div>
+          </section>
+
+          <section id="sec-vault">
+            <div class="section-head">
+              <h2>Local vault</h2>
+              <span id="secrets-count" class="count"></span>
+            </div>
+            <p class="section-note">Values portman keeps itself, write-only. A <code>local</code> block picks which of them a service or egress route gets.</p>
+            <div class="card" id="secrets-card">
+              <div id="secrets-empty" class="empty card-empty" hidden>No local secrets yet. Set one below, then name it in a <code>local</code> block.</div>
+              <div class="table-scroll" id="secrets-table-wrap">
+                <table class="table" id="secrets-table">
+                  <thead>
+                    <tr><th>Key</th><th>Used by</th><th class="col-mode">Status</th><th class="col-actions"></th></tr>
+                  </thead>
+                  <tbody id="secrets-body"></tbody>
+                </table>
+              </div>
+              <form id="secret-form" class="add-row" autocomplete="off">
+                <input id="secret-key" type="text" placeholder="GITHUB_TOKEN" required aria-label="Key" pattern="[A-Za-z_][A-Za-z0-9_]*" title="Letters, digits and _ — cannot start with a digit" spellcheck="false">
+                <span class="arrow" aria-hidden="true">=</span>
+                <input id="secret-value" type="password" placeholder="value — write-only, never shown again" required aria-label="Value" autocomplete="new-password">
+                <button type="submit" id="secret-submit">Set</button>
+              </form>
+              <p id="secret-error" class="error" hidden></p>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
 
     <footer class="footer mono">
       <span id="dashboard-url"></span>

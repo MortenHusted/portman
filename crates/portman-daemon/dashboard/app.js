@@ -981,6 +981,7 @@ let focused = false;
 let applyingRoute = false;
 
 function routeHash() {
+  if (page === 'secrets') return '#secrets';
   if (cfgEditor.open) return '#cfg/' + encodeURIComponent(cfgEditor.root);
   if (!selected) return '';
   const base = (selected.kind === 'service' ? 'svc/' : 'ctr/') + encodeURIComponent(selected.key);
@@ -995,6 +996,12 @@ function pushRoute() {
 
 function applyRoute() {
   applyingRoute = true;
+  if (location.hash === '#secrets') {
+    showPage('secrets');
+    applyingRoute = false;
+    return;
+  }
+  showPage('overview');
   const cfg = location.hash.match(/^#cfg\/(.+)$/);
   if (cfg) {
     openConfig(decodeURIComponent(cfg[1]));
@@ -1055,7 +1062,10 @@ el('insp-focus').addEventListener('click', () => setFocus(true));
 el('insp-back').addEventListener('click', () => setFocus(false));
 el('focus-prev').addEventListener('click', () => focusStep(-1));
 el('focus-next').addEventListener('click', () => focusStep(1));
-document.querySelector('.brand').addEventListener('click', () => setFocus(false));
+document.querySelector('.brand').addEventListener('click', () => {
+  setFocus(false);
+  navigateTo('');
+});
 
 document.addEventListener('keydown', (ev) => {
   if (ev.target && /^(INPUT|TEXTAREA)$/.test(ev.target.tagName)) return;
@@ -1209,10 +1219,11 @@ let secretsStatus = null;
 
 function renderSecrets() {
   const s = secretsStatus;
-  // An older daemon has no /api/secrets — keep the section out of the way.
-  el('sec-secrets').hidden = !s;
+  // An older daemon has no /api/secrets — keep the page out of the nav.
+  document.querySelector('.nav-link[data-page="secrets"]').hidden = !s;
   if (!s) return;
 
+  renderBlocks(s.blocks || []);
   renderProviderState('infisical', s.infisical_client_id
     ? `configured · ${s.infisical_client_id}`
     : null);
@@ -1356,6 +1367,252 @@ async function submitProviderForm(provider, body) {
     errEl.hidden = false;
   }
 }
+
+// --- Secret blocks ---------------------------------------------------------
+// A block is the mapping a config names: which provider, and which keys /
+// refs / folders. Global blocks (defined here) are editable; repo blocks are
+// listed with their root and edited in that repo's config.
+
+const blockEditor = { open: false, editing: null };
+
+function blockDefinition(config) {
+  switch (config.provider) {
+    case 'local':
+      return `<span class="chips">${config.keys.map(k => `<span class="chip mono">${esc(k)}</span>`).join('')}</span>`;
+    case '1password':
+      return Object.entries(config.refs || {})
+        .map(([k, r]) => `<div class="block-def" title="${esc(r)}">${esc(k)} ← ${esc(r)}</div>`)
+        .join('');
+    case 'infisical':
+      return `<div class="block-def" title="${esc(config.url)}">${esc(config.url)} · ${esc(config.environment)}</div>
+        <div class="block-def" title="${esc(config.paths.join(', '))}">${esc(config.paths.join(', '))}</div>`;
+    default:
+      return `<span class="block-def">${esc(config.provider)}</span>`;
+  }
+}
+
+function renderBlocks(blocks) {
+  const rows = [...blocks].sort((a, b) => a.name.localeCompare(b.name));
+  el('blocks-count').textContent = rows.length ? `${rows.length}` : '';
+  el('blocks-empty').hidden = rows.length > 0;
+  el('blocks-table-wrap').hidden = rows.length === 0;
+
+  const tbody = el('blocks-body');
+  tbody.innerHTML = '';
+  for (const b of rows) {
+    const owner = b.root
+      ? `<span class="block-owner" title="${esc(b.root)}">in ${esc(b.root.split('/').filter(Boolean).pop() || b.root)}/portman.toml</span>`
+      : '<span class="block-owner">global</span>';
+    const usedBy = b.used_by.length
+      ? `<span class="chips">${b.used_by.map(u => `<span class="chip mono">${esc(u)}</span>`).join('')}</span>`
+      : '<span class="secret-unused">unused</span>';
+    const actions = b.root
+      ? ''
+      : `<button type="button" class="secondary tiny block-edit-btn" data-name="${esc(b.name)}">Edit</button>
+         <button type="button" class="danger tiny block-remove-btn" data-name="${esc(b.name)}" data-used="${b.used_by.length}">Remove</button>`;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><span class="block-name">${esc(b.name)}</span>${owner}</td>
+      <td><span class="mode-tag">${esc(b.config.provider)}</span></td>
+      <td>${blockDefinition(b.config)}</td>
+      <td>${usedBy}</td>
+      <td class="col-actions"><span class="row-actions">${actions}</span></td>`;
+    tbody.appendChild(tr);
+  }
+
+  tbody.querySelectorAll('.block-edit-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const block = rows.find(b => b.name === btn.dataset.name);
+      if (block) openBlockEditor(block);
+    });
+  });
+  tbody.querySelectorAll('.block-remove-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const name = btn.dataset.name;
+      const used = Number(btn.dataset.used);
+      const warning = used
+        ? ` ${used} service${used === 1 ? '' : 's'}/route${used === 1 ? '' : 's'} reference it and will fail until it is redefined.`
+        : '';
+      if (!confirm(`Remove block ${name}?${warning}`)) return;
+      try {
+        await api('/secrets/blocks/' + encodeURIComponent(name), { method: 'DELETE' });
+        if (blockEditor.editing === name) closeBlockEditor();
+        refresh();
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+  });
+}
+
+function openBlockEditor(block) {
+  blockEditor.open = true;
+  blockEditor.editing = block ? block.name : null;
+  const form = el('block-editor');
+  form.hidden = false;
+  el('block-error').hidden = true;
+  el('block-editor-title').textContent = block ? `Edit block ${block.name}` : 'New block';
+  el('block-name').value = block ? block.name : '';
+  el('block-name').disabled = !!block;
+  const config = block ? block.config : { provider: 'local', keys: [] };
+  el('block-provider').value = config.provider;
+  el('block-keys').value = (config.keys || []).join(' ');
+  el('block-refs').innerHTML = '';
+  for (const [k, r] of Object.entries(config.refs || {})) addRefRow(k, r);
+  if (config.provider === '1password' && !el('block-refs').children.length) addRefRow();
+  el('block-inf-url').value = config.url || '';
+  el('block-inf-project').value = config.project_id || '';
+  el('block-inf-env').value = config.environment || '';
+  el('block-inf-paths').value = (config.paths || []).join(', ');
+  el('block-inf-api').value = config.api_version || 'v3';
+  el('block-inf-mode').value = config.mode || 'native';
+  renderBlockProviderFields();
+  (block ? el('block-provider') : el('block-name')).focus();
+  form.scrollIntoView({ block: 'nearest' });
+}
+
+function closeBlockEditor() {
+  blockEditor.open = false;
+  blockEditor.editing = null;
+  el('block-editor').hidden = true;
+}
+
+function renderBlockProviderFields() {
+  const provider = el('block-provider').value;
+  for (const p of ['local', '1password', 'infisical']) {
+    el(`block-fields-${p}`).hidden = p !== provider;
+  }
+  if (provider === 'local') renderVaultKeyChips();
+  if (provider === '1password' && !el('block-refs').children.length) addRefRow();
+}
+
+// The vault's keys as one-click additions to a local block's allowlist.
+function renderVaultKeyChips() {
+  const chips = el('block-keys-chips');
+  chips.innerHTML = '';
+  const keys = (secretsStatus?.local || []).filter(r => r.set).map(r => r.key);
+  for (const key of keys) {
+    const chip = document.createElement('span');
+    chip.className = 'chip mono clickable';
+    chip.textContent = key;
+    chip.title = 'Add to this block';
+    chip.addEventListener('click', () => {
+      const current = parseKeyList(el('block-keys').value);
+      if (!current.includes(key)) current.push(key);
+      el('block-keys').value = current.join(' ');
+    });
+    chips.appendChild(chip);
+  }
+}
+
+function parseKeyList(text) {
+  return text.split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
+}
+
+function addRefRow(key = '', ref = '') {
+  const row = document.createElement('div');
+  row.className = 'ref-row';
+  row.innerHTML = `
+    <input type="text" class="ref-key" placeholder="API_KEY" value="${esc(key)}" spellcheck="false" aria-label="Env key">
+    <span class="arrow" aria-hidden="true">←</span>
+    <input type="text" class="ref-value" placeholder="op://vault/item/field" value="${esc(ref)}" spellcheck="false" aria-label="1Password reference">
+    <button type="button" class="secondary tiny ref-remove" title="Remove this reference">×</button>`;
+  row.querySelector('.ref-remove').addEventListener('click', () => row.remove());
+  el('block-refs').appendChild(row);
+}
+
+// Build the block's wire shape from the form; throws with the message to show.
+function collectBlockConfig() {
+  const provider = el('block-provider').value;
+  if (provider === 'local') {
+    const keys = parseKeyList(el('block-keys').value);
+    if (!keys.length) throw new Error('name at least one key');
+    return { provider, keys };
+  }
+  if (provider === '1password') {
+    const refs = {};
+    for (const row of el('block-refs').querySelectorAll('.ref-row')) {
+      const key = row.querySelector('.ref-key').value.trim();
+      const ref = row.querySelector('.ref-value').value.trim();
+      if (!key && !ref) continue;
+      if (!key || !ref) throw new Error('each reference needs both an env key and an op:// reference');
+      refs[key] = ref;
+    }
+    if (!Object.keys(refs).length) throw new Error('add at least one reference');
+    return { provider, refs };
+  }
+  return {
+    provider,
+    url: el('block-inf-url').value.trim(),
+    project_id: el('block-inf-project').value.trim(),
+    environment: el('block-inf-env').value.trim(),
+    paths: parseKeyList(el('block-inf-paths').value),
+    api_version: el('block-inf-api').value,
+    mode: el('block-inf-mode').value,
+  };
+}
+
+el('block-new').addEventListener('click', () => openBlockEditor(null));
+el('block-cancel').addEventListener('click', closeBlockEditor);
+el('block-provider').addEventListener('change', renderBlockProviderFields);
+el('block-ref-add').addEventListener('click', () => addRefRow());
+
+el('block-editor').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const errEl = el('block-error');
+  errEl.hidden = true;
+  const name = el('block-name').value.trim();
+  let config;
+  try {
+    config = collectBlockConfig();
+  } catch (err) {
+    errEl.textContent = err.message;
+    errEl.hidden = false;
+    return;
+  }
+  const save = el('block-save');
+  save.disabled = true;
+  try {
+    await api('/secrets/blocks/' + encodeURIComponent(name), {
+      method: 'PUT',
+      body: JSON.stringify(config),
+    });
+    closeBlockEditor();
+    refresh();
+  } catch (err) {
+    errEl.textContent = err.message;
+    errEl.hidden = false;
+  }
+  save.disabled = false;
+});
+
+// --- Pages -----------------------------------------------------------------
+// One page per concern: the overview (services, containers, routes,
+// inspector) and secrets. The hash names the page; deep links inside the
+// overview (#svc/…, #cfg/…) keep working unchanged.
+
+let page = 'overview';
+
+function showPage(name) {
+  page = name;
+  el('page-overview').hidden = name !== 'overview';
+  el('page-secrets').hidden = name !== 'secrets';
+  document.querySelectorAll('.nav-link').forEach(a => {
+    a.classList.toggle('active', a.dataset.page === name);
+  });
+}
+
+function navigateTo(hash) {
+  if (location.hash !== hash) history.pushState(null, '', location.pathname + hash);
+  applyRoute();
+}
+
+document.querySelectorAll('.nav-link').forEach(a => {
+  a.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    navigateTo(a.dataset.page === 'secrets' ? '#secrets' : '');
+  });
+});
 
 // --- Status / footer -------------------------------------------------------
 
