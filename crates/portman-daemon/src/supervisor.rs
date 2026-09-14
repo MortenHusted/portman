@@ -435,7 +435,11 @@ struct PersistedService {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedSecrets {
-    root: PathBuf,
+    /// Config root that declared the block; `None` for a daemon-global block
+    /// defined through the dashboard (`SetSecretsBlock`). Wire-defaults so a
+    /// pre-global `services.json` still restores.
+    #[serde(default)]
+    root: Option<PathBuf>,
     config: SecretsProviderConfig,
 }
 
@@ -724,12 +728,50 @@ impl Supervisor {
         }
         {
             let mut blocks = self.inner.secrets.lock().expect("secrets lock poisoned");
-            blocks.retain(|_, b| b.root != root);
+            // Block names are global like service names: a repo block that
+            // collides with a daemon-global one (or another root's) would
+            // silently swap which coordinates every consumer resolves.
+            for name in secrets.keys() {
+                if let Some(held) = blocks.get(name) {
+                    if held.root.as_deref() != Some(root) {
+                        bail!(
+                            "[secrets.{name}] is already defined {} — block names are global",
+                            describe_block_owner(held.root.as_deref())
+                        );
+                    }
+                }
+            }
+            // An egress route names a block this file may not declare (a
+            // daemon-global one). This is the first point that sees both
+            // sets, so it is where "does the block exist, and is the key in
+            // a local block's allowlist" gets decided — still before any
+            // request is proxied.
+            for (name, route) in &egress {
+                let block = secrets.get(&route.spec.secrets).or_else(|| {
+                    blocks
+                        .get(&route.spec.secrets)
+                        .filter(|b| b.root.as_deref() != Some(root))
+                        .map(|b| &b.config)
+                });
+                let Some(block) = block else {
+                    bail!(
+                        "[egress.{name}] references [secrets.{}] which is neither in this config nor defined globally",
+                        route.spec.secrets
+                    );
+                };
+                portman_core::service_config::egress_key_allowed(
+                    &route.spec.secrets,
+                    block,
+                    &route.spec.key,
+                )
+                .with_context(|| format!("in [egress.{name}]"))?;
+            }
+            blocks.retain(|_, b| b.root.as_deref() != Some(root));
             for (name, config) in secrets {
                 blocks.insert(
                     name,
                     PersistedSecrets {
-                        root: root.to_path_buf(),
+                        root: Some(root.to_path_buf()),
                         config,
                     },
                 );
@@ -1019,6 +1061,84 @@ impl Supervisor {
         roots.sort();
         roots.dedup();
         roots
+    }
+
+    /// Define or replace a daemon-global block. A name a repo config owns is
+    /// refused: that block is edited where it is declared.
+    pub(crate) fn set_global_block(
+        &self,
+        name: String,
+        config: SecretsProviderConfig,
+    ) -> Result<()> {
+        {
+            let mut blocks = self.inner.secrets.lock().expect("secrets lock poisoned");
+            if let Some(held) = blocks.get(&name) {
+                if let Some(root) = &held.root {
+                    bail!(
+                        "[secrets.{name}] is declared by {} — edit it there",
+                        root.display()
+                    );
+                }
+            }
+            blocks.insert(name, PersistedSecrets { root: None, config });
+        }
+        self.persist();
+        // Replaced coordinates must not keep serving the old block's values.
+        self.inner.secrets_source.invalidate();
+        Ok(())
+    }
+
+    /// Drop a daemon-global block. Consumers keep referencing the name and
+    /// fail on their next spawn / request with the usual "no such block".
+    pub(crate) fn remove_global_block(&self, name: &str) -> Result<()> {
+        {
+            let mut blocks = self.inner.secrets.lock().expect("secrets lock poisoned");
+            match blocks.get(name) {
+                None => bail!("no block named [secrets.{name}]"),
+                Some(PersistedSecrets {
+                    root: Some(root), ..
+                }) => bail!(
+                    "[secrets.{name}] is declared by {} — remove it there",
+                    root.display()
+                ),
+                Some(_) => {
+                    blocks.remove(name);
+                }
+            }
+        }
+        self.persist();
+        self.inner.secrets_source.invalidate();
+        Ok(())
+    }
+
+    /// Every known block with its owner and consumers (services by name,
+    /// egress routes as `egress:<name>`). Coordinates only — never a value.
+    pub(crate) fn secrets_blocks(&self) -> Vec<portman_protocol::SecretsBlockInfo> {
+        let blocks = self.inner.secrets.lock().expect("secrets lock poisoned");
+        let slots = self.inner.slots.lock().expect("slots lock poisoned");
+        let routes = self.inner.egress.lock().expect("egress lock poisoned");
+        blocks
+            .iter()
+            .map(|(name, block)| {
+                let mut used_by: Vec<String> = slots
+                    .iter()
+                    .filter(|(_, slot)| slot.def.secrets.iter().any(|s| s == name))
+                    .map(|(service, _)| service.clone())
+                    .collect();
+                used_by.extend(
+                    routes
+                        .iter()
+                        .filter(|(_, r)| &r.route.spec.secrets == name)
+                        .map(|(route, _)| format!("egress:{route}")),
+                );
+                portman_protocol::SecretsBlockInfo {
+                    name: name.clone(),
+                    config: block.config.clone(),
+                    root: block.root.clone(),
+                    used_by,
+                }
+            })
+            .collect()
     }
 
     /// Which synced `provider = "local"` blocks name each vault key
@@ -2081,6 +2201,13 @@ fn marker_identity_matches(marker: &RunningMarker) -> bool {
 
 // ---------------------------------------------------------------------------
 // Persistence.
+
+fn describe_block_owner(root: Option<&Path>) -> String {
+    match root {
+        Some(root) => format!("by {}", root.display()),
+        None => "globally (in the dashboard)".to_string(),
+    }
+}
 
 fn load_persisted(path: &Path) -> Result<Persisted> {
     match std::fs::read(path) {
@@ -3551,6 +3678,17 @@ mod tests {
         );
     }
 
+    /// The block every test egress route names. Sync refuses a route whose
+    /// block is neither synced with it nor global, so routes travel with it.
+    fn egress_blocks() -> Map<String, SecretsProviderConfig> {
+        Map::from([(
+            "gh".to_string(),
+            SecretsProviderConfig::Local {
+                keys: vec!["TOKEN".into()],
+            },
+        )])
+    }
+
     fn egress_route(host: &str) -> EgressRoute {
         EgressRoute {
             host: host.to_string(),
@@ -3577,7 +3715,7 @@ mod tests {
         sup.sync(
             dir.path(),
             vec![],
-            Map::new(),
+            egress_blocks(),
             Map::from([("gh".to_string(), egress_route("github.internal"))]),
         )
         .await
@@ -3595,7 +3733,7 @@ mod tests {
         sup.sync(
             dir.path(),
             vec![],
-            Map::new(),
+            egress_blocks(),
             Map::from([("gh".into(), changed)]),
         )
         .await
@@ -3627,7 +3765,7 @@ mod tests {
         sup.sync(
             dir.path(),
             vec![],
-            Map::new(),
+            egress_blocks(),
             Map::from([("gh".to_string(), egress_route("github.internal"))]),
         )
         .await
@@ -3640,7 +3778,7 @@ mod tests {
             .sync(
                 &other,
                 vec![],
-                Map::new(),
+                egress_blocks(),
                 Map::from([("gh".to_string(), egress_route("github.internal"))]),
             )
             .await
@@ -3667,7 +3805,7 @@ mod tests {
         sup.sync(
             dir.path(),
             vec![],
-            Map::new(),
+            egress_blocks(),
             Map::from([("gh".to_string(), egress_route("github.internal"))]),
         )
         .await
@@ -3680,7 +3818,7 @@ mod tests {
         sup.sync(
             dir.path(),
             vec![],
-            Map::new(),
+            egress_blocks(),
             Map::from([("gh".to_string(), moved)]),
         )
         .await

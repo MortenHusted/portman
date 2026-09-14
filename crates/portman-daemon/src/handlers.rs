@@ -56,6 +56,22 @@ pub(crate) async fn dispatch(request: Request, state: &DaemonState) -> Response 
         Request::SetLocalSecret { key, value } => handle_set_local_secret(state, key, value),
         Request::UnsetLocalSecret { key } => handle_unset_local_secret(state, key),
         Request::SecretsStatus => handle_secrets_status(state),
+        Request::SetSecretsBlock { name, config } => {
+            let name = name.trim().to_string();
+            if let Err(e) = portman_core::service_config::validate_secrets_block(&name, &config) {
+                return err(format!("{e:#}"));
+            }
+            match state.supervisor.set_global_block(name, config) {
+                Ok(()) => Response::Ok,
+                Err(e) => err(format!("{e:#}")),
+            }
+        }
+        Request::RemoveSecretsBlock { name } => {
+            match state.supervisor.remove_global_block(name.trim()) {
+                Ok(()) => Response::Ok,
+                Err(e) => err(format!("{e:#}")),
+            }
+        }
     }
 }
 
@@ -118,6 +134,7 @@ fn handle_secrets_status(state: &DaemonState) -> Response {
         infisical_client_id: state.credentials.infisical().map(|c| c.client_id),
         onepassword: state.credentials.onepassword().is_some(),
         local,
+        blocks: state.supervisor.secrets_blocks(),
     }
 }
 
@@ -816,6 +833,7 @@ mod tests {
             infisical_client_id,
             onepassword,
             local,
+            ..
         } = status
         else {
             panic!("expected secrets_status, got {status:?}");
@@ -856,6 +874,206 @@ mod tests {
                     key: "UNUSED".into()
                 },
                 &state
+            )
+            .await,
+            Response::Err { .. }
+        ));
+    }
+
+    /// Daemon-global blocks: defined without a repo, usable by any repo's
+    /// services and egress routes by name; name collisions with repo blocks
+    /// are refused in both directions; an egress route naming a block no
+    /// one defines (or a key outside a local block's allowlist) is refused
+    /// at sync, the first point that sees both sets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn global_secrets_blocks_are_shared_validated_and_listed() {
+        use portman_protocol::{EgressRoute, EgressSpec, SecretsProviderConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        let local = |keys: &[&str]| SecretsProviderConfig::Local {
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+        };
+        let route = |block: &str, key: &str| EgressRoute {
+            host: "github.api.test".into(),
+            target: "127.0.0.1:9999".into(),
+            spec: EgressSpec {
+                secrets: block.into(),
+                key: key.into(),
+                header: "Authorization".into(),
+                format: "Bearer {value}".into(),
+                upstream_host: "127.0.0.1".into(),
+                tls: false,
+            },
+        };
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Invalid config is refused by the shared validator.
+        let bad = dispatch(
+            Request::SetSecretsBlock {
+                name: "mine".into(),
+                config: local(&[]),
+            },
+            &state,
+        )
+        .await;
+        assert!(matches!(bad, Response::Err { .. }), "{bad:?}");
+        assert!(matches!(
+            dispatch(
+                Request::SetSecretsBlock {
+                    name: "mine".into(),
+                    config: local(&["GITHUB_TOKEN"]),
+                },
+                &state,
+            )
+            .await,
+            Response::Ok
+        ));
+
+        // A repo may consume the global block by name without declaring it…
+        let web = portman_protocol::ServiceDefinition {
+            name: "web".into(),
+            run: vec!["true".into()],
+            dir: root.clone(),
+            port: None,
+            host: None,
+            mode: Mode::Http,
+            ready: portman_protocol::ReadyCheck::None,
+            depends: Vec::new(),
+            restart: portman_protocol::RestartPolicy::Never,
+            stop_grace_ms: 300,
+            env_files: Vec::new(),
+            env: Default::default(),
+            secrets: vec!["mine".into()],
+            secrets_optional: false,
+            watch: Vec::new(),
+            watch_mode: Default::default(),
+            watch_debounce_ms: 500,
+            groups: Vec::new(),
+            project: None,
+        };
+        state
+            .supervisor
+            .sync(
+                &root,
+                vec![web.clone()],
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::from([(
+                    "github".to_string(),
+                    route("mine", "GITHUB_TOKEN"),
+                )]),
+            )
+            .await
+            .unwrap();
+        // …but not redeclare its name, name a block nobody defines, or use a
+        // key outside a local block's allowlist.
+        let redeclare = state
+            .supervisor
+            .sync(
+                &root,
+                vec![web.clone()],
+                std::collections::BTreeMap::from([("mine".to_string(), local(&["OTHER"]))]),
+                std::collections::BTreeMap::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{redeclare:#}").contains("globally"),
+            "{redeclare:#}"
+        );
+        let unknown = state
+            .supervisor
+            .sync(
+                &root,
+                vec![web.clone()],
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::from([("github".to_string(), route("nope", "K"))]),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{unknown:#}").contains("[secrets.nope]"),
+            "{unknown:#}"
+        );
+        let bad_key = state
+            .supervisor
+            .sync(
+                &root,
+                vec![web.clone()],
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::from([("github".to_string(), route("mine", "OTHER"))]),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{bad_key:#}").contains("not in [secrets.mine]"),
+            "{bad_key:#}"
+        );
+
+        // The listing shows owner and consumers; a repo block is listed with
+        // its root and cannot be replaced or removed as a global one.
+        state
+            .supervisor
+            .sync(
+                &root,
+                vec![web],
+                std::collections::BTreeMap::from([("repo-block".to_string(), local(&["A"]))]),
+                std::collections::BTreeMap::from([(
+                    "github".to_string(),
+                    route("mine", "GITHUB_TOKEN"),
+                )]),
+            )
+            .await
+            .unwrap();
+        let Response::SecretsStatus { blocks, .. } = dispatch(Request::SecretsStatus, &state).await
+        else {
+            panic!("expected secrets_status");
+        };
+        let mine = blocks.iter().find(|b| b.name == "mine").unwrap();
+        assert_eq!(mine.root, None);
+        assert_eq!(
+            mine.used_by,
+            vec!["web".to_string(), "egress:github".to_string()]
+        );
+        let repo_block = blocks.iter().find(|b| b.name == "repo-block").unwrap();
+        assert_eq!(repo_block.root.as_deref(), Some(root.as_path()));
+        assert!(matches!(
+            dispatch(
+                Request::SetSecretsBlock {
+                    name: "repo-block".into(),
+                    config: local(&["B"]),
+                },
+                &state,
+            )
+            .await,
+            Response::Err { .. }
+        ));
+        assert!(matches!(
+            dispatch(
+                Request::RemoveSecretsBlock {
+                    name: "repo-block".into()
+                },
+                &state,
+            )
+            .await,
+            Response::Err { .. }
+        ));
+        assert!(matches!(
+            dispatch(
+                Request::RemoveSecretsBlock {
+                    name: "mine".into()
+                },
+                &state,
+            )
+            .await,
+            Response::Ok
+        ));
+        assert!(matches!(
+            dispatch(
+                Request::RemoveSecretsBlock {
+                    name: "mine".into()
+                },
+                &state,
             )
             .await,
             Response::Err { .. }

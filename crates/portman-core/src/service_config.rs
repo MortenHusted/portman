@@ -1841,10 +1841,6 @@ mod tests {
         assert!(!local.spec.tls);
     }
 
-    /// An egress route naming a secrets block that isn't in the config
-    /// fails at load time with the block named — not at proxy time with a
-    /// 502 the user then has to chase.
-    #[test]
     /// A block the file doesn't declare may be a daemon-global one, so load
     /// accepts the reference and leaves existence to sync. (The daemon's
     /// sync test pins the refusal there.)

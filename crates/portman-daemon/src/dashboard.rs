@@ -259,6 +259,31 @@ async fn handle_connection(mut stream: TcpStream, state: DaemonState) -> Result<
             )
             .await
         }
+        // Daemon-global blocks: the body is the block's provider config in
+        // its wire shape (`{"provider":"local","keys":[...]}` etc.).
+        ("PUT", path) if path.starts_with("/api/secrets/blocks/") => {
+            let name = urlencoding_path_segment(&path["/api/secrets/blocks/".len()..]);
+            let config: portman_protocol::SecretsProviderConfig = match serde_json::from_slice(body)
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    return api_json(stream, err_response(&format!("invalid block: {err}"))).await;
+                }
+            };
+            api_json(
+                stream,
+                handlers::dispatch(Request::SetSecretsBlock { name, config }, &state).await,
+            )
+            .await
+        }
+        ("DELETE", path) if path.starts_with("/api/secrets/blocks/") => {
+            let name = urlencoding_path_segment(&path["/api/secrets/blocks/".len()..]);
+            api_json(
+                stream,
+                handlers::dispatch(Request::RemoveSecretsBlock { name }, &state).await,
+            )
+            .await
+        }
         ("POST", "/api/secrets/infisical") => {
             handle_set_provider_credentials(stream, state, "infisical", body).await
         }

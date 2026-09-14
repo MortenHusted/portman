@@ -40,6 +40,7 @@ pub(crate) async fn cmd_secrets_list() -> Result<()> {
             infisical_client_id,
             onepassword,
             local,
+            blocks,
         } => {
             match infisical_client_id {
                 Some(id) => println!("infisical   configured (client id {id})"),
@@ -53,25 +54,55 @@ pub(crate) async fn cmd_secrets_list() -> Result<()> {
             println!();
             if local.is_empty() {
                 println!("(no local secrets — portman secrets set KEY)");
+            } else {
+                let width = local.iter().map(|s| s.key.len()).max().unwrap_or(0);
+                for s in &local {
+                    let state = if s.set { "set" } else { "MISSING" };
+                    let refs = if s.blocks.is_empty() {
+                        String::from("(not referenced)")
+                    } else {
+                        s.blocks
+                            .iter()
+                            .map(|b| format!("[secrets.{b}]"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    };
+                    println!("{:<width$}  {state:<7}  {refs}", s.key);
+                }
+            }
+            println!();
+            if blocks.is_empty() {
+                println!("(no [secrets.*] blocks — define one in the dashboard or a portman.toml)");
                 return Ok(());
             }
-            let width = local.iter().map(|s| s.key.len()).max().unwrap_or(0);
-            for s in &local {
-                let state = if s.set { "set" } else { "MISSING" };
-                let blocks = if s.blocks.is_empty() {
-                    String::from("(not referenced)")
-                } else {
-                    s.blocks
-                        .iter()
-                        .map(|b| format!("[secrets.{b}]"))
-                        .collect::<Vec<_>>()
-                        .join(" ")
+            let width = blocks.iter().map(|b| b.name.len()).max().unwrap_or(0);
+            for b in &blocks {
+                let owner = match &b.root {
+                    Some(root) => root.display().to_string(),
+                    None => String::from("(global)"),
                 };
-                println!("{:<width$}  {state:<7}  {blocks}", s.key);
+                let used = if b.used_by.is_empty() {
+                    String::from("unused")
+                } else {
+                    b.used_by.join(", ")
+                };
+                println!(
+                    "[secrets.{:<width$}]  {:<10}  {owner}  used by: {used}",
+                    b.name,
+                    provider_label(&b.config)
+                );
             }
             Ok(())
         }
         other => other.unexpected(),
+    }
+}
+
+fn provider_label(config: &portman_protocol::SecretsProviderConfig) -> &'static str {
+    match config {
+        portman_protocol::SecretsProviderConfig::Infisical { .. } => "infisical",
+        portman_protocol::SecretsProviderConfig::OnePassword { .. } => "1password",
+        portman_protocol::SecretsProviderConfig::Local { .. } => "local",
     }
 }
 
