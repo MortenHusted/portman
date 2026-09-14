@@ -15,7 +15,10 @@ mod tui;
 use client::request;
 use cmd::bridge::{cmd_bridge, cmd_bridge_mode, cmd_bridge_prepare, cmd_bridge_status, cmd_doctor};
 use cmd::install::{cmd_install, cmd_uninstall};
-use cmd::secrets::{cmd_secrets_set_infisical, cmd_secrets_set_op};
+use cmd::secrets::{
+    cmd_secrets_list, cmd_secrets_set, cmd_secrets_set_infisical, cmd_secrets_set_op,
+    cmd_secrets_unset,
+};
 use cmd::services::{cmd_down, cmd_logs, cmd_status, cmd_up};
 use cmd::tld::{cmd_tld_add, cmd_tld_list, cmd_tld_remove};
 use fmt::{format_bytes, format_rate, open_browser, truncate};
@@ -204,6 +207,27 @@ enum SecretsAction {
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
     },
+    /// Set (or replace) a value in portman's local vault.
+    ///
+    /// Blocks with `provider = "local"` pull from it: `[secrets.mine]
+    /// provider = "local" keys = ["GITHUB_TOKEN"]`. Values are write-only —
+    /// nothing lists them back.
+    Set {
+        /// Env key, e.g. GITHUB_TOKEN.
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// Omit to read the value from stdin (keeps it out of shell history).
+        #[arg(long, value_name = "VALUE")]
+        value: Option<String>,
+    },
+    /// Remove a value from the local vault.
+    Unset {
+        #[arg(value_name = "KEY")]
+        key: String,
+    },
+    /// Show which provider credentials are stored and which local keys
+    /// exist or are referenced by synced configs. Names only, never values.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -285,6 +309,9 @@ async fn main() -> Result<()> {
                 client_secret,
             } => cmd_secrets_set_infisical(client_id, client_secret).await,
             SecretsAction::SetOp { token } => cmd_secrets_set_op(token).await,
+            SecretsAction::Set { key, value } => cmd_secrets_set(key, value).await,
+            SecretsAction::Unset { key } => cmd_secrets_unset(key).await,
+            SecretsAction::List => cmd_secrets_list().await,
         },
         Command::Tld { action } => match action {
             TldAction::List => cmd_tld_list().await,
