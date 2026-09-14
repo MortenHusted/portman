@@ -96,6 +96,58 @@
             <p id="add-error" class="error" hidden></p>
           </div>
         </section>
+
+        <section id="sec-secrets" hidden>
+          <div class="section-head">
+            <h2>Secrets</h2>
+            <span id="secrets-count" class="count"></span>
+          </div>
+          <div class="card" id="secrets-card">
+            <div class="provider-strip">
+              <div class="provider-row">
+                <span class="provider-name">Infisical</span>
+                <span id="provider-infisical-state" class="provider-state"></span>
+                <div class="grow"></div>
+                <button type="button" id="provider-infisical-btn" class="secondary tiny">Set…</button>
+              </div>
+              <form id="provider-infisical-form" class="provider-form" autocomplete="off" hidden>
+                <input id="infisical-client-id" type="text" placeholder="machine identity client id" required aria-label="Infisical client id" spellcheck="false">
+                <input id="infisical-client-secret" type="password" placeholder="client secret" required aria-label="Infisical client secret" autocomplete="new-password">
+                <button type="submit" class="primary tiny">Save</button>
+                <button type="button" class="secondary tiny provider-cancel" data-provider="infisical">Cancel</button>
+                <span class="provider-error error" hidden></span>
+              </form>
+              <div class="provider-row">
+                <span class="provider-name">1Password</span>
+                <span id="provider-1password-state" class="provider-state"></span>
+                <div class="grow"></div>
+                <button type="button" id="provider-1password-btn" class="secondary tiny">Set…</button>
+              </div>
+              <form id="provider-1password-form" class="provider-form" autocomplete="off" hidden>
+                <input id="onepassword-token" type="password" placeholder="service-account token" required aria-label="1Password service-account token" autocomplete="new-password">
+                <button type="submit" class="primary tiny">Save</button>
+                <button type="button" class="secondary tiny provider-cancel" data-provider="1password">Cancel</button>
+                <span class="provider-error error" hidden></span>
+              </form>
+            </div>
+            <div id="secrets-empty" class="empty card-empty" hidden>No local secrets yet. Set one below, then reference it from a <code>[secrets.&lt;name&gt;] provider = "local"</code> block.</div>
+            <div class="table-scroll" id="secrets-table-wrap">
+              <table class="table" id="secrets-table">
+                <thead>
+                  <tr><th>Key</th><th>Used by</th><th class="col-mode">Status</th><th class="col-actions"></th></tr>
+                </thead>
+                <tbody id="secrets-body"></tbody>
+              </table>
+            </div>
+            <form id="secret-form" class="add-row" autocomplete="off">
+              <input id="secret-key" type="text" placeholder="GITHUB_TOKEN" required aria-label="Key" pattern="[A-Za-z_][A-Za-z0-9_]*" title="Letters, digits and _ — cannot start with a digit" spellcheck="false">
+              <span class="arrow" aria-hidden="true">=</span>
+              <input id="secret-value" type="password" placeholder="value — write-only, never shown again" required aria-label="Value" autocomplete="new-password">
+              <button type="submit" id="secret-submit">Set</button>
+            </form>
+            <p id="secret-error" class="error" hidden></p>
+          </div>
+        </section>
       </div>
 
       <aside class="inspector-rail">

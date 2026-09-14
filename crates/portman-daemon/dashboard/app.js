@@ -1200,6 +1200,163 @@ el('add-form').addEventListener('submit', async (ev) => {
   }
 });
 
+// --- Secrets ---------------------------------------------------------------
+// Names and presence only: the API never returns a value, and nothing here
+// ever renders one. The forms are static HTML so the 5s refresh cannot
+// clobber a half-typed value; only the listing re-renders.
+
+let secretsStatus = null;
+
+function renderSecrets() {
+  const s = secretsStatus;
+  // An older daemon has no /api/secrets — keep the section out of the way.
+  el('sec-secrets').hidden = !s;
+  if (!s) return;
+
+  renderProviderState('infisical', s.infisical_client_id
+    ? `configured · ${s.infisical_client_id}`
+    : null);
+  renderProviderState('1password', s.onepassword ? 'configured' : null);
+
+  const rows = s.local || [];
+  const missing = rows.filter(r => !r.set).length;
+  el('secrets-count').textContent = rows.length
+    ? `${rows.length}${missing ? ` · ${missing} missing` : ''}`
+    : '';
+  el('secrets-empty').hidden = rows.length > 0;
+  el('secrets-table-wrap').hidden = rows.length === 0;
+
+  const tbody = el('secrets-body');
+  tbody.innerHTML = '';
+  for (const r of rows) {
+    const usedBy = r.blocks.length
+      ? `<span class="chips">${r.blocks.map(b => `<span class="chip mono">[secrets.${esc(b)}]</span>`).join('')}</span>`
+      : '<span class="secret-unused">not referenced</span>';
+    const status = r.set
+      ? '<span class="badge set">set</span>'
+      : '<span class="badge missing" title="A synced config names this key but no value is stored — services using it will not start">missing</span>';
+    const actions = r.set
+      ? `<button type="button" class="secondary tiny replace-btn" data-key="${esc(r.key)}">Replace</button>
+         <button type="button" class="danger tiny remove-secret-btn" data-key="${esc(r.key)}" data-blocks="${esc(r.blocks.join(', '))}">Remove</button>`
+      : `<button type="button" class="primary tiny replace-btn" data-key="${esc(r.key)}">Set</button>`;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><span class="secret-key">${esc(r.key)}</span></td>
+      <td>${usedBy}</td>
+      <td class="col-mode">${status}</td>
+      <td class="col-actions"><span class="row-actions">${actions}</span></td>`;
+    tbody.appendChild(tr);
+  }
+
+  tbody.querySelectorAll('.replace-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      el('secret-key').value = btn.dataset.key;
+      updateSecretSubmitLabel();
+      el('secret-value').focus();
+    });
+  });
+  tbody.querySelectorAll('.remove-secret-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const key = btn.dataset.key;
+      const blocks = btn.dataset.blocks;
+      const warning = blocks
+        ? ` It is referenced by ${blocks}; services using it will fail to start until it is set again.`
+        : '';
+      if (!confirm(`Remove ${key} from the vault?${warning}`)) return;
+      try {
+        await api('/secrets/local/' + encodeURIComponent(key), { method: 'DELETE' });
+        refresh();
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+  });
+  updateSecretSubmitLabel();
+}
+
+function renderProviderState(provider, configured) {
+  const state = el(`provider-${provider}-state`);
+  state.textContent = configured || 'not configured';
+  state.className = 'provider-state' + (configured ? ' ok' : '');
+  el(`provider-${provider}-btn`).textContent = configured ? 'Replace…' : 'Set…';
+}
+
+function updateSecretSubmitLabel() {
+  const key = el('secret-key').value.trim();
+  const exists = (secretsStatus?.local || []).some(r => r.set && r.key === key);
+  el('secret-submit').textContent = exists ? 'Replace' : 'Set';
+}
+
+el('secret-key').addEventListener('input', updateSecretSubmitLabel);
+
+el('secret-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const errEl = el('secret-error');
+  errEl.hidden = true;
+  const key = el('secret-key').value.trim();
+  const submit = el('secret-submit');
+  submit.disabled = true;
+  try {
+    await api('/secrets/local/' + encodeURIComponent(key), {
+      method: 'PUT',
+      body: JSON.stringify({ value: el('secret-value').value }),
+    });
+    el('secret-key').value = '';
+    el('secret-value').value = '';
+    refresh();
+  } catch (err) {
+    errEl.textContent = err.message;
+    errEl.hidden = false;
+  }
+  submit.disabled = false;
+});
+
+function toggleProviderForm(provider, open) {
+  const form = el(`provider-${provider}-form`);
+  form.hidden = !open;
+  form.querySelector('.provider-error').hidden = true;
+  if (open) {
+    form.querySelector('input').focus();
+  } else {
+    form.querySelectorAll('input').forEach(i => { i.value = ''; });
+  }
+}
+
+for (const provider of ['infisical', '1password']) {
+  el(`provider-${provider}-btn`).addEventListener('click', () => {
+    toggleProviderForm(provider, el(`provider-${provider}-form`).hidden);
+  });
+}
+document.querySelectorAll('.provider-cancel').forEach(btn => {
+  btn.addEventListener('click', () => toggleProviderForm(btn.dataset.provider, false));
+});
+
+el('provider-infisical-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  submitProviderForm('infisical', {
+    client_id: el('infisical-client-id').value.trim(),
+    client_secret: el('infisical-client-secret').value,
+  });
+});
+el('provider-1password-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  submitProviderForm('1password', { token: el('onepassword-token').value });
+});
+
+async function submitProviderForm(provider, body) {
+  const form = el(`provider-${provider}-form`);
+  const errEl = form.querySelector('.provider-error');
+  errEl.hidden = true;
+  try {
+    await api(`/secrets/${provider}`, { method: 'POST', body: JSON.stringify(body) });
+    toggleProviderForm(provider, false);
+    refresh();
+  } catch (err) {
+    errEl.textContent = err.message;
+    errEl.hidden = false;
+  }
+}
+
 // --- Status / footer -------------------------------------------------------
 
 function renderStatus(status) {
@@ -1248,14 +1405,16 @@ async function refresh() {
   resetAlerts();
   try {
     const status = await api('/status');
-    const [entriesRes, tldsRes, resourcesRes, servicesRes, historyRes, certsRes] = await Promise.all([
+    const [entriesRes, tldsRes, resourcesRes, servicesRes, historyRes, certsRes, secretsRes] = await Promise.all([
       api('/entries'),
       api('/tlds'),
       api('/resources').catch(() => ({ snapshot: {} })),
       api('/services').catch(() => ({ services: [] })),
       api('/resources/history').catch(() => ({ series: [] })),
       api('/certs').catch(() => null),
+      api('/secrets').catch(() => null),
     ]);
+    secretsStatus = secretsRes;
     allEntries = entriesRes.entries || [];
     allTlds = tldsRes.tlds || [];
     services = (servicesRes.services || []).sort((a, b) => a.name.localeCompare(b.name));
@@ -1288,6 +1447,7 @@ async function refresh() {
     renderContainers();
     renderInspector();
     renderRoutes();
+    renderSecrets();
     renderFooter(allTlds, certsRes);
   } catch (err) {
     renderStatus(null);
