@@ -258,12 +258,29 @@ esac
         );
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // Pre-warm: syspolicyd assesses fresh scripts on first exec.
-        let _ = std::process::Command::new(&path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        warm_exec(&path);
         path
+    }
+
+    /// Exec a freshly written script once before the code under test does.
+    /// Two reasons: macOS syspolicyd assesses fresh scripts on first exec,
+    /// and on Linux a concurrent test's `fork` can inherit this script's
+    /// write fd for the instant before its `exec`, making our exec fail
+    /// with ETXTBSY. Retrying here absorbs that window so the real spawn
+    /// under test never sees it.
+    fn warm_exec(path: &Path) {
+        for _ in 0..100 {
+            match std::process::Command::new(path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+            {
+                Err(e) if e.raw_os_error() == Some(nix::errno::Errno::ETXTBSY as i32) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                _ => return,
+            }
+        }
     }
 
     fn invocations(dir: &Path) -> Vec<String> {
@@ -344,10 +361,7 @@ esac
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::process::Command::new(&path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        warm_exec(&path);
 
         let refs = BTreeMap::from([("K".to_string(), "op://v/i/f".to_string())]);
         let err = resolve_with(&path, &refs, &creds()).await.unwrap_err();
