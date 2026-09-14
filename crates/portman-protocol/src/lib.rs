@@ -310,6 +310,21 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<Redacted>,
     },
+    /// Set (or replace) one value in the daemon's local secrets vault — the
+    /// store `[secrets.<name>] provider = "local"` blocks read from. Written
+    /// 0600 with the provider credentials. Values are write-only: nothing
+    /// ever returns them over IPC.
+    SetLocalSecret {
+        key: String,
+        value: Redacted,
+    },
+    /// Remove one value from the local vault.
+    UnsetLocalSecret {
+        key: String,
+    },
+    /// Which providers have credentials and which local keys exist or are
+    /// referenced — names and flags only, never values.
+    SecretsStatus,
 }
 
 /// A secret value whose `Debug` rendering is always `<redacted>` — the IPC
@@ -443,9 +458,34 @@ pub enum Response {
         #[serde(default)]
         last_id: i64,
     },
+    /// Answer to `SecretsStatus`. Names and presence only — no value, token
+    /// or client secret ever travels in this response.
+    SecretsStatus {
+        /// Client id of the stored Infisical machine identity, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        infisical_client_id: Option<String>,
+        /// Whether a 1Password service-account token is stored.
+        #[serde(default)]
+        onepassword: bool,
+        /// Every local vault key, plus every key a synced `local` block
+        /// references — so a referenced-but-unset key is visible.
+        #[serde(default)]
+        local: Vec<LocalSecretInfo>,
+    },
     Err {
         message: String,
     },
+}
+
+/// One row of the local vault listing: a key, whether a value is stored for
+/// it, and which `[secrets.<name>] provider = "local"` blocks name it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalSecretInfo {
+    pub key: String,
+    /// `false` when a synced block references the key but no value is set.
+    pub set: bool,
+    #[serde(default)]
+    pub blocks: Vec<String>,
 }
 
 /// One row of the supervised-service status list.
@@ -995,6 +1035,13 @@ pub enum SecretsProviderConfig {
         /// Env key → `op://vault/item/field` reference.
         refs: std::collections::BTreeMap<String, String>,
     },
+    /// The daemon's own vault (`portman secrets set KEY`). The block names
+    /// exactly which keys a service or egress route may take, so a vault
+    /// shared by every repo on the machine still yields hermetic envs.
+    Local {
+        /// Env keys to pull, in order. Non-empty, validated at config load.
+        keys: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1315,6 +1362,52 @@ mod tests {
                 assert!(egress["github"].spec.tls);
             }
             other => panic!("expected sync_services, got {other:?}"),
+        }
+    }
+
+    /// The local provider tags as `"local"` on the wire and carries its key
+    /// allowlist; the vault requests keep their values `Redacted` in Debug
+    /// while serializing as plain strings.
+    #[test]
+    fn local_secrets_wire_shapes() {
+        let block = SecretsProviderConfig::Local {
+            keys: vec!["GITHUB_TOKEN".into()],
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        assert_eq!(json, r#"{"provider":"local","keys":["GITHUB_TOKEN"]}"#);
+        assert_eq!(
+            serde_json::from_str::<SecretsProviderConfig>(&json).unwrap(),
+            block
+        );
+
+        let set = Request::SetLocalSecret {
+            key: "GITHUB_TOKEN".into(),
+            value: Redacted("ghp_secret".into()),
+        };
+        assert!(!format!("{set:?}").contains("ghp_secret"));
+        let json = serde_json::to_string(&set).unwrap();
+        assert!(json.contains(r#""value":"ghp_secret""#));
+        assert!(matches!(
+            serde_json::from_str::<Request>(&json).unwrap(),
+            Request::SetLocalSecret { key, value } if key == "GITHUB_TOKEN" && value.0 == "ghp_secret"
+        ));
+
+        let status = Response::SecretsStatus {
+            infisical_client_id: Some("machine-id".into()),
+            onepassword: false,
+            local: vec![LocalSecretInfo {
+                key: "GITHUB_TOKEN".into(),
+                set: false,
+                blocks: vec!["mine".into()],
+            }],
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::SecretsStatus { local, .. } => {
+                assert_eq!(local[0].blocks, vec!["mine".to_string()]);
+                assert!(!local[0].set);
+            }
+            other => panic!("expected secrets_status, got {other:?}"),
         }
     }
 
