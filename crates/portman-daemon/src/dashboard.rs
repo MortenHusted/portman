@@ -237,6 +237,59 @@ async fn handle_connection(mut stream: TcpStream, state: DaemonState) -> Result<
             )
             .await
         }
+        // Secrets are write-only over this API: the status lists names and
+        // presence, the writes take a value and answer Ok. Nothing here (or
+        // in the IPC layer it maps onto) ever returns a value.
+        ("GET", "/api/secrets") => {
+            api_json(
+                stream,
+                handlers::dispatch(Request::SecretsStatus, &state).await,
+            )
+            .await
+        }
+        ("PUT", path) if path.starts_with("/api/secrets/local/") => {
+            let key = urlencoding_path_segment(&path["/api/secrets/local/".len()..]);
+            handle_set_local_secret(stream, state, key, body).await
+        }
+        ("DELETE", path) if path.starts_with("/api/secrets/local/") => {
+            let key = urlencoding_path_segment(&path["/api/secrets/local/".len()..]);
+            api_json(
+                stream,
+                handlers::dispatch(Request::UnsetLocalSecret { key }, &state).await,
+            )
+            .await
+        }
+        // Daemon-global blocks: the body is the block's provider config in
+        // its wire shape (`{"provider":"local","keys":[...]}` etc.).
+        ("PUT", path) if path.starts_with("/api/secrets/blocks/") => {
+            let name = urlencoding_path_segment(&path["/api/secrets/blocks/".len()..]);
+            let config: portman_protocol::SecretsProviderConfig = match serde_json::from_slice(body)
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    return api_json(stream, err_response(&format!("invalid block: {err}"))).await;
+                }
+            };
+            api_json(
+                stream,
+                handlers::dispatch(Request::SetSecretsBlock { name, config }, &state).await,
+            )
+            .await
+        }
+        ("DELETE", path) if path.starts_with("/api/secrets/blocks/") => {
+            let name = urlencoding_path_segment(&path["/api/secrets/blocks/".len()..]);
+            api_json(
+                stream,
+                handlers::dispatch(Request::RemoveSecretsBlock { name }, &state).await,
+            )
+            .await
+        }
+        ("POST", "/api/secrets/infisical") => {
+            handle_set_provider_credentials(stream, state, "infisical", body).await
+        }
+        ("POST", "/api/secrets/1password") => {
+            handle_set_provider_credentials(stream, state, "1password", body).await
+        }
         _ => write_response(stream, 404, "text/plain", b"Not Found").await,
     }
 }
@@ -517,6 +570,79 @@ async fn handle_add_static(stream: TcpStream, state: DaemonState, body: &[u8]) -
                 mode,
                 service: parsed.service.filter(|s| !s.trim().is_empty()),
                 project: None,
+            },
+            &state,
+        )
+        .await,
+    )
+    .await
+}
+
+/// `PUT /api/secrets/local/<KEY>` with `{"value": "…"}`. The value lands in
+/// a [`Redacted`](portman_protocol::Redacted) straight out of the JSON so no
+/// Debug rendering on the way to the store can print it.
+async fn handle_set_local_secret(
+    stream: TcpStream,
+    state: DaemonState,
+    key: String,
+    body: &[u8],
+) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct SetBody {
+        value: portman_protocol::Redacted,
+    }
+    let parsed: SetBody = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(err) => {
+            return api_json(stream, err_response(&format!("invalid JSON: {err}"))).await;
+        }
+    };
+    api_json(
+        stream,
+        handlers::dispatch(
+            Request::SetLocalSecret {
+                key,
+                value: parsed.value,
+            },
+            &state,
+        )
+        .await,
+    )
+    .await
+}
+
+/// `POST /api/secrets/{infisical,1password}` — the dashboard form of
+/// `portman secrets set-infisical` / `set-op`. Body fields are optional so
+/// the daemon-side handler can name what is missing.
+async fn handle_set_provider_credentials(
+    stream: TcpStream,
+    state: DaemonState,
+    provider: &str,
+    body: &[u8],
+) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct CredentialsBody {
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        client_secret: Option<portman_protocol::Redacted>,
+        #[serde(default)]
+        token: Option<portman_protocol::Redacted>,
+    }
+    let parsed: CredentialsBody = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(err) => {
+            return api_json(stream, err_response(&format!("invalid JSON: {err}"))).await;
+        }
+    };
+    api_json(
+        stream,
+        handlers::dispatch(
+            Request::SetSecretsCredentials {
+                provider: provider.to_string(),
+                client_id: parsed.client_id,
+                client_secret: parsed.client_secret,
+                token: parsed.token,
             },
             &state,
         )

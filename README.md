@@ -100,7 +100,7 @@ Local-dev networking needs privileges. Here is exactly what portman takes and wh
 - TLD registration is opt-in per TLD. A container label under an unmanaged TLD is ignored with a warning rather than silently reshaping your DNS. `.localhost` is the exception: the operating system already resolves it to loopback, so HTTP routes such as `app.localhost` need no resolver install.
 - The IPC socket (`portman.sock`) is mode 0660 and peer-credential-gated to root and the owning user. The dashboard binds loopback only and validates Host/Origin.
 - The dashboard's `/api/*` routes require a bearer token (0600 in the daemon's data dir, owned by your login user). Loopback keeps the network out, not other local processes, and those routes read captured logs and write repo config. `portman dashboard` passes the token to the browser; scripts send `Authorization: Bearer $(cat …/dashboard-token)`. `--dashboard-auth=false` turns it off for development.
-- Secrets never live in repo config. `portman.toml` carries provider coordinates only; machine credentials (Infisical universal-auth, 1Password service accounts) are stored 0600 in the daemon's data dir, written via `portman secrets set-*` reading from stdin.
+- Secrets never live in repo config. `portman.toml` carries provider coordinates only; machine credentials (Infisical universal-auth, 1Password service accounts) and the local vault (`portman secrets set KEY`) are stored 0600 in the daemon's data dir, written from stdin or the dashboard's Secrets panel. Values are write-only: no IPC request, API route, or page ever returns one — listings show key names, whether a value is set, and which `[secrets.*]` blocks reference it.
 - Values portman hands a service are masked in that service's captured output before it is stored, so the log store never becomes a second copy of a secret. Exact-value matching, so a value the service transforms before printing is not caught.
 - Optionally, `scripts/setup-sudoers.sh` installs a narrow NOPASSWD sudoers fragment so `portman install` runs unattended. Read it before installing it; nothing requires it.
 
@@ -152,7 +152,7 @@ mode = "tcp"
 #   portman secrets set-infisical --client-id <id>     # secret read from stdin
 #   portman secrets set-op                             # token read from stdin
 [secrets.myapp]
-provider = "infisical"                       # or "1password" with a `refs` table
+provider = "infisical"                       # "1password" with a `refs` table, or "local"
 url = "https://secrets.example.com"          # self-hosted or cloud
 project_id = "…"
 environment = "dev"
@@ -160,11 +160,24 @@ paths = ["/apps/myapp", "/shared"]           # first path wins on duplicate keys
 # api_version = "v4"                         # default "v3" (works on self-hosted)
 # mode = "cli"                               # fall back to `infisical export`
 
+# The local vault — values portman keeps itself, set once per machine with
+# `portman secrets set GITHUB_TOKEN` (value from stdin) or in the dashboard's
+# Secrets panel. A block names exactly which keys it yields, so a vault shared
+# by every repo still produces hermetic envs. `portman secrets list` shows
+# which keys are set and which a synced block references but nobody has set.
+[secrets.mine]
+provider = "local"
+keys = ["GITHUB_TOKEN", "OPENROUTER_API_KEY"]
+
 # [secrets.op]
 # provider = "1password"
 # [secrets.op.refs]
 # API_KEY = "op://vault/item/field"          # resolved via `op` + service-account token
 ```
+
+`[secrets.<name>]` blocks are referenced by name from a service's `secrets = [...]` (values land in its env) and from an `[egress.<name>]` route (one key is attached as a request header). A block does not have to live in the repo: the dashboard's **Secrets** page defines daemon-global blocks (local key allowlists, 1Password `op://` mappings, Infisical coordinates) that every repo can reference by name, so a mapping used by three repos is declared once. Block names are global like service names — a repo block and a global block with the same name are refused at `portman up`. For a `local` block, an egress `key` must be in the block's `keys`; that is checked when the config loads if the block is in the same file, otherwise at `portman up`, and never as late as proxy time.
+
+The dashboard has two pages: **Overview** (services, containers, routes, inspector) and **Secrets** (blocks, provider credentials, the local vault). `portman secrets list` prints the same picture in the terminal.
 
 ### Authenticated egress (`[egress.<name>]`)
 

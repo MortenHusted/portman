@@ -50,6 +50,11 @@ struct Credentials {
     infisical: Option<InfisicalCredentials>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     onepassword: Option<OnePasswordCredentials>,
+    /// The local vault: values `[secrets.<name>] provider = "local"` blocks
+    /// hand out, keyed by env name. Same file, same 0600 writer as the
+    /// provider credentials — one place on disk that holds secret material.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    local: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -101,6 +106,52 @@ impl CredentialsStore {
             .expect("credentials lock poisoned")
             .onepassword
             .clone()
+    }
+
+    /// Set or replace one vault value. The key is validated by the caller
+    /// (`validate_env_key`), so the vault only ever holds keys a block could
+    /// reference.
+    pub(crate) fn set_local(&self, key: String, value: String) -> Result<()> {
+        let mut guard = self.state.lock().expect("credentials lock poisoned");
+        guard.local.insert(key, value);
+        save(&self.path, &guard)
+    }
+
+    /// Remove one vault value; `Ok(false)` when there was none.
+    pub(crate) fn unset_local(&self, key: &str) -> Result<bool> {
+        let mut guard = self.state.lock().expect("credentials lock poisoned");
+        if guard.local.remove(key).is_none() {
+            return Ok(false);
+        }
+        save(&self.path, &guard)?;
+        Ok(true)
+    }
+
+    /// Every vault key, sorted. Names only — the listing surfaces never see
+    /// values.
+    pub(crate) fn local_keys(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("credentials lock poisoned")
+            .local
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// The vault values for a block's allowlist, in the block's order. The
+    /// first key without a value fails the whole block: a service that
+    /// declared it needs a key must not start without it.
+    pub(crate) fn local_values(&self, keys: &[String]) -> Result<Vec<(String, String)>, String> {
+        let guard = self.state.lock().expect("credentials lock poisoned");
+        keys.iter()
+            .map(|key| match guard.local.get(key) {
+                Some(value) => Ok((key.clone(), value.clone())),
+                None => Err(format!(
+                    "local secret `{key}` is not set — run `portman secrets set {key}`"
+                )),
+            })
+            .collect()
     }
 }
 
@@ -197,6 +248,16 @@ impl SecretsSource for ProviderSecretsSource {
             return Ok(cached.clone());
         }
         let fetched = match config {
+            // The vault is in memory and its values are set by hand (CLI or
+            // dashboard) — a freshly set value should reach the next spawn
+            // and the next egress request without waiting for a `portman
+            // up`, so local blocks never enter the per-run cache.
+            SecretsProviderConfig::Local { keys } => {
+                return self
+                    .credentials
+                    .local_values(keys)
+                    .map_err(SecretsError::fatal);
+            }
             SecretsProviderConfig::Infisical { .. } => {
                 let creds = self.credentials.infisical().ok_or_else(|| {
                     SecretsError::fatal(
@@ -252,6 +313,9 @@ mod tests {
             .set_infisical("machine-id".into(), "machine-secret".into())
             .unwrap();
         store.set_onepassword("op-token".into()).unwrap();
+        store
+            .set_local("GITHUB_TOKEN".into(), "ghp_value".into())
+            .unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "credentials must be owner-only");
@@ -263,6 +327,56 @@ mod tests {
             "machine-secret"
         );
         assert_eq!(reloaded.onepassword().unwrap().token, "op-token");
+        assert_eq!(reloaded.local_keys(), vec!["GITHUB_TOKEN".to_string()]);
+        assert!(reloaded.unset_local("GITHUB_TOKEN").unwrap());
+        assert!(!reloaded.unset_local("GITHUB_TOKEN").unwrap());
+        assert!(reloaded.local_keys().is_empty());
+    }
+
+    /// A local block yields its keys in declared order straight from the
+    /// vault: a value set after the first resolve is visible on the next one
+    /// (no per-run cache), and a missing key fails the block fatally — a
+    /// restart cannot fix an unset value, so no backoff retry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_block_reads_vault_live_and_fails_fatally_on_missing_key() {
+        use crate::supervisor::SecretsSource as _;
+
+        let dir = tempdir().unwrap();
+        let store = CredentialsStore::load(dir.path().join("credentials.json")).unwrap();
+        let source = ProviderSecretsSource::new(store.clone());
+        let config = SecretsProviderConfig::Local {
+            keys: vec!["B_KEY".into(), "A_KEY".into()],
+        };
+
+        let err = source.resolve_block("mine", &config).await.unwrap_err();
+        assert!(!err.transient, "{}", err.message);
+        assert!(
+            err.message.contains("`B_KEY` is not set"),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("portman secrets set B_KEY"),
+            "{}",
+            err.message
+        );
+
+        store.set_local("A_KEY".into(), "a".into()).unwrap();
+        store.set_local("B_KEY".into(), "b".into()).unwrap();
+        assert_eq!(
+            source.resolve_block("mine", &config).await.unwrap(),
+            vec![
+                ("B_KEY".to_string(), "b".to_string()),
+                ("A_KEY".to_string(), "a".to_string())
+            ]
+        );
+
+        store.set_local("B_KEY".into(), "b2".into()).unwrap();
+        assert_eq!(
+            source.resolve_block("mine", &config).await.unwrap()[0].1,
+            "b2",
+            "a vault write must be visible without invalidate()"
+        );
     }
 
     /// The per-run value cache: a second resolve reuses the fetched block

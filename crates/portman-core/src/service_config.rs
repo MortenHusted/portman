@@ -310,6 +310,8 @@ struct RawSecrets {
     mode: Option<InfisicalMode>,
     // 1password
     refs: Option<BTreeMap<String, String>>,
+    // local
+    keys: Option<Vec<String>>,
 }
 
 /// One `[egress.<name>]` block: a local hostname the proxy answers, the
@@ -358,6 +360,8 @@ fn resolve(root: &Path, raw: RawConfig) -> Result<ServiceConfig> {
         .map(|(name, block)| {
             let resolved =
                 resolve_secrets(&name, block).with_context(|| format!("in [secrets.{name}]"))?;
+            validate_secrets_block(&name, &resolved)
+                .with_context(|| format!("in [secrets.{name}]"))?;
             Ok((name, resolved))
         })
         .collect::<Result<_>>()?;
@@ -546,8 +550,10 @@ fn validate_group_tag(tag: &str) -> Result<()> {
 fn resolve_secrets(name: &str, raw: RawSecrets) -> Result<SecretsProviderConfig> {
     match raw.provider.as_str() {
         "infisical" => {
-            if raw.refs.is_some() {
-                bail!("`refs` is not valid for provider `infisical`");
+            for (field, set) in [("refs", raw.refs.is_some()), ("keys", raw.keys.is_some())] {
+                if set {
+                    bail!("`{field}` is not valid for provider `infisical`");
+                }
             }
             Ok(SecretsProviderConfig::Infisical {
                 url: raw
@@ -574,6 +580,7 @@ fn resolve_secrets(name: &str, raw: RawSecrets) -> Result<SecretsProviderConfig>
                 ("paths", raw.paths.is_some()),
                 ("api_version", raw.api_version.is_some()),
                 ("mode", raw.mode.is_some()),
+                ("keys", raw.keys.is_some()),
             ] {
                 if set {
                     bail!("`{field}` is not valid for provider `1password`");
@@ -582,21 +589,127 @@ fn resolve_secrets(name: &str, raw: RawSecrets) -> Result<SecretsProviderConfig>
             let refs = raw
                 .refs
                 .with_context(|| format!("[secrets.{name}] requires `refs`"))?;
-            for (key, reference) in &refs {
+            Ok(SecretsProviderConfig::OnePassword { refs })
+        }
+        "local" => {
+            for (field, set) in [
+                ("url", raw.url.is_some()),
+                ("project_id", raw.project_id.is_some()),
+                ("environment", raw.environment.is_some()),
+                ("paths", raw.paths.is_some()),
+                ("api_version", raw.api_version.is_some()),
+                ("mode", raw.mode.is_some()),
+                ("refs", raw.refs.is_some()),
+            ] {
+                if set {
+                    bail!("`{field}` is not valid for provider `local`");
+                }
+            }
+            let keys = raw
+                .keys
+                .with_context(|| format!("[secrets.{name}] requires `keys`"))?;
+            Ok(SecretsProviderConfig::Local { keys })
+        }
+        other => bail!(
+            "unknown secrets provider `{other}` (expected `infisical`, `1password`, or `local`)"
+        ),
+    }
+}
+
+/// The rules a `[secrets.<name>]` block must satisfy whether it comes from
+/// a repo config or is defined in the dashboard as a daemon-global block —
+/// one definition so both paths refuse the same things.
+pub fn validate_secrets_block(name: &str, config: &SecretsProviderConfig) -> Result<()> {
+    validate_name("secrets block", name)?;
+    match config {
+        SecretsProviderConfig::Infisical {
+            url,
+            project_id,
+            environment,
+            paths,
+            ..
+        } => {
+            for (field, value) in [
+                ("url", url),
+                ("project_id", project_id),
+                ("environment", environment),
+            ] {
+                if value.trim().is_empty() {
+                    bail!("`{field}` cannot be empty");
+                }
+            }
+            if paths.is_empty() || paths.iter().any(|p| p.trim().is_empty()) {
+                bail!("`paths` must name at least one non-empty path");
+            }
+        }
+        SecretsProviderConfig::OnePassword { refs } => {
+            if refs.is_empty() {
+                bail!("`refs` must map at least one key");
+            }
+            for (key, reference) in refs {
+                validate_env_key(key)?;
                 if !reference.starts_with("op://") {
                     bail!("refs.{key} must be an op:// reference, got `{reference}`");
                 }
             }
-            Ok(SecretsProviderConfig::OnePassword { refs })
         }
-        other => bail!("unknown secrets provider `{other}` (expected `infisical` or `1password`)"),
+        SecretsProviderConfig::Local { keys } => {
+            if keys.is_empty() {
+                bail!("`keys` must name at least one key");
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for key in keys {
+                validate_env_key(key)?;
+                if !seen.insert(key.as_str()) {
+                    bail!("`keys` lists `{key}` twice");
+                }
+            }
+        }
     }
+    Ok(())
 }
 
-/// Validate and resolve one `[egress.<name>]` block. The referenced
-/// secrets block must exist in the same config — an egress route naming a
-/// block that isn't synced would fail only at proxy time, and "looks fine
-/// until it doesn't" is exactly what config validation exists to remove.
+/// An environment variable name as every shell and runtime agrees on it:
+/// `[A-Za-z_][A-Za-z0-9_]*`. Shared by the `local` block's `keys` and the
+/// daemon's `portman secrets set KEY` so the vault can only hold keys a
+/// block could reference.
+pub fn validate_env_key(key: &str) -> Result<()> {
+    let mut chars = key.chars();
+    let valid = match chars.next() {
+        Some(first) if first == '_' || first.is_ascii_alphabetic() => {
+            chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        }
+        _ => false,
+    };
+    if !valid {
+        bail!(
+            "`{key}` is not a valid env key (letters, digits, and `_`; cannot start with a digit)"
+        );
+    }
+    Ok(())
+}
+
+/// A local block declares exactly which keys it yields, so an egress `key`
+/// outside that list can never resolve. Shared by config load (block in the
+/// same file) and the daemon's sync (block declared elsewhere).
+pub fn egress_key_allowed(
+    block_name: &str,
+    block: &SecretsProviderConfig,
+    key: &str,
+) -> Result<()> {
+    if let SecretsProviderConfig::Local { keys } = block {
+        if !keys.iter().any(|k| k == key) {
+            bail!("`key = \"{key}\"` is not in [secrets.{block_name}]'s `keys`");
+        }
+    }
+    Ok(())
+}
+
+/// Validate and resolve one `[egress.<name>]` block. A referenced secrets
+/// block declared in the same config is checked here; one that isn't (a
+/// daemon-global block) is checked at sync — either way before proxy time,
+/// and "looks fine until it doesn't" is exactly what validation exists to
+/// remove.
 fn resolve_egress(
     name: &str,
     raw: RawEgress,
@@ -608,11 +721,15 @@ fn resolve_egress(
     }
     let target =
         validate_target(&raw.target).with_context(|| format!("`target` in [egress.{name}]"))?;
-    if !secrets.contains_key(&raw.secrets) {
-        bail!("references [secrets.{}] which does not exist", raw.secrets);
-    }
     if raw.key.trim().is_empty() {
         bail!("`key` cannot be empty");
+    }
+    // The block may be declared here or be a daemon-global one the dashboard
+    // defined; a name this file doesn't declare is checked at sync, where
+    // the daemon knows both sets. When it IS declared here, refuse a local
+    // `key` outside the block's allowlist now rather than at proxy time.
+    if let Some(block) = secrets.get(&raw.secrets) {
+        egress_key_allowed(&raw.secrets, block, &raw.key)?;
     }
     if !raw.format.contains("{value}") {
         bail!("`format` must contain the `{{value}}` placeholder");
@@ -690,20 +807,24 @@ fn is_loopback_host(host: &str) -> bool {
 /// Egress route names appear in the same places service names do — same
 /// boring charset.
 fn validate_egress_name(name: &str) -> Result<()> {
-    validate_service_name(name)
+    validate_name("egress route name", name)
 }
 
 /// Service names appear in CLI args, log queries, and dashboard URL paths —
 /// keep the charset boring.
 fn validate_service_name(name: &str) -> Result<()> {
+    validate_name("service name", name)
+}
+
+fn validate_name(kind: &str, name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 {
-        bail!("service name `{name}` must be 1-64 characters");
+        bail!("{kind} `{name}` must be 1-64 characters");
     }
     if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
     {
-        bail!("service name `{name}` may only contain letters, digits, and . _ -");
+        bail!("{kind} `{name}` may only contain letters, digits, and . _ -");
     }
     Ok(())
 }
@@ -1720,11 +1841,11 @@ mod tests {
         assert!(!local.spec.tls);
     }
 
-    /// An egress route naming a secrets block that isn't in the config
-    /// fails at load time with the block named — not at proxy time with a
-    /// 502 the user then has to chase.
+    /// A block the file doesn't declare may be a daemon-global one, so load
+    /// accepts the reference and leaves existence to sync. (The daemon's
+    /// sync test pins the refusal there.)
     #[test]
-    fn egress_referencing_missing_secrets_block_rejected() {
+    fn egress_referencing_undeclared_secrets_block_loads() {
         let dir = tempdir().unwrap();
         write_config(
             dir.path(),
@@ -1733,13 +1854,157 @@ mod tests {
             [egress.github]
             host = "github.api.test"
             target = "api.github.com:443"
-            secrets = "nope"
+            secrets = "global"
             key = "TOKEN"
+            tls = true
+            "#,
+        );
+        let cfg = load(dir.path()).unwrap();
+        assert_eq!(cfg.egress["github"].spec.secrets, "global");
+    }
+
+    /// The same rules apply to a block whether a repo declares it or the
+    /// dashboard defines it globally.
+    #[test]
+    fn validate_secrets_block_covers_every_provider() {
+        use std::collections::BTreeMap;
+        let ok = |name: &str, c: &SecretsProviderConfig| validate_secrets_block(name, c).is_ok();
+        let err = |name: &str, c: &SecretsProviderConfig| {
+            format!("{:?}", validate_secrets_block(name, c).unwrap_err())
+        };
+        let local = SecretsProviderConfig::Local {
+            keys: vec!["A".into()],
+        };
+        assert!(ok("mine", &local));
+        assert!(err("bad name", &local).contains("secrets block `bad name`"));
+        assert!(err("mine", &SecretsProviderConfig::Local { keys: vec![] })
+            .contains("at least one key"));
+
+        let op = |refs: &[(&str, &str)]| SecretsProviderConfig::OnePassword {
+            refs: refs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>(),
+        };
+        assert!(ok("op", &op(&[("TOKEN", "op://v/i/f")])));
+        assert!(err("op", &op(&[])).contains("at least one key"));
+        assert!(err("op", &op(&[("TOKEN", "vault/item")])).contains("op:// reference"));
+        assert!(err("op", &op(&[("1BAD", "op://v/i/f")])).contains("not a valid env key"));
+
+        let infisical = |url: &str, paths: &[&str]| SecretsProviderConfig::Infisical {
+            url: url.into(),
+            project_id: "p".into(),
+            environment: "dev".into(),
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+            api_version: Default::default(),
+            mode: Default::default(),
+        };
+        assert!(ok(
+            "inf",
+            &infisical("https://secrets.example.com", &["/shared"])
+        ));
+        assert!(err("inf", &infisical("", &["/shared"])).contains("`url` cannot be empty"));
+        assert!(err("inf", &infisical("https://x", &[])).contains("`paths`"));
+    }
+
+    /// A `local` block is a key allowlist over the daemon's vault; it parses
+    /// to exactly that, in declared order, and an egress route may name only
+    /// a key the block lists.
+    #[test]
+    fn local_secrets_block_resolves_and_gates_egress_key() {
+        let dir = tempdir().unwrap();
+        write_config(
+            dir.path(),
+            CONFIG_FILE,
+            r#"
+            [secrets.mine]
+            provider = "local"
+            keys = ["GITHUB_TOKEN", "OPENROUTER_API_KEY"]
+
+            [service.web]
+            run = "bin/server"
+            secrets = ["mine"]
+
+            [egress.github]
+            host = "github.api.test"
+            target = "api.github.com:443"
+            secrets = "mine"
+            key = "GITHUB_TOKEN"
+            tls = true
+            "#,
+        );
+        let cfg = load(dir.path()).unwrap();
+        assert_eq!(
+            cfg.secrets["mine"],
+            SecretsProviderConfig::Local {
+                keys: vec!["GITHUB_TOKEN".into(), "OPENROUTER_API_KEY".into()],
+            }
+        );
+        assert_eq!(cfg.egress["github"].spec.key, "GITHUB_TOKEN");
+
+        write_config(
+            dir.path(),
+            CONFIG_FILE,
+            r#"
+            [secrets.mine]
+            provider = "local"
+            keys = ["GITHUB_TOKEN"]
+
+            [egress.github]
+            host = "github.api.test"
+            target = "api.github.com:443"
+            secrets = "mine"
+            key = "OTHER_TOKEN"
+            tls = true
             "#,
         );
         let err = format!("{:?}", load(dir.path()).unwrap_err());
-        assert!(err.contains("[secrets.nope]"), "{err}");
-        assert!(err.contains("does not exist"), "{err}");
+        assert!(err.contains("`key = \"OTHER_TOKEN\"`"), "{err}");
+        assert!(err.contains("[secrets.mine]"), "{err}");
+    }
+
+    /// The allowlist is strict: it must exist, be non-empty, hold valid env
+    /// names, and not repeat a key; provider-specific fields of the other
+    /// providers are refused on a local block and `keys` is refused on them.
+    #[test]
+    fn local_secrets_block_validation() {
+        let dir = tempdir().unwrap();
+        let cases: &[(&str, &str)] = &[
+            ("[secrets.mine]\nprovider = \"local\"\n", "requires `keys`"),
+            (
+                "[secrets.mine]\nprovider = \"local\"\nkeys = []\n",
+                "at least one key",
+            ),
+            (
+                "[secrets.mine]\nprovider = \"local\"\nkeys = [\"1BAD\"]\n",
+                "`1BAD` is not a valid env key",
+            ),
+            (
+                "[secrets.mine]\nprovider = \"local\"\nkeys = [\"A-B\"]\n",
+                "`A-B` is not a valid env key",
+            ),
+            (
+                "[secrets.mine]\nprovider = \"local\"\nkeys = [\"A\", \"A\"]\n",
+                "lists `A` twice",
+            ),
+            (
+                "[secrets.mine]\nprovider = \"local\"\nkeys = [\"A\"]\nurl = \"https://x\"\n",
+                "`url` is not valid for provider `local`",
+            ),
+            (
+                "[secrets.mine]\nprovider = \"1password\"\nkeys = [\"A\"]\n[secrets.mine.refs]\nA = \"op://v/i/f\"\n",
+                "`keys` is not valid for provider `1password`",
+            ),
+            (
+                "[secrets.mine]\nprovider = \"infisical\"\nkeys = [\"A\"]\nurl = \"https://x\"\nproject_id = \"p\"\nenvironment = \"dev\"\npaths = [\"/\"]\n",
+                "`keys` is not valid for provider `infisical`",
+            ),
+        ];
+        for (toml, expected) in cases {
+            write_config(dir.path(), CONFIG_FILE, toml);
+            let err = format!("{:?}", load(dir.path()).unwrap_err());
+            assert!(err.contains(expected), "{toml}\n→ {err}");
+        }
     }
 
     /// Strict parsing: a typo'd field names the key; a missing required
