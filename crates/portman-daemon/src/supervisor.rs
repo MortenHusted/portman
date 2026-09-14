@@ -1021,6 +1021,22 @@ impl Supervisor {
         roots
     }
 
+    /// Which synced `provider = "local"` blocks name each vault key
+    /// (key → block names), so a listing can show a key's consumers and a
+    /// referenced-but-unset key.
+    pub(crate) fn local_key_usage(&self) -> BTreeMap<String, Vec<String>> {
+        let blocks = self.inner.secrets.lock().expect("secrets lock poisoned");
+        let mut usage: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (name, block) in blocks.iter() {
+            if let SecretsProviderConfig::Local { keys } = &block.config {
+                for key in keys {
+                    usage.entry(key.clone()).or_default().push(name.clone());
+                }
+            }
+        }
+        usage
+    }
+
     pub(crate) fn status(&self) -> Vec<ServiceStatus> {
         let slots = self.inner.slots.lock().expect("slots lock poisoned");
         slots

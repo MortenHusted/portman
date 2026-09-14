@@ -53,6 +53,71 @@ pub(crate) async fn dispatch(request: Request, state: &DaemonState) -> Response 
             client_secret,
             token,
         } => handle_set_secrets_credentials(state, provider, client_id, client_secret, token),
+        Request::SetLocalSecret { key, value } => handle_set_local_secret(state, key, value),
+        Request::UnsetLocalSecret { key } => handle_unset_local_secret(state, key),
+        Request::SecretsStatus => handle_secrets_status(state),
+    }
+}
+
+fn handle_set_local_secret(
+    state: &DaemonState,
+    key: String,
+    value: portman_protocol::Redacted,
+) -> Response {
+    let key = key.trim().to_string();
+    if let Err(e) = portman_core::service_config::validate_env_key(&key) {
+        return err(e.to_string());
+    }
+    let value = value.0.trim().to_string();
+    if value.is_empty() {
+        return err(format!("value for `{key}` cannot be empty"));
+    }
+    match state.credentials.set_local(key, value) {
+        Ok(()) => Response::Ok,
+        Err(e) => err(format!("persisting secrets: {e:#}")),
+    }
+}
+
+fn handle_unset_local_secret(state: &DaemonState, key: String) -> Response {
+    match state.credentials.unset_local(key.trim()) {
+        Ok(true) => Response::Ok,
+        Ok(false) => err(format!("no local secret `{}` is set", key.trim())),
+        Err(e) => err(format!("persisting secrets: {e:#}")),
+    }
+}
+
+/// Names and presence only. The union of what the vault holds and what
+/// synced local blocks reference, so the listing shows both a key nothing
+/// uses and a key a block needs but nobody has set.
+fn handle_secrets_status(state: &DaemonState) -> Response {
+    let mut usage = state.supervisor.local_key_usage();
+    let mut local: Vec<portman_protocol::LocalSecretInfo> = state
+        .credentials
+        .local_keys()
+        .into_iter()
+        .map(|key| {
+            let blocks = usage.remove(&key).unwrap_or_default();
+            portman_protocol::LocalSecretInfo {
+                key,
+                set: true,
+                blocks,
+            }
+        })
+        .collect();
+    local.extend(
+        usage
+            .into_iter()
+            .map(|(key, blocks)| portman_protocol::LocalSecretInfo {
+                key,
+                set: false,
+                blocks,
+            }),
+    );
+    local.sort_by(|a, b| a.key.cmp(&b.key));
+    Response::SecretsStatus {
+        infisical_client_id: state.credentials.infisical().map(|c| c.client_id),
+        onepassword: state.credentials.onepassword().is_some(),
+        local,
     }
 }
 
@@ -678,6 +743,123 @@ mod tests {
             dashboard_token: None,
             started: std::time::Instant::now(),
         }
+    }
+
+    /// The vault listing is names and flags: a stored key nothing references,
+    /// a stored key a synced local block names, and a referenced key nobody
+    /// has set (so the operator sees what a `portman up` will fail on). No
+    /// response carries a value.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn secrets_status_merges_vault_and_local_block_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+
+        let set = dispatch(
+            Request::SetLocalSecret {
+                key: " GITHUB_TOKEN ".into(),
+                value: portman_protocol::Redacted("ghp_value".into()),
+            },
+            &state,
+        )
+        .await;
+        assert!(matches!(set, Response::Ok), "{set:?}");
+        let bad_key = dispatch(
+            Request::SetLocalSecret {
+                key: "1BAD".into(),
+                value: portman_protocol::Redacted("x".into()),
+            },
+            &state,
+        )
+        .await;
+        assert!(matches!(bad_key, Response::Err { .. }), "{bad_key:?}");
+        let empty = dispatch(
+            Request::SetLocalSecret {
+                key: "UNUSED".into(),
+                value: portman_protocol::Redacted("  ".into()),
+            },
+            &state,
+        )
+        .await;
+        assert!(matches!(empty, Response::Err { .. }), "{empty:?}");
+        assert!(matches!(
+            dispatch(
+                Request::SetLocalSecret {
+                    key: "UNUSED".into(),
+                    value: portman_protocol::Redacted("u".into()),
+                },
+                &state,
+            )
+            .await,
+            Response::Ok
+        ));
+
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        state
+            .supervisor
+            .sync(
+                &root,
+                Vec::new(),
+                std::collections::BTreeMap::from([(
+                    "mine".to_string(),
+                    portman_protocol::SecretsProviderConfig::Local {
+                        keys: vec!["GITHUB_TOKEN".into(), "MISSING_KEY".into()],
+                    },
+                )]),
+                std::collections::BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let status = dispatch(Request::SecretsStatus, &state).await;
+        let Response::SecretsStatus {
+            infisical_client_id,
+            onepassword,
+            local,
+        } = status
+        else {
+            panic!("expected secrets_status, got {status:?}");
+        };
+        assert_eq!(infisical_client_id, None);
+        assert!(!onepassword);
+        let rows: Vec<(String, bool, Vec<String>)> = local
+            .into_iter()
+            .map(|r| (r.key, r.set, r.blocks))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("GITHUB_TOKEN".to_string(), true, vec!["mine".to_string()]),
+                ("MISSING_KEY".to_string(), false, vec!["mine".to_string()]),
+                ("UNUSED".to_string(), true, vec![]),
+            ]
+        );
+        assert!(
+            !serde_json::to_string(&dispatch(Request::SecretsStatus, &state).await)
+                .unwrap()
+                .contains("ghp_value")
+        );
+
+        assert!(matches!(
+            dispatch(
+                Request::UnsetLocalSecret {
+                    key: "UNUSED".into()
+                },
+                &state
+            )
+            .await,
+            Response::Ok
+        ));
+        assert!(matches!(
+            dispatch(
+                Request::UnsetLocalSecret {
+                    key: "UNUSED".into()
+                },
+                &state
+            )
+            .await,
+            Response::Err { .. }
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
