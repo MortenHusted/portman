@@ -175,7 +175,9 @@ keys = ["GITHUB_TOKEN", "OPENROUTER_API_KEY"]
 # API_KEY = "op://vault/item/field"          # resolved via `op` + service-account token
 ```
 
-`[secrets.<name>]` blocks are referenced by name from a service's `secrets = [...]` (values land in its env) and from an `[egress.<name>]` route (one key is attached as a request header). For a `local` block, an egress `key` must be in the block's `keys`; that is checked when the config loads, not at proxy time.
+`[secrets.<name>]` blocks are referenced by name from a service's `secrets = [...]` (values land in its env) and from an `[egress.<name>]` route (one key is attached as a request header). A block does not have to live in the repo: the dashboard's **Secrets** page defines daemon-global blocks (local key allowlists, 1Password `op://` mappings, Infisical coordinates) that every repo can reference by name, so a mapping used by three repos is declared once. Block names are global like service names — a repo block and a global block with the same name are refused at `portman up`. For a `local` block, an egress `key` must be in the block's `keys`; that is checked when the config loads if the block is in the same file, otherwise at `portman up`, and never as late as proxy time.
+
+The dashboard has two pages: **Overview** (services, containers, routes, inspector) and **Secrets** (blocks, provider credentials, the local vault). `portman secrets list` prints the same picture in the terminal.
 
 ### Authenticated egress (`[egress.<name>]`)
 
