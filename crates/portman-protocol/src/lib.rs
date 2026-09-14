@@ -325,6 +325,18 @@ pub enum Request {
     /// Which providers have credentials and which local keys exist or are
     /// referenced — names and flags only, never values.
     SecretsStatus,
+    /// Define (or replace) a daemon-global `[secrets.<name>]` block — one
+    /// declared in the dashboard rather than a repo config, usable from any
+    /// repo by name. Coordinates only, like a repo block; never a value.
+    SetSecretsBlock {
+        name: String,
+        config: SecretsProviderConfig,
+    },
+    /// Drop a daemon-global block. Repo-owned blocks are refused: they are
+    /// removed by editing the config that declares them.
+    RemoveSecretsBlock {
+        name: String,
+    },
 }
 
 /// A secret value whose `Debug` rendering is always `<redacted>` — the IPC
@@ -471,6 +483,10 @@ pub enum Response {
         /// references — so a referenced-but-unset key is visible.
         #[serde(default)]
         local: Vec<LocalSecretInfo>,
+        /// Every known `[secrets.<name>]` block: daemon-global ones and the
+        /// ones synced from repo configs (with their root).
+        #[serde(default)]
+        blocks: Vec<SecretsBlockInfo>,
     },
     Err {
         message: String,
@@ -486,6 +502,21 @@ pub struct LocalSecretInfo {
     pub set: bool,
     #[serde(default)]
     pub blocks: Vec<String>,
+}
+
+/// One `[secrets.<name>]` block as the daemon knows it. `config` carries
+/// provider coordinates only (never a value), so listing it is safe.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecretsBlockInfo {
+    pub name: String,
+    pub config: SecretsProviderConfig,
+    /// Config root that declared the block; `None` for a daemon-global block
+    /// (defined in the dashboard / via `SetSecretsBlock`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<std::path::PathBuf>,
+    /// Services (by name) and egress routes (`egress:<name>`) that reference it.
+    #[serde(default)]
+    pub used_by: Vec<String>,
 }
 
 /// One row of the supervised-service status list.
@@ -1400,15 +1431,29 @@ mod tests {
                 set: false,
                 blocks: vec!["mine".into()],
             }],
+            blocks: vec![SecretsBlockInfo {
+                name: "mine".into(),
+                config: block.clone(),
+                root: None,
+                used_by: vec!["web".into(), "egress:github".into()],
+            }],
         };
         let json = serde_json::to_string(&status).unwrap();
         match serde_json::from_str::<Response>(&json).unwrap() {
-            Response::SecretsStatus { local, .. } => {
+            Response::SecretsStatus { local, blocks, .. } => {
                 assert_eq!(local[0].blocks, vec!["mine".to_string()]);
                 assert!(!local[0].set);
+                assert_eq!(blocks[0].root, None);
+                assert_eq!(blocks[0].config, block);
             }
             other => panic!("expected secrets_status, got {other:?}"),
         }
+        // A pre-blocks daemon's status still parses.
+        let sparse = r#"{"kind":"secrets_status","onepassword":false,"local":[]}"#;
+        assert!(matches!(
+            serde_json::from_str::<Response>(sparse).unwrap(),
+            Response::SecretsStatus { blocks, .. } if blocks.is_empty()
+        ));
     }
 
     #[test]
