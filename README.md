@@ -264,11 +264,15 @@ Unix IPC protocol. Control requests in managed mode use this envelope:
     "grant_id": "agent-run-unique-id",
     "host": "qwen.localhost",
     "token_sha256": "<64 lowercase hex characters>",
-    "expires_at": 1800000000
+    "expires_at": 1800000000,
+    "expected_route_revision": "<revision from authenticated list_egress_routes>"
   }
 }
 ```
 
+Fetch `list_egress_routes` through the authenticated control envelope to obtain
+exact host references and opaque revisions, without upstream addresses or secret
+locators. Issuance rejects any revision other than the one selected by the owner.
 The exact-host route must already exist; protected wildcard routes are not supported.
 The grant binds its exact host, upstream target
 and credential spec; editing the route invalidates the old grant. The issue

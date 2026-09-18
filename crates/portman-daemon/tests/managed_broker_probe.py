@@ -69,7 +69,7 @@ with tempfile.TemporaryDirectory(prefix='portman-u2-state-') as root:
         if duplicate: conn.putheader('Authorization', 'Bearer ' + bearer)
         conn.endheaders(); response = conn.getresponse(); status=response.status; response.read(); conn.close(); return status
     def issue(id, expires):
-        return ipc({'kind':'issue_egress_grant', 'grant_id':id, 'host':'qwen.localhost', 'token_sha256':hashlib.sha256(token.encode()).hexdigest(), 'expires_at':expires})
+        return ipc({'kind':'issue_egress_grant', 'grant_id':id, 'host':'qwen.localhost', 'token_sha256':hashlib.sha256(token.encode()).hexdigest(), 'expires_at':expires, 'expected_route_revision':route_revision})
     try:
         start()
         status = ipc({'kind':'status'})
@@ -82,6 +82,12 @@ with tempfile.TemporaryDirectory(prefix='portman-u2-state-') as root:
         target = '127.0.0.1:' + str(upstream.server_port)
         routes = {name:{'host':host,'target':target,'spec':spec} for name, host in [('qwen','qwen.localhost'),('alias','alias.localhost')]}
         ok({'kind':'sync_services','root':str(root),'services':[],'secrets':{'probe':{'provider':'local','keys':['SYNTHETIC_TOKEN']}},'egress':routes})
+        inventory = ipc({'kind':'list_egress_routes'})
+        route_revision = next(r['revision'] for r in inventory['routes'] if r['host']=='qwen.localhost')
+        assert target not in json.dumps(inventory) and 'SYNTHETIC_TOKEN' not in json.dumps(inventory)
+        wrong_revision = ipc({'kind':'issue_egress_grant', 'grant_id':'wrong-revision', 'host':'qwen.localhost', 'token_sha256':hashlib.sha256(token.encode()).hexdigest(), 'expires_at':int(time.time())+60, 'expected_route_revision':'0'*64})
+        assert wrong_revision['kind']=='err'
+        result['expected_route_revision_enforced'] = True
         expiry = int(time.time()) + 60
         assert issue('probe-run',expiry)['kind'] == 'ok'
         assert issue('probe-run',expiry)['kind'] == 'ok'

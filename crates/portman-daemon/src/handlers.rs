@@ -24,6 +24,7 @@ pub(crate) async fn dispatch(request: Request, state: &DaemonState) -> Response 
             host,
             token_sha256,
             expires_at,
+            expected_route_revision,
         } => {
             let Ok(host) = portman_core::static_store::validate_host(&host) else {
                 return err("invalid grant host");
@@ -37,12 +38,16 @@ pub(crate) async fn dispatch(request: Request, state: &DaemonState) -> Response 
             if !state.supervisor.managed_broker() && !spec.require_caller_token {
                 return err("route does not require a caller token");
             }
+            let revision = crate::egress_grants::route_identity(&entry.target, &spec);
+            if revision != expected_route_revision {
+                return err("egress route revision changed");
+            }
             match state.supervisor.grants().issue(
                 grant_id,
                 host,
                 token_sha256,
                 expires_at,
-                crate::egress_grants::route_identity(&entry.target, &spec),
+                revision,
             ) {
                 Ok(()) => Response::Ok,
                 Err(e) => err(format!("{e:#}")),
@@ -52,6 +57,25 @@ pub(crate) async fn dispatch(request: Request, state: &DaemonState) -> Response 
         {
             Ok(()) => Response::Ok,
             Err(e) => err(format!("{e:#}")),
+        },
+        Request::ListEgressRoutes => Response::EgressRoutes {
+            routes: state
+                .registry
+                .list()
+                .into_iter()
+                .filter_map(|entry| {
+                    if entry.mode != Mode::Egress {
+                        return None;
+                    }
+                    let spec = entry.egress?;
+                    Some(portman_protocol::EgressRouteInfo {
+                        host: entry.host,
+                        revision: crate::egress_grants::route_identity(&entry.target, &spec),
+                        require_caller_token: state.supervisor.managed_broker()
+                            || spec.require_caller_token,
+                    })
+                })
+                .collect(),
         },
         Request::ListEntries => Response::Entries {
             entries: state.registry.list(),
@@ -1438,6 +1462,59 @@ mod tests {
                 egress_grants_version: 1,
                 ..
             }
+        ));
+    }
+    #[tokio::test]
+    async fn issue_requires_selected_route_revision_and_inventory_omits_secret_locators() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        state.supervisor.set_managed_broker();
+        let mut entry = portman_protocol::Entry {
+            host: "qwen.localhost".into(),
+            target: "provider.example:443".into(),
+            source: portman_protocol::Source::Static,
+            mode: Mode::Egress,
+            container_id: None,
+            project: None,
+            egress: Some(portman_protocol::EgressSpec {
+                require_caller_token: true,
+                secrets: "private-secret-block".into(),
+                key: "PRIVATE_KEY_REFERENCE".into(),
+                header: "Authorization".into(),
+                format: "Bearer {value}".into(),
+                upstream_host: "provider.example".into(),
+                tls: true,
+            }),
+        };
+        state.registry.upsert(entry.clone());
+        let inventory = dispatch(Request::ListEgressRoutes, &state).await;
+        let wire = serde_json::to_string(&inventory).unwrap();
+        assert!(!wire.contains("private-secret-block"));
+        assert!(!wire.contains("PRIVATE_KEY_REFERENCE"));
+        assert!(!wire.contains("provider.example"));
+        let Response::EgressRoutes { routes } = inventory else {
+            panic!("expected inventory")
+        };
+        let original_revision = routes[0].revision.clone();
+        let issue = |revision: String| Request::IssueEgressGrant {
+            grant_id: "selected-route".into(),
+            host: entry.host.clone(),
+            token_sha256: "a".repeat(64),
+            expires_at: crate::now_unix_ms() / 1000 + 60,
+            expected_route_revision: revision,
+        };
+        entry.egress.as_mut().unwrap().key = "REPLACED_KEY_REFERENCE".into();
+        state.registry.upsert(entry.clone());
+        assert!(matches!(
+            dispatch(issue(original_revision), &state).await,
+            Response::Err { .. }
+        ));
+        assert!(!dir.path().join("egress-grants.json").exists());
+        let revised =
+            crate::egress_grants::route_identity(&entry.target, entry.egress.as_ref().unwrap());
+        assert!(matches!(
+            dispatch(issue(revised), &state).await,
+            Response::Ok
         ));
     }
 }

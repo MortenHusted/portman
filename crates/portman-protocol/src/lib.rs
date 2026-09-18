@@ -200,6 +200,8 @@ pub enum Request {
         request: Box<Request>,
     },
     ListEntries,
+    /// Safe route references/revisions for host-controller selection.
+    ListEgressRoutes,
     /// Host-controller API. Only a SHA-256 digest crosses IPC; callers generate
     /// and deliver a high-entropy bearer separately from provider credentials.
     IssueEgressGrant {
@@ -207,6 +209,7 @@ pub enum Request {
         host: String,
         token_sha256: String,
         expires_at: u64,
+        expected_route_revision: String,
     },
     /// Terminal, durable revocation; unknown IDs become tombstones too.
     RevokeEgressGrant {
@@ -379,6 +382,9 @@ fn default_logs_limit() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
+    EgressRoutes {
+        routes: Vec<EgressRouteInfo>,
+    },
     Entries {
         entries: Vec<Entry>,
     },
@@ -657,6 +663,14 @@ impl EgressSpec {
     pub fn render(&self, value: &str) -> String {
         self.format.replace("{value}", value)
     }
+}
+
+/// Host-local route inventory. Upstream addresses and secret locators stay local.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EgressRouteInfo {
+    pub host: String,
+    pub revision: String,
+    pub require_caller_token: bool,
 }
 
 /// One `[egress.<name>]` route as synced from repo config: where local
