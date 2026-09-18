@@ -73,10 +73,50 @@ async fn handle_client(mut stream: UnixStream, state: DaemonState, owner_uid: u3
     let request = tokio::time::timeout(READ_TIMEOUT, read_request(&mut stream))
         .await
         .context("ipc read timed out")??;
+    let request = match authenticate_control(
+        request,
+        state.supervisor.managed_broker(),
+        state.dashboard_token.as_deref(),
+    ) {
+        Ok(request) => request,
+        Err(message) => {
+            write_response(
+                &mut stream,
+                &portman_protocol::Response::Err {
+                    message: message.into(),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     debug!(?request, "ipc request");
     let response = handlers::dispatch(request, &state).await;
     write_response(&mut stream, &response).await?;
     Ok(())
+}
+
+fn authenticate_control(
+    request: portman_protocol::Request,
+    managed: bool,
+    token: Option<&str>,
+) -> std::result::Result<portman_protocol::Request, &'static str> {
+    use portman_protocol::Request;
+    use subtle::ConstantTimeEq;
+    match request {
+        Request::Authenticated {
+            token: supplied,
+            request,
+        } if token.is_some_and(|expected| {
+            !expected.is_empty() && bool::from(expected.as_bytes().ct_eq(supplied.0.as_bytes()))
+        }) =>
+        {
+            Ok(*request)
+        }
+        Request::Authenticated { .. } => Err("control authentication denied"),
+        _ if managed => Err("managed broker requires authenticated control envelope"),
+        request => Ok(request),
+    }
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {
@@ -139,5 +179,27 @@ mod tests {
         remove_stale_socket(&path).unwrap();
 
         assert!(!path.exists());
+    }
+    #[test]
+    fn managed_control_requires_separate_admin_token() {
+        use portman_protocol::{Redacted, Request};
+        let envelope = |token: &str| Request::Authenticated {
+            token: Redacted(token.into()),
+            request: Box::new(Request::Status),
+        };
+        assert!(authenticate_control(Request::Status, true, Some("host-admin")).is_err());
+        assert!(
+            authenticate_control(envelope("workspace-token"), true, Some("host-admin")).is_err()
+        );
+        assert!(authenticate_control(envelope("host-admin"), true, None).is_err());
+        assert!(matches!(
+            authenticate_control(envelope("host-admin"), true, Some("host-admin")),
+            Ok(Request::Status)
+        ));
+        assert!(matches!(
+            authenticate_control(Request::Status, false, None),
+            Ok(Request::Status)
+        ));
+        assert!(!format!("{:?}", envelope("secret-admin-value")).contains("secret-admin-value"));
     }
 }

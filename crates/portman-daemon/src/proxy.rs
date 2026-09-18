@@ -301,6 +301,20 @@ async fn handle_egress(
         .ok();
         return Ok(());
     };
+    if !credentials.authorize(host, &target, &spec, &head.headers) {
+        write_error(
+            &mut client,
+            403,
+            host,
+            "Route authorization denied.",
+            "A valid route-scoped bearer grant is required.",
+            "",
+            wants_html,
+        )
+        .await
+        .ok();
+        return Ok(());
+    }
     let audit = EgressAudit::from_spec(host, &target, &spec);
     let Some(value) = credentials.resolve(&spec).await else {
         warn!(
@@ -835,6 +849,7 @@ mod tests {
     fn egress_entry(host: &str, target: String) -> Entry {
         let mut e = entry(host, target, Mode::Egress);
         e.egress = Some(portman_protocol::EgressSpec {
+            require_caller_token: false,
             secrets: "gh".into(),
             key: "GITHUB_TOKEN".into(),
             header: "Authorization".into(),
@@ -1523,5 +1538,115 @@ mod tests {
             "a refused handshake must never yield a success response: {response}"
         );
         upstream.abort();
+    }
+    struct ProtectedCredentials {
+        store: crate::egress_grants::GrantStore,
+        resolutions: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl crate::egress::CredentialSource for ProtectedCredentials {
+        fn authorize(
+            &self,
+            host: &str,
+            target: &str,
+            spec: &portman_protocol::EgressSpec,
+            headers: &[(String, String)],
+        ) -> bool {
+            self.store.permits(
+                host,
+                &crate::egress_grants::route_identity(target, spec),
+                headers,
+                crate::now_unix_ms() / 1000,
+            )
+        }
+        async fn resolve(&self, _: &portman_protocol::EgressSpec) -> Option<String> {
+            self.resolutions.fetch_add(1, Ordering::SeqCst);
+            Some("synthetic-upstream-secret".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_proxy_authorizes_before_resolving_or_connecting() {
+        use sha2::{Digest, Sha256};
+        const TOKEN: &str = "synthetic-bearer-0123456789abcdef0123456789";
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut route = egress_entry("qwen.localhost", upstream.local_addr().unwrap().to_string());
+        route.egress.as_mut().unwrap().require_caller_token = true;
+        let registry = Registry::new();
+        registry.upsert(route.clone());
+        let credentials = Arc::new(ProtectedCredentials {
+            store: crate::egress_grants::GrantStore::new(dir.path().join("grants.json")),
+            resolutions: AtomicUsize::new(0),
+        });
+        credentials
+            .store
+            .issue(
+                "run-1".into(),
+                route.host.clone(),
+                hex::encode(Sha256::digest(TOKEN)),
+                crate::now_unix_ms() / 1000 + 60,
+                crate::egress_grants::route_identity(&route.target, route.egress.as_ref().unwrap()),
+            )
+            .unwrap();
+        for authorization in [
+            String::new(),
+            "Authorization: Bearer incorrect-token-0123456789abcdef\r\n".into(),
+            format!("Authorization: Bearer {TOKEN}\r\nAuthorization: Bearer {TOKEN}\r\n"),
+            format!("Authorization: Bearer {TOKEN}\r\nX-Api-Key: conflicting\r\n"),
+        ] {
+            let proxy = proxy_once_with(
+                registry.clone(),
+                StubStarter::inert(),
+                credentials.clone(),
+                Roots::System,
+            )
+            .await;
+            let mut client = TcpStream::connect(proxy).await.unwrap();
+            client
+                .write_all(
+                    format!("GET / HTTP/1.1\r\nHost: qwen.localhost\r\n{authorization}\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            client.shutdown().await.unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 403"));
+        }
+        assert_eq!(credentials.resolutions.load(Ordering::SeqCst), 0);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), upstream.accept())
+                .await
+                .is_err()
+        );
+        let read_upstream = tokio::spawn(async move {
+            let (mut connection, _) = upstream.accept().await.unwrap();
+            let mut bytes = vec![0; 4096];
+            let size = connection.read(&mut bytes).await.unwrap();
+            connection
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            String::from_utf8(bytes[..size].to_vec()).unwrap()
+        });
+        let proxy = proxy_once_with(
+            registry,
+            StubStarter::inert(),
+            credentials.clone(),
+            Roots::System,
+        )
+        .await;
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        client.write_all(format!("GET / HTTP/1.1\r\nHost: qwen.localhost\r\nAuthorization: Bearer {TOKEN}\r\n\r\n").as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"));
+        let forwarded = read_upstream.await.unwrap();
+        assert!(!forwarded.contains(TOKEN));
+        assert!(forwarded.contains("Authorization: Bearer synthetic-upstream-secret\r\n"));
+        assert_eq!(credentials.resolutions.load(Ordering::SeqCst), 1);
     }
 }

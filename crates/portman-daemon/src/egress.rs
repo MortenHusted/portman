@@ -6,11 +6,8 @@
 //! gets an authenticated request without ever having been given the value —
 //! the same shape as an authenticated reverse proxy in front of a REST API.
 //!
-//! What this does NOT do, so nobody reads more into it than is there: it
-//! authenticates nothing about the *caller*. Any local process that can reach
-//! the proxy port can use the credential. It stops the value being copied into
-//! environments, config files, and logs; it does not stop a process that
-//! wanted to make the call from making it.
+//! Legacy routes authenticate the upstream only. Protected routes and managed
+//! broker mode additionally require a fixed-expiry route-scoped caller grant.
 
 use std::sync::Arc;
 
@@ -35,6 +32,15 @@ fn is_caller_owned(name: &str) -> bool {
 /// come from a remote provider (Infisical/1Password), resolved at proxy time.
 #[async_trait::async_trait]
 pub(crate) trait CredentialSource: Send + Sync + 'static {
+    fn authorize(
+        &self,
+        _host: &str,
+        _target: &str,
+        spec: &EgressSpec,
+        _headers: &[(String, String)],
+    ) -> bool {
+        !spec.require_caller_token
+    }
     /// The secret named by `spec`, or `None` if the block or key is unknown.
     async fn resolve(&self, spec: &EgressSpec) -> Option<String>;
 }
@@ -63,6 +69,23 @@ pub(crate) struct SupervisorCredentials {
 
 #[async_trait::async_trait]
 impl CredentialSource for SupervisorCredentials {
+    fn authorize(
+        &self,
+        host: &str,
+        target: &str,
+        spec: &EgressSpec,
+        headers: &[(String, String)],
+    ) -> bool {
+        if !self.supervisor.managed_broker() && !spec.require_caller_token {
+            return true;
+        }
+        self.supervisor.grants().permits(
+            host,
+            &crate::egress_grants::route_identity(target, spec),
+            headers,
+            crate::now_unix_ms() / 1000,
+        )
+    }
     async fn resolve(&self, spec: &EgressSpec) -> Option<String> {
         self.supervisor.resolve_egress_value(spec).await
     }
@@ -110,7 +133,11 @@ pub(crate) fn rewrite_head(
     out.push_str(path);
     out.push_str(" HTTP/1.1\r\n");
     for (name, val) in headers {
-        if is_caller_owned(name) {
+        if is_caller_owned(name)
+            || name.eq_ignore_ascii_case(&spec.header)
+            || name.eq_ignore_ascii_case("x-api-key")
+            || name.eq_ignore_ascii_case("api-key")
+        {
             continue;
         }
         out.push_str(name);
@@ -163,6 +190,7 @@ mod tests {
 
     fn spec() -> EgressSpec {
         EgressSpec {
+            require_caller_token: false,
             secrets: "gh".into(),
             key: "GITHUB_TOKEN".into(),
             header: "Authorization".into(),

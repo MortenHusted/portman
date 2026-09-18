@@ -20,16 +20,26 @@ use serde::Serialize;
 
 /// Serialize `value` as pretty JSON and atomically replace `path` with it.
 pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    atomic_write_json_impl(path, value, None)
+    atomic_write_json_impl(path, value, None, false)
 }
 
 /// Same, but the file is created with `mode` (e.g. 0o600 for state that
 /// embeds service environments).
 pub fn atomic_write_json_with_mode<T: Serialize>(path: &Path, value: &T, mode: u32) -> Result<()> {
-    atomic_write_json_impl(path, value, Some(mode))
+    atomic_write_json_impl(path, value, Some(mode), false)
 }
 
-fn atomic_write_json_impl<T: Serialize>(path: &Path, value: &T, mode: Option<u32>) -> Result<()> {
+/// Security policy writes acknowledge only after file and directory sync.
+pub fn atomic_write_json_durable<T: Serialize>(path: &Path, value: &T, mode: u32) -> Result<()> {
+    atomic_write_json_impl(path, value, Some(mode), true)
+}
+
+fn atomic_write_json_impl<T: Serialize>(
+    path: &Path,
+    value: &T,
+    mode: Option<u32>,
+    durable: bool,
+) -> Result<()> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     let parent = path.parent().context("target path has no parent")?;
@@ -60,9 +70,14 @@ fn atomic_write_json_impl<T: Serialize>(path: &Path, value: &T, mode: Option<u32
         drop(file);
         fs::rename(&tmp, path)
             .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
-        // Persist the rename itself. Failure here is not worth failing the
-        // write over — the data file is already synced and in place.
-        if let Ok(dir) = fs::File::open(parent) {
+        // Security policy requires a durable rename before acknowledgement;
+        // older general-purpose stores retain best-effort directory sync.
+        if durable {
+            fs::File::open(parent)
+                .context("opening policy directory for sync")?
+                .sync_all()
+                .context("syncing policy directory")?;
+        } else if let Ok(dir) = fs::File::open(parent) {
             let _ = dir.sync_all();
         }
         Ok(())

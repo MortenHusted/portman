@@ -193,7 +193,28 @@ fn default_dashboard_port() -> u16 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
+    /// Managed broker control envelope. Token is the existing host-only
+    /// dashboard admin token, never a workspace route bearer.
+    Authenticated {
+        token: Redacted,
+        request: Box<Request>,
+    },
     ListEntries,
+    /// Safe route references/revisions for host-controller selection.
+    ListEgressRoutes,
+    /// Host-controller API. Only a SHA-256 digest crosses IPC; callers generate
+    /// and deliver a high-entropy bearer separately from provider credentials.
+    IssueEgressGrant {
+        grant_id: String,
+        host: String,
+        token_sha256: String,
+        expires_at: u64,
+        expected_route_revision: String,
+    },
+    /// Terminal, durable revocation; unknown IDs become tombstones too.
+    RevokeEgressGrant {
+        grant_id: String,
+    },
     /// Retained CPU/memory time series for services, containers, and totals.
     ResourceHistory,
     AddStatic {
@@ -361,6 +382,9 @@ fn default_logs_limit() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
+    EgressRoutes {
+        routes: Vec<EgressRouteInfo>,
+    },
     Entries {
         entries: Vec<Entry>,
     },
@@ -370,6 +394,10 @@ pub enum Response {
     },
     Ok,
     Status {
+        #[serde(default)]
+        managed_broker: bool,
+        #[serde(default)]
+        egress_grants_version: u32,
         #[serde(default = "default_unknown")]
         version: String,
         #[serde(default = "default_unknown")]
@@ -607,6 +635,10 @@ pub struct Entry {
 /// environment.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EgressSpec {
+    /// Require a route-scoped bearer grant. Managed broker mode enforces this
+    /// for every route regardless of this backwards-compatible default.
+    #[serde(default)]
+    pub require_caller_token: bool,
     /// `[secrets.<block>]` the value comes from.
     pub secrets: String,
     /// Key within that block.
@@ -631,6 +663,14 @@ impl EgressSpec {
     pub fn render(&self, value: &str) -> String {
         self.format.replace("{value}", value)
     }
+}
+
+/// Host-local route inventory. Upstream addresses and secret locators stay local.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EgressRouteInfo {
+    pub host: String,
+    pub revision: String,
+    pub require_caller_token: bool,
 }
 
 /// One `[egress.<name>]` route as synced from repo config: where local
@@ -1153,7 +1193,11 @@ mod tests {
                 bridge_enabled,
                 bridge_mode,
                 dashboard_port,
+                managed_broker,
+                egress_grants_version,
             } => {
+                assert!(!managed_broker);
+                assert_eq!(egress_grants_version, 0);
                 assert_eq!(version, "0.0.1");
                 assert_eq!(running_since, "5s");
                 assert_eq!(dns_port, 5335);
@@ -1366,6 +1410,7 @@ mod tests {
                     host: "github.api.test".into(),
                     target: "api.github.com:443".into(),
                     spec: EgressSpec {
+                        require_caller_token: false,
                         secrets: "pacer".into(),
                         key: "GITHUB_TOKEN".into(),
                         header: "Authorization".into(),

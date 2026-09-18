@@ -199,3 +199,35 @@ Accepted residual risk for now:
   state and can depend on external package availability. Keep shell syntax in
   CI; use `portman install` or `portman bridge prepare` to build the setup
   image outside the safe baseline.
+
+
+## Managed broker qualification (2026-09-19)
+
+The protected-route implementation passed 341 workspace tests, native all-target
+Clippy with warnings denied, and formatting. A static `x86_64-unknown-linux-musl`
+daemon built with `cargo zigbuild` passed the standalone
+`crates/portman-daemon/tests/managed_broker_probe.py` on a Linux x86_64 dev box
+without Docker. The probe uses a temporary home/XDG directory, explicit ephemeral
+ports, a synthetic local upstream and synthetic credentials, then stops its
+processes and deletes its state. No installed services or agent profiles change.
+
+Verified through actual IPC and HTTP: separate admin authentication; rejection
+before upstream connection for missing, wrong, duplicate and wrong-route bearers;
+provider injection without forwarding the local bearer; persisted route
+protection; denied service/bridge starts; revocation and expiry after restart;
+clock rollback denial after restart; legacy-mode reopening refusal; and absence
+of synthetic credentials from daemon logs. Unit tests separately cover denying
+service definitions/watchers and existing service state.
+
+Qualified binary SHA-256:
+`cd6a20da0fee6dff46acef0a0da8001b65357753de2546186a30b54d8f78668c`.
+The linker emitted its existing deprecated optimization-setting warning; the
+build and Linux runtime checks succeeded. This qualifies the broker contract,
+not Landlock/harness launch integration or deployment.
+
+After rebasing onto fresh `origin/main`, Clippy remained green. A parallel suite
+run hit two existing supervisor timing assertions (`stop_terms_then_kills_a_term_ignoring_child`
+and `sync_restarts_changed_and_stops_removed`); the full serial suite passed all
+341 tests. The revision-aware Linux probe was repeated successfully against the
+binary above. The inherited instruction-file-only commit was excluded from this
+feature branch while the root checkout retained it.

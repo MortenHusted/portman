@@ -21,3 +21,7 @@ xcuserdata/
 /docs/plans
 /docs/solutions
 /CLAUDE.local.md
+
+# Local worktrees and their uncommitted lifecycle shims (worktree-setup)
+/.worktrees/
+/scripts/worktrees/

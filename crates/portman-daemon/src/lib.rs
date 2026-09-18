@@ -11,6 +11,7 @@ mod dns;
 mod docker_events;
 mod egress;
 mod egress_client;
+mod egress_grants;
 mod env_compose;
 mod handlers;
 mod ipc_server;
@@ -88,6 +89,10 @@ pub(crate) fn block_on_reactor<T>(f: impl FnOnce() -> T) -> T {
     about = "portman daemon — Docker watcher, DNS, HTTP proxy"
 )]
 struct Args {
+    /// Dedicated credential broker: all egress requires route grants and no
+    /// services, watchers, Docker or pitchfork starts are permitted.
+    #[arg(long, env = "PORTMAN_MANAGED_BROKER")]
+    managed_broker: bool,
     /// Path to the docker socket. Examples:
     ///   colima (legacy home): /Users/<you>/.colima/default/docker.sock
     ///   colima (XDG):         /Users/<you>/.config/colima/default/docker.sock
@@ -226,14 +231,6 @@ pub async fn daemon_main() -> Result<()> {
     raise_fd_limit();
     let args = Args::parse();
 
-    let docker = connect_docker(&args).context("connecting to docker")?;
-    let version = docker.version().await.context("docker ping/version")?;
-    info!(
-        api_version = version.api_version.as_deref().unwrap_or("?"),
-        server_version = version.version.as_deref().unwrap_or("?"),
-        "connected to docker"
-    );
-
     ensure_data_dir_owned_by_login_user().context("preparing data dir")?;
 
     let registry = Registry::new();
@@ -286,6 +283,28 @@ pub async fn daemon_main() -> Result<()> {
     let supervisor = supervisor::Supervisor::for_daemon(logs.sink(), route_binder, secrets_source)
         .context("initializing supervisor")?;
 
+    supervisor.configure_managed_broker(args.managed_broker)?;
+    let docker = connect_docker(&args).context("connecting to docker")?;
+    if !args.managed_broker {
+        let version = docker.version().await.context("docker ping/version")?;
+        info!(
+            api_version = version.api_version.as_deref().unwrap_or("?"),
+            server_version = version.version.as_deref().unwrap_or("?"),
+            "connected to docker"
+        );
+    }
+
+    if args.managed_broker {
+        anyhow::ensure!(
+            args.dashboard_auth,
+            "managed broker requires dashboard authentication"
+        );
+        supervisor
+            .restore()
+            .await
+            .context("restoring managed broker")?;
+    }
+
     let runner = runner::Runner::new(
         docker.clone(),
         static_store.clone(),
@@ -329,7 +348,9 @@ pub async fn daemon_main() -> Result<()> {
 
     seed_builtin_routes(&state);
     seed_from_static_store(&state);
-    seed_from_running_containers(&docker, &state).await;
+    if !args.managed_broker {
+        seed_from_running_containers(&docker, &state).await;
+    }
 
     // Provision certs for any already-registered entries under TLS-enabled TLDs.
     provision_certs_for_existing(&state);
@@ -337,7 +358,7 @@ pub async fn daemon_main() -> Result<()> {
     // Restore persisted desired service state (terminating any process
     // groups that survived an unclean daemon exit, never adopting them) and
     // start desired-up services.
-    {
+    if !args.managed_broker {
         let supervisor = supervisor.clone();
         tokio::spawn(async move {
             if let Err(err) = supervisor.restore().await {
@@ -346,12 +367,25 @@ pub async fn daemon_main() -> Result<()> {
         });
     }
 
-    let sampler = tokio::spawn(resources::run_sampler(state.clone(), resource_history));
+    let managed_broker = args.managed_broker;
+    let sampler = resources::run_sampler(state.clone(), resource_history);
+    let sampler = tokio::spawn(async move {
+        if managed_broker {
+            std::future::pending::<()>().await;
+        }
+        sampler.await
+    });
     let ipc = tokio::spawn(ipc_server::run(state.clone()));
     let dashboard = tokio::spawn(dashboard::run(state.clone(), args.dashboard_port));
     // Hand bridge_health a clone of the Docker handle before docker_events
     // takes ownership; bollard::Docker is a cheap Arc internally.
-    let bridge_health_task = tokio::spawn(bridge_health::run(docker.clone(), bridge_health_shared));
+    let bridge_health_task = bridge_health::run(docker.clone(), bridge_health_shared);
+    let bridge_health_task = tokio::spawn(async move {
+        if managed_broker {
+            std::future::pending::<()>().await;
+        }
+        bridge_health_task.await
+    });
     // v1 Rust bridge. Starts in whatever state the user last left it
     // (persisted in netbridge.json) or overridden on by
     // `PORTMAN_NETBRIDGE=1`. The IPC server can flip it on/off
@@ -361,14 +395,26 @@ pub async fn daemon_main() -> Result<()> {
     // Subscribe a state receiver *before* spawning the netbridge task
     // so the very first state publish isn't missed.
     let host_facing_rx = netbridge_handle.state_rx.clone();
-    let netbridge_task = tokio::spawn(netbridge::run(
+    let netbridge_task = netbridge::run(
         docker.clone(),
         netbridge_handle,
         netbridge_rx,
         netbridge_state_tx,
         netbridge_state_path,
-    ));
-    let events = tokio::spawn(docker_events::run(docker, state.clone()));
+    );
+    let netbridge_task = tokio::spawn(async move {
+        if managed_broker {
+            std::future::pending::<()>().await;
+        }
+        netbridge_task.await
+    });
+    let events = docker_events::run(docker, state.clone());
+    let events = tokio::spawn(async move {
+        if managed_broker {
+            std::future::pending::<()>().await;
+        }
+        events.await
+    });
     let dns = tokio::spawn(dns::run(
         state.registry.clone(),
         args.dns_port,
@@ -411,7 +457,7 @@ pub async fn daemon_main() -> Result<()> {
     ));
     // Container-facing listeners on 192.168.99.1 — only bind when the
     // netbridge says the address exists.
-    let host_facing_task = tokio::spawn(host_facing::run(
+    let host_facing_task = host_facing::run(
         state.registry.clone(),
         host_facing_rx,
         args.proxy_port,
@@ -420,7 +466,13 @@ pub async fn daemon_main() -> Result<()> {
         state.tls_store.clone(),
         bridge_ifindex,
         starter,
-    ));
+    );
+    let host_facing_task = tokio::spawn(async move {
+        if managed_broker {
+            std::future::pending::<()>().await;
+        }
+        host_facing_task.await
+    });
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("installing SIGTERM handler")?;
@@ -524,6 +576,14 @@ fn raise_fd_limit() {
 }
 
 fn connect_docker(args: &Args) -> Result<Docker> {
+    if args.managed_broker {
+        // Keep the shared state shape, with no capability to reach an engine.
+        return Ok(Docker::connect_with_socket(
+            "/dev/null",
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )?);
+    }
     if let Some(path) = args.docker_socket.as_deref() {
         info!(socket = path, "using configured docker socket");
         return Ok(Docker::connect_with_socket(
