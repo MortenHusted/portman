@@ -203,7 +203,7 @@ Accepted residual risk for now:
 
 ## Managed broker qualification (2026-09-19)
 
-The protected-route implementation passed 340 workspace tests, native all-target
+The protected-route implementation passed 341 workspace tests, native all-target
 Clippy with warnings denied, and formatting. A static `x86_64-unknown-linux-musl`
 daemon built with `cargo zigbuild` passed the standalone
 `crates/portman-daemon/tests/managed_broker_probe.py` on a Linux x86_64 dev box
@@ -220,7 +220,14 @@ of synthetic credentials from daemon logs. Unit tests separately cover denying
 service definitions/watchers and existing service state.
 
 Qualified binary SHA-256:
-`746517ade919e965d4c3196f45f352b5dc463b8d62c83c1c8520c855d2e0b16c`.
+`cd6a20da0fee6dff46acef0a0da8001b65357753de2546186a30b54d8f78668c`.
 The linker emitted its existing deprecated optimization-setting warning; the
 build and Linux runtime checks succeeded. This qualifies the broker contract,
 not Landlock/harness launch integration or deployment.
+
+After rebasing onto fresh `origin/main`, Clippy remained green. A parallel suite
+run hit two existing supervisor timing assertions (`stop_terms_then_kills_a_term_ignoring_child`
+and `sync_restarts_changed_and_stops_removed`); the full serial suite passed all
+341 tests. The revision-aware Linux probe was repeated successfully against the
+binary above. The inherited instruction-file-only commit was excluded from this
+feature branch while the root checkout retained it.
