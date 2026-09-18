@@ -8,6 +8,43 @@ use crate::DaemonState;
 
 pub(crate) async fn dispatch(request: Request, state: &DaemonState) -> Response {
     match request {
+        Request::Authenticated { .. } => {
+            err("control envelope must be authenticated by IPC transport")
+        }
+        Request::IssueEgressGrant {
+            grant_id,
+            host,
+            token_sha256,
+            expires_at,
+        } => {
+            let Ok(host) = portman_core::static_store::validate_host(&host) else {
+                return err("invalid grant host");
+            };
+            let Some(entry) = state.registry.get(&host) else {
+                return err("grant host has no route");
+            };
+            let Some(spec) = entry.egress else {
+                return err("grant host is not an egress route");
+            };
+            if !state.supervisor.managed_broker() && !spec.require_caller_token {
+                return err("route does not require a caller token");
+            }
+            match state.supervisor.grants().issue(
+                grant_id,
+                host,
+                token_sha256,
+                expires_at,
+                crate::egress_grants::route_identity(&entry.target, &spec),
+            ) {
+                Ok(()) => Response::Ok,
+                Err(e) => err(format!("{e:#}")),
+            }
+        }
+        Request::RevokeEgressGrant { grant_id } => match state.supervisor.grants().revoke(grant_id)
+        {
+            Ok(()) => Response::Ok,
+            Err(e) => err(format!("{e:#}")),
+        },
         Request::ListEntries => Response::Entries {
             entries: state.registry.list(),
         },
@@ -368,6 +405,8 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
     let bridge_enabled = *state.netbridge.enabled.read().await;
     let bridge_mode = *state.netbridge.mode.read().await;
     Response::Status {
+        managed_broker: state.supervisor.managed_broker(),
+        egress_grants_version: 1,
         version: VERSION.to_string(),
         running_since: format_duration(state.started.elapsed()),
         dns_port: state.dns_port,
@@ -897,6 +936,7 @@ mod tests {
             host: "github.api.test".into(),
             target: "127.0.0.1:9999".into(),
             spec: EgressSpec {
+                require_caller_token: false,
                 secrets: block.into(),
                 key: key.into(),
                 header: "Authorization".into(),
@@ -1359,5 +1399,37 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+    }
+    #[tokio::test]
+    async fn managed_broker_denies_starts_and_authenticates_unprotected_aliases() {
+        use crate::egress::{CredentialSource, SupervisorCredentials};
+        use crate::runner::Starter;
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        state.supervisor.set_managed_broker();
+        assert!(!state.runner.can_start("app.localhost", Some("container")));
+        assert!(state.runner.start("app.localhost").await.is_err());
+        assert!(state.supervisor.up(None).await.is_err());
+        let spec = portman_protocol::EgressSpec {
+            require_caller_token: false,
+            secrets: "test".into(),
+            key: "KEY".into(),
+            header: "Authorization".into(),
+            format: "Bearer {value}".into(),
+            upstream_host: "provider.example".into(),
+            tls: true,
+        };
+        let credentials = SupervisorCredentials {
+            supervisor: state.supervisor.clone(),
+        };
+        assert!(!credentials.authorize("alias.localhost", "provider.example:443", &spec, &[]));
+        assert!(matches!(
+            handle_status(&state).await,
+            Response::Status {
+                managed_broker: true,
+                egress_grants_version: 1,
+                ..
+            }
+        ));
     }
 }

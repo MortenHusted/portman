@@ -11,6 +11,16 @@ use portman_protocol::{Request, Response};
 use tokio::net::UnixStream;
 
 pub(crate) async fn request(req: Request) -> Result<Response> {
+    let req = if std::env::var("PORTMAN_MANAGED_BROKER").is_ok_and(|v| v == "true" || v == "1") {
+        let token = std::fs::read_to_string(portman_core::paths::dashboard_token_path()?)
+            .context("reading host control token for managed broker")?;
+        Request::Authenticated {
+            token: portman_protocol::Redacted(token.trim().into()),
+            request: Box::new(req),
+        }
+    } else {
+        req
+    };
     let path = socket_path()?;
     let mut stream = UnixStream::connect(&path).await.with_context(|| {
         format!(

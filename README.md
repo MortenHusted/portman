@@ -222,8 +222,9 @@ Semantics worth knowing:
   cleartext across a real network boundary is refused at config load, not
   just discouraged. Loopback targets (e.g. a local mock) may set
   `tls = false`.
-- **The caller is not authenticated.** Any local process that can reach the
-  proxy port can use the route — that is the point. What portman refuses is
+- **Legacy routes do not authenticate callers.** Set `require_caller_token = true`
+  to require a scoped grant, or use managed broker mode below to enforce grants
+  for every egress route. In all modes Portman refuses
   *cross-origin* callers: a browser page from another site (`Origin` /
   `Sec-Fetch-Site: cross-site`) gets `403` before the credential is
   resolved, mirroring the Start-button guard.
@@ -233,6 +234,65 @@ Semantics worth knowing:
   block unregisters the route on the next `portman up`. A wildcard `host`
   (`*.api.test`) works like static-rule wildcards: the credential is
   attached for every one-label subdomain, always to the same `target`.
+
+### Managed credential broker
+
+`portman-daemon --managed-broker` requires caller grants on **every** egress
+route, even when repo config omits `require_caller_token`. Use this mode for
+sandboxed agents. It requires service-free daemon state and authenticated
+control access: service syncs with definitions, watchers, native service starts,
+Docker starts and pitchfork starts are disabled. Existing supervised services
+must be stopped and forgotten deliberately before switching modes. General
+outbound network access is unchanged.
+
+A trusted controller generates a random 256-bit token, retains/delivers it
+outside argv and logs, and sends its lowercase SHA-256 digest over the existing
+Unix IPC protocol. Control requests in managed mode use this envelope:
+
+```json
+{
+  "kind": "authenticated",
+  "token": "<host-only dashboard admin token>",
+  "request": {
+    "kind": "issue_egress_grant",
+    "grant_id": "agent-run-unique-id",
+    "host": "qwen.localhost",
+    "token_sha256": "<64 lowercase hex characters>",
+    "expires_at": 1800000000
+  }
+}
+```
+
+The exact-host route must already exist; protected wildcard routes are not supported.
+The grant binds its exact host, upstream target
+and credential spec; editing the route invalidates the old grant. The issue
+request is idempotent only for identical parameters and unchanged route. Expiry
+is an absolute Unix timestamp in seconds, with no renewal operation.
+`revoke_egress_grant` takes `grant_id`; revocation is terminal and works before
+issuance too. New runs receive new IDs and tokens. Previously admitted upstream
+requests are not cancelled by revocation.
+
+The agent sends exactly one `Authorization: Bearer <route-token>` header.
+Missing, wrong, duplicate, expired or revoked grants receive 403 before provider
+secret resolution or upstream connection. Conflicting `Proxy-Authorization`,
+`X-Api-Key` and `Api-Key` headers are rejected on protected routes. The proxy
+strips caller authorization and injects the provider credential. Provider SDKs
+must therefore support the selected route and bearer configuration; an SDK that
+only sends a provider-specific key header needs a separate adapter.
+
+Only digests and metadata are persisted in `egress-grants.json` (0600). Missing
+or corrupt grant state denies requests; failed state writes fail issuance or
+revocation. `Status` reports `managed_broker` and `egress_grants_version: 1` so
+controllers can reject unsupported brokers. To use the regular CLI against a
+managed broker, set `PORTMAN_MANAGED_BROKER=true`; it reads the existing dashboard
+admin token file and wraps IPC requests. Never give that admin token to agents.
+
+This is possession-based route authorization, not process identity. The
+sandbox must deny access to Portman's state, credential files, admin token and
+other workspaces' route tokens. All administrative IPC additionally checks the
+admin token, even for same-UID callers. A permitted agent can share its own route
+token; protecting files alone does not prevent that. Calls can use the entire
+configured upstream route; endpoint/method restrictions are not implemented.
 
 A few semantics worth knowing before you rely on them:
 

@@ -107,12 +107,18 @@ impl Runner {
 #[async_trait::async_trait]
 impl Starter for Runner {
     fn can_start(&self, host: &str, container_id: Option<&str>) -> bool {
+        if self.supervisor.managed_broker() {
+            return false;
+        }
         self.supervisor.service_for_host(host).is_some()
             || container_id.is_some()
             || self.static_store.service_for(host).is_some()
     }
 
     async fn start(&self, host: &str) -> Result<String> {
+        if self.supervisor.managed_broker() {
+            bail!("managed broker mode cannot start services");
+        }
         // Native service first: during migration the same host can also
         // carry a pitchfork mapping — native winning is the cutover.
         if let Some(service) = self.supervisor.service_for_host(host) {

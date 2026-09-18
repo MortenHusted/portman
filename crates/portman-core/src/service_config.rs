@@ -321,6 +321,8 @@ struct RawSecrets {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawEgress {
+    #[serde(default)]
+    require_caller_token: bool,
     /// Local hostname callers address (must sit under a managed TLD).
     host: String,
     /// Upstream `host:port` the rewritten request lands at.
@@ -774,6 +776,7 @@ fn resolve_egress(
         host,
         target,
         spec: EgressSpec {
+            require_caller_token: raw.require_caller_token,
             secrets: raw.secrets,
             key: raw.key,
             header: raw.header,

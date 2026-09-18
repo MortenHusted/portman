@@ -11,6 +11,7 @@ mod dns;
 mod docker_events;
 mod egress;
 mod egress_client;
+mod egress_grants;
 mod env_compose;
 mod handlers;
 mod ipc_server;
@@ -88,6 +89,10 @@ pub(crate) fn block_on_reactor<T>(f: impl FnOnce() -> T) -> T {
     about = "portman daemon — Docker watcher, DNS, HTTP proxy"
 )]
 struct Args {
+    /// Dedicated credential broker: all egress requires route grants and no
+    /// services, watchers, Docker or pitchfork starts are permitted.
+    #[arg(long, env = "PORTMAN_MANAGED_BROKER")]
+    managed_broker: bool,
     /// Path to the docker socket. Examples:
     ///   colima (legacy home): /Users/<you>/.colima/default/docker.sock
     ///   colima (XDG):         /Users/<you>/.config/colima/default/docker.sock
@@ -286,6 +291,18 @@ pub async fn daemon_main() -> Result<()> {
     let supervisor = supervisor::Supervisor::for_daemon(logs.sink(), route_binder, secrets_source)
         .context("initializing supervisor")?;
 
+    if args.managed_broker {
+        anyhow::ensure!(
+            args.dashboard_auth,
+            "managed broker requires dashboard authentication"
+        );
+        supervisor.set_managed_broker();
+        supervisor
+            .restore()
+            .await
+            .context("restoring managed broker")?;
+    }
+
     let runner = runner::Runner::new(
         docker.clone(),
         static_store.clone(),
@@ -337,7 +354,7 @@ pub async fn daemon_main() -> Result<()> {
     // Restore persisted desired service state (terminating any process
     // groups that survived an unclean daemon exit, never adopting them) and
     // start desired-up services.
-    {
+    if !args.managed_broker {
         let supervisor = supervisor.clone();
         tokio::spawn(async move {
             if let Err(err) = supervisor.restore().await {

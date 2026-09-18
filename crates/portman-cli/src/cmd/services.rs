@@ -28,8 +28,11 @@ pub(crate) async fn cmd_status(repo: bool) -> Result<()> {
             bridge_enabled: _bridge_enabled,
             bridge_mode: _bridge_mode,
             dashboard_port: _,
+            managed_broker,
+            egress_grants_version,
         } => {
             println!("daemon version:  {version}");
+            println!("managed broker:  {managed_broker} (egress grants v{egress_grants_version})");
             println!("running for:     {running_since}");
             println!("dns port:        {dns_port} (127.0.0.1)");
             println!("http proxy:      {proxy_port} (127.0.0.1)");
