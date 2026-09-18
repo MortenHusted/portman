@@ -239,10 +239,16 @@ Semantics worth knowing:
 
 `portman-daemon --managed-broker` requires caller grants on **every** egress
 route, even when repo config omits `require_caller_token`. Use this mode for
-sandboxed agents. It requires service-free daemon state and authenticated
+sandboxed agents. No Docker installation or daemon is required in this mode;
+container discovery, events, resource sampling and netbridge are disabled.
+It requires service-free daemon state and authenticated
 control access: service syncs with definitions, watchers, native service starts,
 Docker starts and pitchfork starts are disabled. Existing supervised services
-must be stopped and forgotten deliberately before switching modes. General
+must be stopped and forgotten deliberately before switching modes. A durable marker
+prevents this version from reopening managed state in legacy mode. Managed route
+sync and restore also persist `require_caller_token = true`. Pre-feature binaries
+do not understand these controls and **must not** be run against managed state;
+the trusted launcher must pin a compatible binary and check status capabilities. General
 outbound network access is unchanged.
 
 A trusted controller generates a random 256-bit token, retains/delivers it
@@ -267,7 +273,11 @@ The exact-host route must already exist; protected wildcard routes are not suppo
 The grant binds its exact host, upstream target
 and credential spec; editing the route invalidates the old grant. The issue
 request is idempotent only for identical parameters and unchanged route. Expiry
-is an absolute Unix timestamp in seconds, with no renewal operation.
+is an absolute Unix timestamp in seconds, with no renewal operation. The broker
+persists its observed clock high-water mark and compares live time with monotonic
+elapsed time. Rollback denies grant use and issuance, including after restart,
+until time catches up; revocation remains available. This detects rollback below
+previous observations, not unobservable clock changes while the machine is off.
 `revoke_egress_grant` takes `grant_id`; revocation is terminal and works before
 issuance too. New runs receive new IDs and tokens. Previously admitted upstream
 requests are not cancelled by revocation.
@@ -282,7 +292,8 @@ only sends a provider-specific key header needs a separate adapter.
 
 Only digests and metadata are persisted in `egress-grants.json` (0600). Missing
 or corrupt grant state denies requests; failed state writes fail issuance or
-revocation. `Status` reports `managed_broker` and `egress_grants_version: 1` so
+revocation. Security state acknowledges only after both file and directory fsync;
+a failed clock-state write also denies the request. `Status` reports `managed_broker` and `egress_grants_version: 1` so
 controllers can reject unsupported brokers. To use the regular CLI against a
 managed broker, set `PORTMAN_MANAGED_BROKER=true`; it reads the existing dashboard
 admin token file and wraps IPC requests. Never give that admin token to agents.

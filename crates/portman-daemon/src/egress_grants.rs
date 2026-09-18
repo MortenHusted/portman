@@ -18,11 +18,16 @@ struct Grant {
 }
 
 // None is a terminal tombstone, including revoke-before-issue.
-type Records = BTreeMap<String, Option<Grant>>;
+#[derive(Default, Serialize, Deserialize)]
+struct Records {
+    observed_unix: u64,
+    grants: BTreeMap<String, Option<Grant>>,
+}
 
 pub(crate) struct GrantStore {
     path: PathBuf,
     gate: Mutex<()>,
+    started_at: (u64, std::time::Instant),
 }
 
 impl GrantStore {
@@ -30,19 +35,36 @@ impl GrantStore {
         Self {
             path,
             gate: Mutex::new(()),
+            started_at: (crate::now_unix_ms() / 1000, std::time::Instant::now()),
         }
     }
 
     fn read(&self) -> Result<Records> {
         match std::fs::read(&self.path) {
             Ok(bytes) => serde_json::from_slice(&bytes).context("invalid egress grant store"),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Records::default()),
             Err(err) => Err(err).context("reading egress grant store"),
         }
     }
 
     fn write(&self, records: &Records) -> Result<()> {
-        portman_core::atomic_json::atomic_write_json_with_mode(&self.path, records, 0o600)
+        portman_core::atomic_json::atomic_write_json_durable(&self.path, records, 0o600)
+    }
+
+    fn observe(&self, records: &mut Records, now: u64) -> Result<()> {
+        let monotonic_floor = self
+            .started_at
+            .0
+            .saturating_add(self.started_at.1.elapsed().as_secs());
+        let floor = records.observed_unix.max(monotonic_floor);
+        if now < floor {
+            bail!("clock rollback: egress grants unavailable until time recovers");
+        }
+        if now > records.observed_unix {
+            records.observed_unix = now;
+            self.write(records)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn issue(
@@ -67,6 +89,7 @@ impl GrantStore {
         }
         let _guard = self.gate.lock().expect("grant lock poisoned");
         let mut records = self.read()?;
+        self.observe(&mut records, crate::now_unix_ms() / 1000)?;
         let grant = Grant {
             host,
             token_sha256: digest,
@@ -74,7 +97,7 @@ impl GrantStore {
             route_identity,
             revoked: false,
         };
-        if let Some(existing) = records.get(&id) {
+        if let Some(existing) = records.grants.get(&id) {
             if existing.as_ref() == Some(&grant) {
                 return Ok(());
             }
@@ -85,13 +108,14 @@ impl GrantStore {
         }
         // Reusing a bearer across hosts would silently broaden its authority.
         if records
+            .grants
             .values()
             .flatten()
             .any(|g| g.token_sha256 == grant.token_sha256)
         {
             bail!("bearer digest is already assigned to a grant");
         }
-        records.insert(id, Some(grant));
+        records.grants.insert(id, Some(grant));
         self.write(&records)
     }
 
@@ -99,10 +123,10 @@ impl GrantStore {
         validate_id(&id)?;
         let _guard = self.gate.lock().expect("grant lock poisoned");
         let mut records = self.read()?;
-        match records.get_mut(&id) {
+        match records.grants.get_mut(&id) {
             Some(Some(grant)) => grant.revoked = true,
             _ => {
-                records.insert(id, None);
+                records.grants.insert(id, None);
             }
         }
         self.write(&records)
@@ -143,10 +167,13 @@ impl GrantStore {
         }
         let digest = hex::encode(Sha256::digest(token.as_bytes()));
         let _guard = self.gate.lock().expect("grant lock poisoned");
-        let Ok(records) = self.read() else {
+        let Ok(mut records) = self.read() else {
             return false;
         };
-        records.values().flatten().any(|g| {
+        if self.observe(&mut records, now).is_err() {
+            return false;
+        }
+        records.grants.values().flatten().any(|g| {
             !g.revoked
                 && g.route_identity == route
                 && g.host == host
@@ -223,5 +250,20 @@ mod tests {
         let store = GrantStore::new(path);
         assert!(!store.permits("qwen.localhost", "route-v1", &headers(), 0));
         assert!(store.revoke("run-1".into()).is_err());
+    }
+    #[test]
+    fn clock_rollback_cannot_reactivate_expired_grants_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grants.json");
+        let store = GrantStore::new(path.clone());
+        let now = crate::now_unix_ms() / 1000;
+        issue(&store, "clock-test", now + 60).unwrap();
+        assert!(store.permits("qwen.localhost", "route-v1", &headers(), now));
+        assert!(!store.permits("qwen.localhost", "route-v1", &headers(), now + 60));
+        assert!(!store.permits("qwen.localhost", "route-v1", &headers(), now));
+        let reloaded = GrantStore::new(path);
+        assert!(!reloaded.permits("qwen.localhost", "route-v1", &headers(), now));
+        assert!(issue(&reloaded, "new-run", now + 120).is_err());
+        reloaded.revoke("clock-test".into()).unwrap();
     }
 }

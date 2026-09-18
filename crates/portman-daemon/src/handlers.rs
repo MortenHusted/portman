@@ -7,6 +7,14 @@ use portman_protocol::TldInfo;
 use crate::DaemonState;
 
 pub(crate) async fn dispatch(request: Request, state: &DaemonState) -> Response {
+    if state.supervisor.managed_broker()
+        && matches!(
+            request,
+            Request::BridgeEnable | Request::BridgeDisable | Request::BridgeSetMode { .. }
+        )
+    {
+        return err("managed broker mode does not manage container networking");
+    }
     match request {
         Request::Authenticated { .. } => {
             err("control envelope must be authenticated by IPC transport")

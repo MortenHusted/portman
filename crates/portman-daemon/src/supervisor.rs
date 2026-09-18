@@ -569,6 +569,19 @@ pub(crate) struct Supervisor {
 }
 
 impl Supervisor {
+    pub(crate) fn configure_managed_broker(&self, enabled: bool) -> Result<()> {
+        let marker = self.inner.state_path.with_file_name("managed-broker.json");
+        if !enabled {
+            if marker.try_exists()? {
+                bail!("managed broker state cannot be opened in legacy mode");
+            }
+            return Ok(());
+        }
+        portman_core::atomic_json::atomic_write_json_durable(&marker, &true, 0o600)?;
+        self.set_managed_broker();
+        Ok(())
+    }
+
     pub(crate) fn set_managed_broker(&self) {
         self.inner
             .managed_broker
@@ -680,10 +693,15 @@ impl Supervisor {
         root: &Path,
         services: Vec<ServiceDefinition>,
         secrets: BTreeMap<String, SecretsProviderConfig>,
-        egress: BTreeMap<String, EgressRoute>,
+        mut egress: BTreeMap<String, EgressRoute>,
     ) -> Result<SyncReport> {
         if self.managed_broker() && !services.is_empty() {
             bail!("managed broker mode does not supervise services or watchers");
+        }
+        if self.managed_broker() {
+            for route in egress.values_mut() {
+                route.spec.require_caller_token = true;
+            }
         }
         // One sync at a time - see Inner::sync_gate.
         let _gate = self.inner.sync_gate.lock().await;
@@ -1209,11 +1227,21 @@ impl Supervisor {
     /// Load persisted state, reconcile surviving process groups
     /// (terminate-and-respawn, never adopt), then start desired services.
     pub(crate) async fn restore(&self) -> Result<()> {
-        let persisted = load_persisted(&self.inner.state_path)?;
+        let mut persisted = load_persisted(&self.inner.state_path)?;
         if self.managed_broker() && !persisted.services.is_empty() {
             bail!(
                 "managed broker mode requires service-free state; stop and forget services first"
             );
+        }
+        if self.managed_broker() {
+            for entry in persisted.egress.values_mut() {
+                entry.route.spec.require_caller_token = true;
+            }
+            portman_core::atomic_json::atomic_write_json_durable(
+                &self.inner.state_path,
+                &persisted,
+                0o600,
+            )?;
         }
         let mut markers: Vec<(String, RunningMarker)> = Vec::new();
         {
@@ -4267,5 +4295,27 @@ mod tests {
             original_state,
             std::fs::read(dir.path().join("services.json")).unwrap()
         );
+    }
+    #[tokio::test]
+    async fn managed_state_cannot_reopen_as_legacy_and_persists_route_protection() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = test_supervisor(&dir, CollectSink::new());
+        sup.configure_managed_broker(true).unwrap();
+        let legacy = test_supervisor(&dir, CollectSink::new());
+        assert!(legacy.configure_managed_broker(false).is_err());
+        let mut route = egress_route("qwen.localhost");
+        route.spec.require_caller_token = false;
+        let mut egress = Map::new();
+        egress.insert("qwen".into(), route);
+        let mut blocks = Map::new();
+        blocks.insert(
+            "gh".into(),
+            portman_protocol::SecretsProviderConfig::Local {
+                keys: vec!["TOKEN".into()],
+            },
+        );
+        sup.sync(dir.path(), vec![], blocks, egress).await.unwrap();
+        let persisted = load_persisted(&dir.path().join("services.json")).unwrap();
+        assert!(persisted.egress["qwen"].route.spec.require_caller_token);
     }
 }
