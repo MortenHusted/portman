@@ -368,6 +368,12 @@ pub async fn daemon_main() -> Result<()> {
     }
 
     let managed_broker = args.managed_broker;
+    // Bind both families before exposing managed capabilities over IPC.
+    let managed_http = if managed_broker {
+        Some(proxy::bind_managed(args.proxy_port).await?)
+    } else {
+        None
+    };
     let sampler = resources::run_sampler(state.clone(), resource_history);
     let sampler = tokio::spawn(async move {
         if managed_broker {
@@ -433,14 +439,35 @@ pub async fn daemon_main() -> Result<()> {
         Arc::new(crate::egress::SupervisorCredentials {
             supervisor: supervisor.clone(),
         });
-    let http = tokio::spawn(proxy::run(
-        state.registry.clone(),
-        args.proxy_port,
-        bridge_ifindex.clone(),
-        starter.clone(),
-        egress_credentials.clone(),
-        crate::egress_client::Roots::System,
-    ));
+    let http_registry = state.registry.clone();
+    let http_bridge = bridge_ifindex.clone();
+    let http_starter = starter.clone();
+    let http = tokio::spawn(async move {
+        match managed_http {
+            Some(listeners) => {
+                proxy::serve_managed(
+                    listeners,
+                    http_registry,
+                    http_bridge,
+                    http_starter,
+                    egress_credentials,
+                    crate::egress_client::Roots::System,
+                )
+                .await
+            }
+            None => {
+                proxy::run(
+                    http_registry,
+                    args.proxy_port,
+                    http_bridge,
+                    http_starter,
+                    egress_credentials,
+                    crate::egress_client::Roots::System,
+                )
+                .await
+            }
+        }
+    });
     // Loopback front for TCP-mode entries (databases etc.): keeps them
     // reachable even when a VPN/exit-node captures the target's real subnet.
     let tcp_forward = tokio::spawn(tcp_forward::run(

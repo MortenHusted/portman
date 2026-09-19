@@ -79,17 +79,23 @@ impl CredentialsStore {
 
     pub(crate) fn set_infisical(&self, client_id: String, client_secret: String) -> Result<()> {
         let mut guard = self.state.lock().expect("credentials lock poisoned");
-        guard.infisical = Some(InfisicalCredentials {
+        let mut next = guard.clone();
+        next.infisical = Some(InfisicalCredentials {
             client_id,
             client_secret,
         });
-        save(&self.path, &guard)
+        save(&self.path, &next)?;
+        *guard = next;
+        Ok(())
     }
 
     pub(crate) fn set_onepassword(&self, token: String) -> Result<()> {
         let mut guard = self.state.lock().expect("credentials lock poisoned");
-        guard.onepassword = Some(OnePasswordCredentials { token });
-        save(&self.path, &guard)
+        let mut next = guard.clone();
+        next.onepassword = Some(OnePasswordCredentials { token });
+        save(&self.path, &next)?;
+        *guard = next;
+        Ok(())
     }
 
     pub(crate) fn infisical(&self) -> Option<InfisicalCredentials> {
@@ -113,18 +119,65 @@ impl CredentialsStore {
     /// reference.
     pub(crate) fn set_local(&self, key: String, value: String) -> Result<()> {
         let mut guard = self.state.lock().expect("credentials lock poisoned");
-        guard.local.insert(key, value);
-        save(&self.path, &guard)
+        let mut next = guard.clone();
+        next.local.insert(key, value);
+        save(&self.path, &next)?;
+        *guard = next;
+        Ok(())
     }
 
     /// Remove one vault value; `Ok(false)` when there was none.
     pub(crate) fn unset_local(&self, key: &str) -> Result<bool> {
         let mut guard = self.state.lock().expect("credentials lock poisoned");
-        if guard.local.remove(key).is_none() {
+        let mut next = guard.clone();
+        if next.local.remove(key).is_none() {
             return Ok(false);
         }
-        save(&self.path, &guard)?;
+        save(&self.path, &next)?;
+        *guard = next;
         Ok(true)
+    }
+
+    pub(crate) fn install_owned_local(
+        &self,
+        key: &str,
+        value: &str,
+        owned: bool,
+        prepare: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let mut guard = self.state.lock().expect("credentials lock poisoned");
+        if let Some(current) = guard.local.get(key) {
+            anyhow::ensure!(
+                owned && current == value,
+                "owned inference credential conflict"
+            );
+        }
+        // Persist ownership before the key so a crash can retry without claiming a foreign key.
+        prepare()?;
+        let mut next = guard.clone();
+        next.local.insert(key.to_owned(), value.to_owned());
+        save(&self.path, &next)?;
+        *guard = next;
+        Ok(())
+    }
+
+    pub(crate) fn remove_owned_local(
+        &self,
+        key: &str,
+        owned: bool,
+        finish: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let mut guard = self.state.lock().expect("credentials lock poisoned");
+        anyhow::ensure!(
+            owned || !guard.local.contains_key(key),
+            "owned inference credential conflict"
+        );
+        let mut next = guard.clone();
+        next.local.remove(key);
+        // Leave the ownership record until key deletion is durable, including on retries.
+        save(&self.path, &next)?;
+        *guard = next;
+        finish()
     }
 
     /// Every vault key, sorted. Names only — the listing surfaces never see
@@ -158,31 +211,9 @@ impl CredentialsStore {
 /// Atomic-rename write; both the temp file and the final file are 0600 —
 /// these are machine credentials.
 fn save(path: &Path, credentials: &Credentials) -> Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let tmp = path.with_extension("json.tmp");
     let mut persisted = credentials.clone();
     persisted.version = 1;
-    let bytes = serde_json::to_vec_pretty(&persisted)?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)
-        .with_context(|| format!("creating temp file {}", tmp.display()))?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
+    portman_core::atomic_json::atomic_write_json_durable(path, &persisted, 0o600)
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +332,48 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
     use tempfile::tempdir;
+
+    #[test]
+    fn failed_credential_mutations_preserve_state_and_retry_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let store = CredentialsStore::load(path.clone()).unwrap();
+        store.set_local("TOKEN".into(), "old".into()).unwrap();
+        store
+            .set_infisical("old-id".into(), "old-secret".into())
+            .unwrap();
+        store.set_onepassword("old-token".into()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(store.set_local("TOKEN".into(), "new".into()).is_err());
+        assert!(store.unset_local("TOKEN").is_err());
+        assert!(store.unset_local("TOKEN").is_err());
+        assert!(store
+            .set_infisical("new-id".into(), "new-secret".into())
+            .is_err());
+        assert!(store.set_onepassword("new-token".into()).is_err());
+        assert_eq!(store.local_values(&["TOKEN".into()]).unwrap()[0].1, "old");
+        assert_eq!(store.infisical().unwrap().client_id, "old-id");
+        assert_eq!(store.onepassword().unwrap().token, "old-token");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, original).unwrap();
+        assert!(store.unset_local("TOKEN").unwrap());
+        assert!(!store.unset_local("TOKEN").unwrap());
+        assert!(CredentialsStore::load(path.clone())
+            .unwrap()
+            .local_keys()
+            .is_empty());
+        store.set_local("TOKEN".into(), "new".into()).unwrap();
+        assert_eq!(
+            CredentialsStore::load(path)
+                .unwrap()
+                .local_values(&["TOKEN".into()])
+                .unwrap()[0]
+                .1,
+            "new"
+        );
+    }
 
     #[test]
     fn credentials_roundtrip_and_owner_only_permissions() {

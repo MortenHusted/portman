@@ -298,7 +298,30 @@ Only digests and metadata are persisted in `egress-grants.json` (0600). Missing
 or corrupt grant state denies requests; failed state writes fail issuance or
 revocation. Security state acknowledges only after both file and directory fsync;
 a failed clock-state write also denies the request. `Status` reports `managed_broker` and `egress_grants_version: 1` so
-controllers can reject unsupported brokers. To use the regular CLI against a
+controllers can reject unsupported brokers. Managed brokers also report
+`inference_provisioning_version: 1`: credential writes and route-only
+`SyncServices` replacements (including empty-root removal) acknowledge only
+after durable persistence. Failed writes retain the previous in-memory state
+and can be retried. Both `127.0.0.1` and `::1` HTTP listeners bind the same port
+before managed IPC starts; failure to bind either prevents startup. Regular
+unmanaged listeners retain their existing behavior.
+
+Controllers provisioning a route and key together use managed-only
+`install_inference_route` (`root`, `name`, `key`, write-only `value`, `route`)
+and `remove_inference_route` (`root`, `name`, `key`, `host`). The hostname must
+be `<name>.localhost`; the route names the same local block and key. Existing
+root, block, hostname and key ownership must agree before either store changes.
+An unclaimed preexisting key or changed installed route is a conflict, never an
+overwrite. These commands serialize with ordinary route and credential writes.
+
+Install durably records route/block ownership before the credential. Removal
+durably deletes the credential before discarding ownership. An interrupted
+operation can therefore be retried without claiming or deleting a foreign key;
+success is returned only after both stores are durable. Controllers must revoke
+route grants before removal. Repeated removal of absent owned state succeeds.
+The managed `unset_local_secret` command also treats an absent key as success;
+its unmanaged CLI behavior still reports a missing key.
+ To use the regular CLI against a
 managed broker, set `PORTMAN_MANAGED_BROKER=true`; it reads the existing dashboard
 admin token file and wraps IPC requests. Never give that admin token to agents.
 

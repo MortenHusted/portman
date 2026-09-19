@@ -124,6 +124,37 @@ pub(crate) async fn dispatch(request: Request, state: &DaemonState) -> Response 
         } => handle_set_secrets_credentials(state, provider, client_id, client_secret, token),
         Request::SetLocalSecret { key, value } => handle_set_local_secret(state, key, value),
         Request::UnsetLocalSecret { key } => handle_unset_local_secret(state, key),
+        Request::InstallInferenceRoute {
+            root,
+            name,
+            key,
+            value,
+            route,
+        } => {
+            match state
+                .supervisor
+                .install_inference_route(&state.credentials, &root, &name, &key, &value.0, route)
+                .await
+            {
+                Ok(()) => Response::Ok,
+                Err(error) => err(format!("{error:#}")),
+            }
+        }
+        Request::RemoveInferenceRoute {
+            root,
+            name,
+            key,
+            host,
+        } => {
+            match state
+                .supervisor
+                .remove_inference_route(&state.credentials, &root, &name, &key, &host)
+                .await
+            {
+                Ok(()) => Response::Ok,
+                Err(error) => err(format!("{error:#}")),
+            }
+        }
         Request::SecretsStatus => handle_secrets_status(state),
         Request::SetSecretsBlock { name, config } => {
             let name = name.trim().to_string();
@@ -166,6 +197,7 @@ fn handle_set_local_secret(
 fn handle_unset_local_secret(state: &DaemonState, key: String) -> Response {
     match state.credentials.unset_local(key.trim()) {
         Ok(true) => Response::Ok,
+        Ok(false) if state.supervisor.managed_broker() => Response::Ok,
         Ok(false) => err(format!("no local secret `{}` is set", key.trim())),
         Err(e) => err(format!("persisting secrets: {e:#}")),
     }
@@ -439,6 +471,7 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
     Response::Status {
         managed_broker: state.supervisor.managed_broker(),
         egress_grants_version: 1,
+        inference_provisioning_version: u32::from(state.supervisor.managed_broker()),
         version: VERSION.to_string(),
         running_since: format_duration(state.started.elapsed()),
         dns_port: state.dns_port,
@@ -1432,6 +1465,190 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     }
+    fn inference_state(dir: &TempDir) -> DaemonState {
+        let mut state = test_state(dir);
+        state.supervisor = crate::supervisor::Supervisor::new(
+            dir.path().join("services.json"),
+            crate::env_compose::BaseEnv {
+                user: "dev".into(),
+                home: dir.path().join("home"),
+            },
+            crate::supervisor::IdentityPolicy::CurrentUser,
+            crate::supervisor::Timings::default(),
+            state.logs.sink(),
+            Arc::new(crate::supervisor::NoSecrets),
+            Arc::new(crate::supervisor::RouteBinder {
+                registry: state.registry.clone(),
+                static_store: state.static_store.clone(),
+                known_tlds: state.known_tlds.clone(),
+                tls_store: state.tls_store.clone(),
+                cert_manager: state.cert_manager.clone(),
+            }),
+        );
+        state
+    }
+
+    async fn inference_wire(state: &DaemonState, body: serde_json::Value) -> serde_json::Value {
+        // Decode the real protocol and dispatch to real stores, not a broker mock.
+        let request: Request = serde_json::from_value(body).unwrap();
+        assert!(!format!("{request:?}").contains("synthetic-inference-value"));
+        serde_json::to_value(dispatch(request, state).await).unwrap()
+    }
+
+    fn inference_install(root: &std::path::Path) -> serde_json::Value {
+        serde_json::json!({"kind":"install_inference_route","root":root,"name":"inference-demo","key":"DEMO_KEY","value":"synthetic-inference-value",
+            "route":{"host":"inference-demo.localhost","target":"secrets.example.com:443","spec":{
+                "require_caller_token":true,"secrets":"inference-demo","key":"DEMO_KEY","header":"Authorization",
+                "format":"Bearer {value}","upstream_host":"secrets.example.com","tls":true}}})
+    }
+
+    fn inference_remove(root: &std::path::Path) -> serde_json::Value {
+        serde_json::json!({"kind":"remove_inference_route","root":root,"name":"inference-demo","key":"DEMO_KEY","host":"inference-demo.localhost"})
+    }
+
+    #[tokio::test]
+    async fn managed_absent_secret_unset_is_idempotent_on_the_real_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = inference_state(&dir);
+        let request = serde_json::json!({"kind":"unset_local_secret","key":"MISSING_KEY"});
+        assert_eq!(inference_wire(&state, request.clone()).await["kind"], "err");
+        state.supervisor.set_managed_broker();
+        for _ in 0..2 {
+            assert_eq!(
+                inference_wire(&state, request.clone()).await,
+                serde_json::json!({"kind":"ok"})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_inference_install_remove_retry_and_redaction_use_real_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = inference_state(&dir);
+        state.supervisor.set_managed_broker();
+        let root = dir.path().join("owned");
+        assert_eq!(
+            inference_wire(&state, inference_remove(&root)).await,
+            serde_json::json!({"kind":"ok"})
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                inference_wire(&state, inference_install(&root)).await,
+                serde_json::json!({"kind":"ok"})
+            );
+        }
+        assert!(state.registry.get("inference-demo.localhost").is_some());
+        assert_eq!(
+            state
+                .credentials
+                .local_values(&["DEMO_KEY".into()])
+                .unwrap()[0]
+                .1,
+            "synthetic-inference-value"
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                inference_wire(&state, inference_remove(&root)).await,
+                serde_json::json!({"kind":"ok"})
+            );
+        }
+        assert!(state.registry.get("inference-demo.localhost").is_none());
+        assert!(state.credentials.local_keys().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inference_partial_persistence_retries_keep_ownership_until_key_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = inference_state(&dir);
+        state.supervisor.set_managed_broker();
+        let root = dir.path().join("owned");
+        let credentials = dir.path().join("credentials.json");
+        std::fs::create_dir(&credentials).unwrap();
+        assert_eq!(
+            inference_wire(&state, inference_install(&root)).await["kind"],
+            "err"
+        );
+        assert!(state.credentials.local_keys().is_empty());
+        assert!(state.registry.get("inference-demo.localhost").is_some());
+        std::fs::remove_dir(&credentials).unwrap();
+        assert_eq!(
+            inference_wire(&state, inference_install(&root)).await["kind"],
+            "ok"
+        );
+        let services = dir.path().join("services.json");
+        let saved = std::fs::read(&services).unwrap();
+        std::fs::remove_file(&services).unwrap();
+        std::fs::create_dir(&services).unwrap();
+        assert_eq!(
+            inference_wire(&state, inference_remove(&root)).await["kind"],
+            "err"
+        );
+        assert!(state.credentials.local_keys().is_empty());
+        assert!(state.registry.get("inference-demo.localhost").is_some());
+        std::fs::remove_dir(&services).unwrap();
+        std::fs::write(&services, saved).unwrap();
+        assert_eq!(
+            inference_wire(&state, inference_remove(&root)).await["kind"],
+            "ok"
+        );
+        assert!(state.registry.get("inference-demo.localhost").is_none());
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&services).unwrap()).unwrap();
+        assert!(persisted["egress"]
+            .as_object()
+            .map_or(true, |routes| routes.is_empty()));
+        assert!(crate::secrets::CredentialsStore::load(credentials)
+            .unwrap()
+            .local_keys()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_inference_install_and_remove_preserve_foreign_keys_and_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = inference_state(&dir);
+        state.supervisor.set_managed_broker();
+        let root = dir.path().join("owned");
+        state
+            .credentials
+            .set_local("DEMO_KEY".into(), "foreign-value".into())
+            .unwrap();
+        for request in [inference_install(&root), inference_remove(&root)] {
+            assert_eq!(inference_wire(&state, request).await["kind"], "err");
+            assert_eq!(
+                state
+                    .credentials
+                    .local_values(&["DEMO_KEY".into()])
+                    .unwrap()[0]
+                    .1,
+                "foreign-value"
+            );
+        }
+        assert!(state.registry.get("inference-demo.localhost").is_none());
+        state.credentials.unset_local("DEMO_KEY").unwrap();
+        let foreign = dir.path().join("foreign");
+        assert_eq!(
+            inference_wire(&state, inference_install(&foreign)).await["kind"],
+            "ok"
+        );
+        let before = state.registry.get("inference-demo.localhost").unwrap();
+        for request in [inference_install(&root), inference_remove(&root)] {
+            assert_eq!(inference_wire(&state, request).await["kind"], "err");
+            assert_eq!(
+                state.registry.get("inference-demo.localhost").unwrap(),
+                before
+            );
+            assert_eq!(
+                state
+                    .credentials
+                    .local_values(&["DEMO_KEY".into()])
+                    .unwrap()[0]
+                    .1,
+                "synthetic-inference-value"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn managed_broker_denies_starts_and_authenticates_unprotected_aliases() {
         use crate::egress::{CredentialSource, SupervisorCredentials};
@@ -1460,6 +1677,7 @@ mod tests {
             Response::Status {
                 managed_broker: true,
                 egress_grants_version: 1,
+                inference_provisioning_version: 1,
                 ..
             }
         ));

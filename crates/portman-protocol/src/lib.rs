@@ -343,6 +343,21 @@ pub enum Request {
     UnsetLocalSecret {
         key: String,
     },
+    /// Managed-only, ownership-checked route/block/key provisioning. Values are never returned.
+    InstallInferenceRoute {
+        root: std::path::PathBuf,
+        name: String,
+        key: String,
+        value: Redacted,
+        route: EgressRoute,
+    },
+    /// Managed-only removal of one root-owned inference route and its credential.
+    RemoveInferenceRoute {
+        root: std::path::PathBuf,
+        name: String,
+        key: String,
+        host: String,
+    },
     /// Which providers have credentials and which local keys exist or are
     /// referenced — names and flags only, never values.
     SecretsStatus,
@@ -398,6 +413,8 @@ pub enum Response {
         managed_broker: bool,
         #[serde(default)]
         egress_grants_version: u32,
+        #[serde(default)]
+        inference_provisioning_version: u32,
         #[serde(default = "default_unknown")]
         version: String,
         #[serde(default = "default_unknown")]
@@ -1195,9 +1212,11 @@ mod tests {
                 dashboard_port,
                 managed_broker,
                 egress_grants_version,
+                inference_provisioning_version,
             } => {
                 assert!(!managed_broker);
                 assert_eq!(egress_grants_version, 0);
+                assert_eq!(inference_provisioning_version, 0);
                 assert_eq!(version, "0.0.1");
                 assert_eq!(running_since, "5s");
                 assert_eq!(dns_port, 5335);
