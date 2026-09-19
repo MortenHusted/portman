@@ -705,6 +705,10 @@ impl Supervisor {
         }
         // One sync at a time - see Inner::sync_gate.
         let _gate = self.inner.sync_gate.lock().await;
+        if self.managed_broker() {
+            self.sync_managed_routes(root, secrets, egress)?;
+            return Ok(SyncReport::default());
+        }
         let mut report = SyncReport::default();
         let mut to_stop: Vec<String> = Vec::new(); // stop before replacing/removing
         let mut restart_after: Vec<String> = Vec::new();
@@ -886,6 +890,95 @@ impl Supervisor {
             self.up(Some(&[name])).await?;
         }
         Ok(report)
+    }
+
+    fn sync_managed_routes(
+        &self,
+        root: &Path,
+        secrets: BTreeMap<String, SecretsProviderConfig>,
+        egress: BTreeMap<String, EgressRoute>,
+    ) -> Result<()> {
+        let _gate = self
+            .inner
+            .persist_gate
+            .lock()
+            .expect("persist gate poisoned");
+        let mut next = persisted_snapshot(&self.inner);
+        for name in secrets.keys() {
+            if let Some(held) = next.secrets.get(name) {
+                if held.root.as_deref() != Some(root) {
+                    bail!(
+                        "[secrets.{name}] is already defined {}",
+                        describe_block_owner(held.root.as_deref())
+                    );
+                }
+            }
+        }
+        for name in egress.keys() {
+            if let Some(held) = next.egress.get(name) {
+                if held.root != root {
+                    bail!(
+                        "egress route name `{name}` is already defined by {}",
+                        held.root.display()
+                    );
+                }
+            }
+        }
+        next.secrets
+            .retain(|_, block| block.root.as_deref() != Some(root));
+        for (name, config) in secrets {
+            next.secrets.insert(
+                name,
+                PersistedSecrets {
+                    root: Some(root.to_path_buf()),
+                    config,
+                },
+            );
+        }
+        for (name, route) in &egress {
+            let block = next.secrets.get(&route.spec.secrets).with_context(|| {
+                format!("[egress.{name}] references an undefined secrets block")
+            })?;
+            portman_core::service_config::egress_key_allowed(
+                &route.spec.secrets,
+                &block.config,
+                &route.spec.key,
+            )?;
+            if next
+                .egress
+                .values()
+                .any(|held| held.root != root && held.route.host == route.host)
+            {
+                bail!("egress host is already owned by another root");
+            }
+        }
+        let removed: Vec<_> = next
+            .egress
+            .values()
+            .filter(|r| r.root == root)
+            .map(|r| r.route.clone())
+            .collect();
+        next.egress.retain(|_, route| route.root != root);
+        for (name, route) in &egress {
+            next.egress.insert(
+                name.clone(),
+                PersistedEgress {
+                    root: root.to_path_buf(),
+                    route: route.clone(),
+                },
+            );
+        }
+        crate::block_on_reactor(|| write_persisted(&self.inner.state_path, &next))?;
+        *self.inner.secrets.lock().expect("secrets lock poisoned") = next.secrets;
+        *self.inner.egress.lock().expect("egress lock poisoned") = next.egress;
+        for route in removed {
+            self.inner.routes.deregister_egress(&route);
+        }
+        for route in egress.values() {
+            self.inner.routes.register_egress(route);
+        }
+        self.inner.secrets_source.invalidate();
+        Ok(())
     }
 
     /// Resolve the single secret value an egress route names: find the
@@ -1114,19 +1207,27 @@ impl Supervisor {
         name: String,
         config: SecretsProviderConfig,
     ) -> Result<()> {
-        {
-            let mut blocks = self.inner.secrets.lock().expect("secrets lock poisoned");
-            if let Some(held) = blocks.get(&name) {
-                if let Some(root) = &held.root {
-                    bail!(
-                        "[secrets.{name}] is declared by {} — edit it there",
-                        root.display()
-                    );
-                }
+        let _gate = self
+            .inner
+            .persist_gate
+            .lock()
+            .expect("persist gate poisoned");
+        let mut next = persisted_snapshot(&self.inner);
+        let mut blocks = self.inner.secrets.lock().expect("secrets lock poisoned");
+        next.secrets = blocks.clone();
+        if let Some(held) = next.secrets.get(&name) {
+            if let Some(root) = &held.root {
+                bail!(
+                    "[secrets.{name}] is declared by {} — edit it there",
+                    root.display()
+                );
             }
-            blocks.insert(name, PersistedSecrets { root: None, config });
         }
-        self.persist();
+        next.secrets
+            .insert(name, PersistedSecrets { root: None, config });
+        crate::block_on_reactor(|| write_persisted(&self.inner.state_path, &next))?;
+        *blocks = next.secrets;
+        drop(blocks);
         // Replaced coordinates must not keep serving the old block's values.
         self.inner.secrets_source.invalidate();
         Ok(())
@@ -1135,22 +1236,31 @@ impl Supervisor {
     /// Drop a daemon-global block. Consumers keep referencing the name and
     /// fail on their next spawn / request with the usual "no such block".
     pub(crate) fn remove_global_block(&self, name: &str) -> Result<()> {
-        {
-            let mut blocks = self.inner.secrets.lock().expect("secrets lock poisoned");
-            match blocks.get(name) {
-                None => bail!("no block named [secrets.{name}]"),
-                Some(PersistedSecrets {
-                    root: Some(root), ..
-                }) => bail!(
+        let _gate = self
+            .inner
+            .persist_gate
+            .lock()
+            .expect("persist gate poisoned");
+        let mut next = persisted_snapshot(&self.inner);
+        let mut blocks = self.inner.secrets.lock().expect("secrets lock poisoned");
+        next.secrets = blocks.clone();
+        match next.secrets.get(name) {
+            None => bail!("no block named [secrets.{name}]"),
+            Some(PersistedSecrets {
+                root: Some(root), ..
+            }) => {
+                bail!(
                     "[secrets.{name}] is declared by {} — remove it there",
                     root.display()
-                ),
-                Some(_) => {
-                    blocks.remove(name);
-                }
+                );
+            }
+            Some(_) => {
+                next.secrets.remove(name);
             }
         }
-        self.persist();
+        crate::block_on_reactor(|| write_persisted(&self.inner.state_path, &next))?;
+        *blocks = next.secrets;
+        drop(blocks);
         self.inner.secrets_source.invalidate();
         Ok(())
     }
@@ -2281,32 +2391,34 @@ fn load_persisted(path: &Path) -> Result<Persisted> {
 fn persist(inner: &Arc<Inner>) {
     // See Inner::persist_gate — snapshot and write as one ordered unit.
     let _gate = inner.persist_gate.lock().expect("persist gate poisoned");
-    let persisted = {
-        let slots = inner.slots.lock().expect("slots lock poisoned");
-        let secrets = inner.secrets.lock().expect("secrets lock poisoned");
-        let egress = inner.egress.lock().expect("egress lock poisoned");
-        Persisted {
-            version: 1,
-            services: slots
-                .iter()
-                .map(|(name, slot)| {
-                    (
-                        name.clone(),
-                        PersistedService {
-                            root: slot.root.clone(),
-                            definition: slot.def.clone(),
-                            desired_up: *slot.desired_tx.borrow(),
-                            running: slot.running.clone(),
-                        },
-                    )
-                })
-                .collect(),
-            secrets: secrets.clone(),
-            egress: egress.clone(),
-        }
-    };
+    let persisted = persisted_snapshot(inner);
     if let Err(err) = crate::block_on_reactor(|| write_persisted(&inner.state_path, &persisted)) {
         warn!(%err, "persisting services state");
+    }
+}
+
+fn persisted_snapshot(inner: &Arc<Inner>) -> Persisted {
+    let slots = inner.slots.lock().expect("slots lock poisoned");
+    let secrets = inner.secrets.lock().expect("secrets lock poisoned");
+    let egress = inner.egress.lock().expect("egress lock poisoned");
+    Persisted {
+        version: 1,
+        services: slots
+            .iter()
+            .map(|(name, slot)| {
+                (
+                    name.clone(),
+                    PersistedService {
+                        root: slot.root.clone(),
+                        definition: slot.def.clone(),
+                        desired_up: *slot.desired_tx.borrow(),
+                        running: slot.running.clone(),
+                    },
+                )
+            })
+            .collect(),
+        secrets: secrets.clone(),
+        egress: egress.clone(),
     }
 }
 
@@ -2319,7 +2431,7 @@ fn write_persisted(path: &Path, persisted: &Persisted) -> Result<()> {
     // away, the other's rename ENOENTed (or worse, won with a stale
     // snapshot). The exact bug class 2.2 fixed in the core stores; this
     // copy was missed. 0600: the state embeds service environments.
-    portman_core::atomic_json::atomic_write_json_with_mode(path, persisted, 0o600)
+    portman_core::atomic_json::atomic_write_json_durable(path, persisted, 0o600)
 }
 
 #[cfg(test)]
@@ -4296,6 +4408,93 @@ mod tests {
             std::fs::read(dir.path().join("services.json")).unwrap()
         );
     }
+    #[test]
+    fn global_block_failed_mutations_preserve_owner_and_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = test_supervisor(&dir, CollectSink::new());
+        let path = dir.path().join("services.json");
+        let config = SecretsProviderConfig::Local {
+            keys: vec!["TOKEN".into()],
+        };
+        sup.set_global_block("demo".into(), config.clone()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(sup.set_global_block("other".into(), config).is_err());
+        for _ in 0..2 {
+            assert!(sup.remove_global_block("demo").is_err());
+        }
+        assert_eq!(sup.secrets_blocks().len(), 1);
+        assert_eq!(sup.secrets_blocks()[0].name, "demo");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, before).unwrap();
+        sup.remove_global_block("demo").unwrap();
+        assert!(load_persisted(&path).unwrap().secrets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_route_install_remove_failures_preserve_state_and_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sup, registry, _static_store) = route_test_setup(&dir);
+        sup.configure_managed_broker(true).unwrap();
+        let path = dir.path().join("services.json");
+        let blocks = Map::from([(
+            "gh".into(),
+            SecretsProviderConfig::Local {
+                keys: vec!["TOKEN".into()],
+            },
+        )]);
+        let routes = Map::from([("demo".into(), egress_route("demo.localhost"))]);
+        std::fs::create_dir(&path).unwrap();
+        assert!(sup
+            .sync(dir.path(), vec![], blocks.clone(), routes.clone())
+            .await
+            .is_err());
+        assert!(sup.inner.egress.lock().unwrap().is_empty());
+        assert!(registry.get("demo.localhost").is_none());
+        assert!(sup.secrets_blocks().is_empty());
+        std::fs::remove_dir(&path).unwrap();
+        sup.sync(dir.path(), vec![], blocks.clone(), routes.clone())
+            .await
+            .unwrap();
+        assert_eq!(load_persisted(&path).unwrap().egress.len(), 1);
+        assert!(
+            registry
+                .get("demo.localhost")
+                .unwrap()
+                .egress
+                .unwrap()
+                .require_caller_token
+        );
+        let before = std::fs::read(&path).unwrap();
+        let other = dir.path().join("other");
+        assert!(sup.sync(&other, vec![], blocks, routes).await.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        for _ in 0..2 {
+            assert!(sup
+                .sync(dir.path(), vec![], Map::new(), Map::new())
+                .await
+                .is_err());
+            assert_eq!(sup.inner.egress.lock().unwrap().len(), 1);
+            assert!(registry.get("demo.localhost").is_some());
+            assert_eq!(sup.secrets_blocks().len(), 1);
+        }
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, before).unwrap();
+        sup.sync(dir.path(), vec![], Map::new(), Map::new())
+            .await
+            .unwrap();
+        sup.sync(dir.path(), vec![], Map::new(), Map::new())
+            .await
+            .unwrap();
+        assert!(sup.inner.egress.lock().unwrap().is_empty());
+        assert!(registry.get("demo.localhost").is_none());
+        assert!(load_persisted(&path).unwrap().egress.is_empty());
+        assert!(load_persisted(&path).unwrap().secrets.is_empty());
+    }
+
     #[tokio::test]
     async fn managed_state_cannot_reopen_as_legacy_and_persists_route_protection() {
         let dir = tempfile::tempdir().unwrap();

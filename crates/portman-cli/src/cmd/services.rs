@@ -30,9 +30,10 @@ pub(crate) async fn cmd_status(repo: bool) -> Result<()> {
             dashboard_port: _,
             managed_broker,
             egress_grants_version,
+            inference_provisioning_version,
         } => {
             println!("daemon version:  {version}");
-            println!("managed broker:  {managed_broker} (egress grants v{egress_grants_version})");
+            println!("managed broker:  {managed_broker} (egress grants v{egress_grants_version}, inference provisioning v{inference_provisioning_version})");
             println!("running for:     {running_since}");
             println!("dns port:        {dns_port} (127.0.0.1)");
             println!("http proxy:      {proxy_port} (127.0.0.1)");

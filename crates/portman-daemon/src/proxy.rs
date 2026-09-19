@@ -72,6 +72,43 @@ pub(crate) async fn run_on(
             format!("binding HTTP proxy {addr}")
         }
     })?;
+    serve(listener, registry, bridge, starter, credentials, roots).await
+}
+
+pub(crate) async fn bind_managed(port: u16) -> Result<(TcpListener, TcpListener)> {
+    let ipv4 = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .context("binding managed IPv4 HTTP proxy")?;
+    let port = ipv4.local_addr()?.port();
+    let ipv6 = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port))
+        .await
+        .context("binding managed IPv6 HTTP proxy")?;
+    Ok((ipv4, ipv6))
+}
+
+pub(crate) async fn serve_managed(
+    listeners: (TcpListener, TcpListener),
+    registry: Registry,
+    bridge: BridgeIfIndex,
+    starter: Arc<dyn Starter>,
+    credentials: Credentials,
+    roots: Roots,
+) -> Result<()> {
+    tokio::select! {
+        result = serve(listeners.0, registry.clone(), bridge.clone(), starter.clone(), credentials.clone(), roots) => result,
+        result = serve(listeners.1, registry, bridge, starter, credentials, roots) => result,
+    }
+}
+
+async fn serve(
+    listener: TcpListener,
+    registry: Registry,
+    bridge: BridgeIfIndex,
+    starter: Arc<dyn Starter>,
+    credentials: Credentials,
+    roots: Roots,
+) -> Result<()> {
+    let addr = listener.local_addr()?;
     info!(%addr, "http proxy listening");
 
     loop {
@@ -776,6 +813,33 @@ mod tests {
                 outcome,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn managed_listener_pair_uses_one_loopback_port() {
+        let (v4, v6) = bind_managed(0).await.unwrap();
+        assert_eq!(
+            v4.local_addr().unwrap().port(),
+            v6.local_addr().unwrap().port()
+        );
+        assert_eq!(v4.local_addr().unwrap().ip(), std::net::Ipv4Addr::LOCALHOST);
+        assert_eq!(v6.local_addr().unwrap().ip(), std::net::Ipv6Addr::LOCALHOST);
+        let _client4 = TcpStream::connect(v4.local_addr().unwrap()).await.unwrap();
+        let _client6 = TcpStream::connect(v6.local_addr().unwrap()).await.unwrap();
+        assert!(v4.accept().await.unwrap().1.ip().is_loopback());
+        assert!(v6.accept().await.unwrap().1.ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn failed_managed_ipv6_bind_releases_ipv4_listener() {
+        let held = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = held.local_addr().unwrap().port();
+        assert!(bind_managed(port).await.is_err());
+        let _released = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
     }
 
     #[async_trait::async_trait]

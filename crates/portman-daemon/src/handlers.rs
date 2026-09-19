@@ -439,6 +439,7 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
     Response::Status {
         managed_broker: state.supervisor.managed_broker(),
         egress_grants_version: 1,
+        inference_provisioning_version: u32::from(state.supervisor.managed_broker()),
         version: VERSION.to_string(),
         running_since: format_duration(state.started.elapsed()),
         dns_port: state.dns_port,
@@ -1460,6 +1461,7 @@ mod tests {
             Response::Status {
                 managed_broker: true,
                 egress_grants_version: 1,
+                inference_provisioning_version: 1,
                 ..
             }
         ));

@@ -298,7 +298,13 @@ Only digests and metadata are persisted in `egress-grants.json` (0600). Missing
 or corrupt grant state denies requests; failed state writes fail issuance or
 revocation. Security state acknowledges only after both file and directory fsync;
 a failed clock-state write also denies the request. `Status` reports `managed_broker` and `egress_grants_version: 1` so
-controllers can reject unsupported brokers. To use the regular CLI against a
+controllers can reject unsupported brokers. Managed brokers also report
+`inference_provisioning_version: 1`: credential writes and route-only
+`SyncServices` replacements (including empty-root removal) acknowledge only
+after durable persistence. Failed writes retain the previous in-memory state
+and can be retried. Both `127.0.0.1` and `::1` HTTP listeners bind the same port
+before managed IPC starts; failure to bind either prevents startup. Regular
+unmanaged listeners retain their existing behavior. To use the regular CLI against a
 managed broker, set `PORTMAN_MANAGED_BROKER=true`; it reads the existing dashboard
 admin token file and wraps IPC requests. Never give that admin token to agents.
 

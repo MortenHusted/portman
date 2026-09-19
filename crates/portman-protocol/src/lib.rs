@@ -398,6 +398,8 @@ pub enum Response {
         managed_broker: bool,
         #[serde(default)]
         egress_grants_version: u32,
+        #[serde(default)]
+        inference_provisioning_version: u32,
         #[serde(default = "default_unknown")]
         version: String,
         #[serde(default = "default_unknown")]
@@ -1195,9 +1197,11 @@ mod tests {
                 dashboard_port,
                 managed_broker,
                 egress_grants_version,
+                inference_provisioning_version,
             } => {
                 assert!(!managed_broker);
                 assert_eq!(egress_grants_version, 0);
+                assert_eq!(inference_provisioning_version, 0);
                 assert_eq!(version, "0.0.1");
                 assert_eq!(running_since, "5s");
                 assert_eq!(dns_port, 5335);
