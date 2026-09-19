@@ -343,6 +343,21 @@ pub enum Request {
     UnsetLocalSecret {
         key: String,
     },
+    /// Managed-only, ownership-checked route/block/key provisioning. Values are never returned.
+    InstallInferenceRoute {
+        root: std::path::PathBuf,
+        name: String,
+        key: String,
+        value: Redacted,
+        route: EgressRoute,
+    },
+    /// Managed-only removal of one root-owned inference route and its credential.
+    RemoveInferenceRoute {
+        root: std::path::PathBuf,
+        name: String,
+        key: String,
+        host: String,
+    },
     /// Which providers have credentials and which local keys exist or are
     /// referenced — names and flags only, never values.
     SecretsStatus,

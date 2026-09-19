@@ -892,6 +892,128 @@ impl Supervisor {
         Ok(report)
     }
 
+    pub(crate) async fn install_inference_route(
+        &self,
+        credentials: &crate::secrets::CredentialsStore,
+        root: &Path,
+        name: &str,
+        key: &str,
+        value: &str,
+        route: EgressRoute,
+    ) -> Result<()> {
+        ensure_inference_fields(root, name, key, &route.host)?;
+        anyhow::ensure!(self.managed_broker(), "managed broker required");
+        anyhow::ensure!(
+            !value.is_empty()
+                && value.len() <= 16384
+                && value.trim() == value
+                && !value.chars().any(char::is_control),
+            "invalid inference credential"
+        );
+        anyhow::ensure!(
+            route.spec.secrets == name
+                && route.spec.key == key
+                && route.spec.require_caller_token
+                && route.spec.tls
+                && route.spec.header == "Authorization"
+                && route.spec.format == "Bearer {value}",
+            "invalid inference route binding"
+        );
+        let _gate = self.inner.sync_gate.lock().await;
+        let _persist = self
+            .inner
+            .persist_gate
+            .lock()
+            .expect("persist gate poisoned");
+        let owned = self.inference_route_owned(root, name, key, &route.host, Some(&route))?;
+        credentials.install_owned_local(key, value, owned, || {
+            self.sync_managed_routes_locked(
+                root,
+                BTreeMap::from([(
+                    name.into(),
+                    SecretsProviderConfig::Local {
+                        keys: vec![key.into()],
+                    },
+                )]),
+                BTreeMap::from([(name.into(), route)]),
+            )
+        })
+    }
+
+    pub(crate) async fn remove_inference_route(
+        &self,
+        credentials: &crate::secrets::CredentialsStore,
+        root: &Path,
+        name: &str,
+        key: &str,
+        host: &str,
+    ) -> Result<()> {
+        ensure_inference_fields(root, name, key, host)?;
+        anyhow::ensure!(self.managed_broker(), "managed broker required");
+        let _gate = self.inner.sync_gate.lock().await;
+        let _persist = self
+            .inner
+            .persist_gate
+            .lock()
+            .expect("persist gate poisoned");
+        let owned = self.inference_route_owned(root, name, key, host, None)?;
+        credentials.remove_owned_local(key, owned, || {
+            self.sync_managed_routes_locked(root, BTreeMap::new(), BTreeMap::new())
+        })
+    }
+
+    fn inference_route_owned(
+        &self,
+        root: &Path,
+        name: &str,
+        key: &str,
+        host: &str,
+        expected: Option<&EgressRoute>,
+    ) -> Result<bool> {
+        let snapshot = persisted_snapshot(&self.inner);
+        anyhow::ensure!(
+            !snapshot
+                .services
+                .values()
+                .any(|service| service.root == root),
+            "owned inference root conflict"
+        );
+        for (held_name, block) in &snapshot.secrets {
+            if held_name == name
+                || block.root.as_deref() == Some(root)
+                || matches!(&block.config, SecretsProviderConfig::Local { keys } if keys.iter().any(|held| held == key))
+            {
+                anyhow::ensure!(
+                    held_name == name
+                        && block.root.as_deref() == Some(root)
+                        && block.config
+                            == SecretsProviderConfig::Local {
+                                keys: vec![key.into()]
+                            },
+                    "owned inference block conflict"
+                );
+            }
+        }
+        for (held_name, route) in &snapshot.egress {
+            if held_name == name
+                || route.root == root
+                || route.route.host == host
+                || route.route.spec.key == key
+            {
+                anyhow::ensure!(
+                    held_name == name
+                        && route.root == root
+                        && route.route.host == host
+                        && route.route.spec.secrets == name
+                        && route.route.spec.key == key
+                        && expected.map_or(true, |expected| route.route == *expected),
+                    "owned inference route conflict"
+                );
+            }
+        }
+        Ok(snapshot.egress.contains_key(name) && snapshot.secrets.contains_key(name))
+    }
+
     fn sync_managed_routes(
         &self,
         root: &Path,
@@ -903,6 +1025,15 @@ impl Supervisor {
             .persist_gate
             .lock()
             .expect("persist gate poisoned");
+        self.sync_managed_routes_locked(root, secrets, egress)
+    }
+
+    fn sync_managed_routes_locked(
+        &self,
+        root: &Path,
+        secrets: BTreeMap<String, SecretsProviderConfig>,
+        egress: BTreeMap<String, EgressRoute>,
+    ) -> Result<()> {
         let mut next = persisted_snapshot(&self.inner);
         for name in secrets.keys() {
             if let Some(held) = next.secrets.get(name) {
@@ -2370,6 +2501,40 @@ fn marker_identity_matches(marker: &RunningMarker) -> bool {
 
 // ---------------------------------------------------------------------------
 // Persistence.
+
+fn ensure_inference_fields(root: &Path, name: &str, key: &str, host: &str) -> Result<()> {
+    anyhow::ensure!(
+        root.is_absolute()
+            && root.components().all(|part| matches!(
+                part,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            ))
+            && root
+                .to_str()
+                .is_some_and(|root| root.len() <= 4096 && !root.chars().any(char::is_control)),
+        "invalid inference root"
+    );
+    portman_core::service_config::validate_env_key(key)?;
+    portman_core::service_config::validate_secrets_block(
+        name,
+        &SecretsProviderConfig::Local {
+            keys: vec![key.into()],
+        },
+    )?;
+    anyhow::ensure!(
+        name.len() <= 63
+            && !name.is_empty()
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+            && !name.starts_with('-')
+            && !name.ends_with('-')
+            && host == format!("{name}.localhost")
+            && host != portman_core::registry::DASHBOARD_HOST,
+        "invalid inference hostname"
+    );
+    Ok(())
+}
 
 fn describe_block_owner(root: Option<&Path>) -> String {
     match root {

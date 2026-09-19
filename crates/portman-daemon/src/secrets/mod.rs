@@ -138,6 +138,48 @@ impl CredentialsStore {
         Ok(true)
     }
 
+    pub(crate) fn install_owned_local(
+        &self,
+        key: &str,
+        value: &str,
+        owned: bool,
+        prepare: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let mut guard = self.state.lock().expect("credentials lock poisoned");
+        if let Some(current) = guard.local.get(key) {
+            anyhow::ensure!(
+                owned && current == value,
+                "owned inference credential conflict"
+            );
+        }
+        // Persist ownership before the key so a crash can retry without claiming a foreign key.
+        prepare()?;
+        let mut next = guard.clone();
+        next.local.insert(key.to_owned(), value.to_owned());
+        save(&self.path, &next)?;
+        *guard = next;
+        Ok(())
+    }
+
+    pub(crate) fn remove_owned_local(
+        &self,
+        key: &str,
+        owned: bool,
+        finish: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let mut guard = self.state.lock().expect("credentials lock poisoned");
+        anyhow::ensure!(
+            owned || !guard.local.contains_key(key),
+            "owned inference credential conflict"
+        );
+        let mut next = guard.clone();
+        next.local.remove(key);
+        // Leave the ownership record until key deletion is durable, including on retries.
+        save(&self.path, &next)?;
+        *guard = next;
+        finish()
+    }
+
     /// Every vault key, sorted. Names only — the listing surfaces never see
     /// values.
     pub(crate) fn local_keys(&self) -> Vec<String> {
