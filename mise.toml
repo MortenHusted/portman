@@ -2,7 +2,7 @@
 # Install mise from https://mise.jdx.dev then run `mise install` once.
 
 [tools]
-rust = "stable"
+rust = "1.99.0"
 
 [env]
 RUST_LOG = "info"
