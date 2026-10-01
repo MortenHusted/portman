@@ -35,7 +35,7 @@ rand = "0.8"
 tun = { version = "0.6", features = ["async"] }
 # Route repair: `if_nametoindex` answers "does this interface still exist?",
 # which is how a stale route pointing at a destroyed utun is recognised.
-nix = { version = "0.29", features = ["net"] }
+nix = { version = "0.29", features = ["net", "fs"] }
 
 [lib]
 path = "src/lib.rs"
