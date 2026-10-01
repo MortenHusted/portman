@@ -118,6 +118,8 @@ portman down --forget # stop and remove this repo's synced definitions
 portman down --forget --root /old/worktree # forget a moved/deleted checkout
 ```
 
+After a reboot or daemon restart, synced services stay **down** until you start them (`portman up`, `portman start <name>`, or the dashboard). To have the daemon relaunch whatever was running when it stopped, set `PORTMAN_AUTOSTART_SERVICES=true` (or pass `--autostart-services=true`) in the daemon's environment. Orphaned processes from an unclean daemon exit are reclaimed either way.
+
 The dashboard's inspector has the same two forgets as buttons: **Forget** drops one service, **Forget root** drops everything its config root owns.
 
 The full field set:
