@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
+use std::os::fd::{AsRawFd, RawFd};
 use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,8 +88,7 @@ impl Default for RuntimeOptions {
 pub struct Runtime {
     utun_name: String,
     docker: Docker,
-    /// Handles of the three pump tasks so we can abort them on
-    /// shutdown. Not awaited — they loop forever by design.
+    /// Pump and route tasks, cancelled and joined on shutdown.
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -169,6 +169,7 @@ impl Runtime {
             .mtu(i32::from(TUNNEL_MTU))
             .up();
         let device = tun::create_as_async(&cfg).context("creating utun")?;
+        prevent_child_inheritance(device.get_ref().as_raw_fd())?;
         let utun_name = device.get_ref().name().context("utun name")?;
         info!(utun = %utun_name, "utun up");
         remember_own_utun(&utun_name);
@@ -219,8 +220,11 @@ impl Runtime {
     /// `portman bridge disable` (user intent) still wants the network
     /// gone; call [`Runtime::shutdown_and_remove_network`] for that.
     pub async fn shutdown(mut self) {
-        for t in self.tasks.drain(..) {
+        for t in &self.tasks {
             t.abort();
+        }
+        for t in self.tasks.drain(..) {
+            let _ = t.await;
         }
         // The kernel recycles utun names. Keep claiming this one after the
         // device is gone and route repair would treat a *recycled* utun —
@@ -240,6 +244,15 @@ impl Runtime {
         self.shutdown().await;
         remove_portman_network_if_owned(&docker).await;
     }
+}
+
+fn prevent_child_inheritance(fd: RawFd) -> Result<()> {
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+
+    let flags = FdFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFD)?);
+    fcntl(fd, FcntlArg::F_SETFD(flags | FdFlag::FD_CLOEXEC))
+        .context("preventing tunnel descriptor inheritance")?;
+    Ok(())
 }
 
 // ── Task spawners ──────────────────────────────────────────────────
@@ -1162,6 +1175,26 @@ fn strip_utun_prefix(pkt: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tunnel_descriptor_is_not_inherited_by_a_child() {
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+        use std::os::unix::net::UnixStream;
+
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let fd = socket.as_raw_fd();
+        fcntl(fd, FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
+        prevent_child_inheritance(fd).unwrap();
+
+        let output = StdCommand::new("/bin/sh")
+            .args(["-c", &format!("test ! -e /dev/fd/{fd}")])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child inherited the tunnel descriptor"
+        );
+    }
 
     #[test]
     fn startup_route_plan_defaults_to_portman_owned_subnet() {
