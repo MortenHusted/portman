@@ -1468,6 +1468,14 @@ impl Supervisor {
     /// Load persisted state, reconcile surviving process groups
     /// (terminate-and-respawn, never adopt), then start desired services.
     pub(crate) async fn restore(&self) -> Result<()> {
+        self.restore_with(true).await
+    }
+
+    /// As [`Self::restore`]. With `autostart == false` the definitions are
+    /// loaded and orphaned process groups are still reclaimed, but nothing is
+    /// started: every service comes up desired-down and stays down until the
+    /// user runs `portman up` / `portman start` (or uses the dashboard).
+    pub(crate) async fn restore_with(&self, autostart: bool) -> Result<()> {
         let mut persisted = load_persisted(&self.inner.state_path)?;
         if self.managed_broker() && !persisted.services.is_empty() {
             bail!(
@@ -1491,7 +1499,8 @@ impl Supervisor {
                 if let Some(marker) = &ps.running {
                     markers.push((name.clone(), marker.clone()));
                 }
-                slots.insert(name, Slot::new(ps.root, ps.definition, ps.desired_up));
+                let desired_up = ps.desired_up && autostart;
+                slots.insert(name, Slot::new(ps.root, ps.definition, desired_up));
             }
         }
         {
@@ -3581,6 +3590,32 @@ mod tests {
         assert_eq!(status.len(), 1);
         assert_eq!(status[0].name, "keeper");
         assert!(!status[0].desired_up);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_without_autostart_keeps_services_down() {
+        let dir = tempdir().unwrap();
+        let sup = test_supervisor(&dir, CollectSink::new());
+        let mut svc = def("keeper", &["/bin/sleep", "10"], dir.path());
+        svc.restart = RestartPolicy::Always;
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
+        sup.up(None).await.unwrap();
+        wait_for_state(&sup, "keeper", StateKind::Ready, Duration::from_secs(20)).await;
+        // Shutdown (not `down`) leaves desired_up = true on disk.
+        sup.shutdown_all().await;
+        let persisted = load_persisted(&dir.path().join("services.json")).unwrap();
+        assert!(persisted.services["keeper"].desired_up);
+
+        let sup2 = test_supervisor(&dir, CollectSink::new());
+        sup2.restore_with(false).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let status = sup2.status();
+        assert_eq!(status.len(), 1, "definition is still known");
+        assert!(!status[0].desired_up);
+        assert_eq!(status[0].state, StateKind::Stopped);
+        assert!(status[0].pid.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]

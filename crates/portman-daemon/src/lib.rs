@@ -130,6 +130,13 @@ struct Args {
     /// loopback is not a trust boundary against local processes.
     #[arg(long, env = "PORTMAN_DASHBOARD_AUTH", default_value_t = true, action = clap::ArgAction::Set)]
     dashboard_auth: bool,
+
+    /// Re-launch supervised services that were running when the daemon last
+    /// stopped. Off by default: after a boot or daemon restart every service
+    /// stays down until you start it (`portman up`, `portman start`, or the
+    /// dashboard). Orphaned processes from an unclean exit are still reclaimed.
+    #[arg(long, env = "PORTMAN_AUTOSTART_SERVICES", default_value_t = false, action = clap::ArgAction::Set)]
+    autostart_services: bool,
 }
 
 /// Snapshot of daemon-level state useful for introspection (e.g. the IPC
@@ -355,13 +362,14 @@ pub async fn daemon_main() -> Result<()> {
     // Provision certs for any already-registered entries under TLS-enabled TLDs.
     provision_certs_for_existing(&state);
 
-    // Restore persisted desired service state (terminating any process
-    // groups that survived an unclean daemon exit, never adopting them) and
-    // start desired-up services.
+    // Restore persisted service definitions (terminating any process
+    // groups that survived an unclean daemon exit, never adopting them).
+    // Services are only started when `--autostart-services` is set.
     if !args.managed_broker {
         let supervisor = supervisor.clone();
+        let autostart = args.autostart_services;
         tokio::spawn(async move {
-            if let Err(err) = supervisor.restore().await {
+            if let Err(err) = supervisor.restore_with(autostart).await {
                 warn!(%err, "restoring supervised services");
             }
         });
@@ -528,7 +536,7 @@ pub async fn daemon_main() -> Result<()> {
     };
 
     // Whatever ended the daemon, stop supervised services cleanly (R7);
-    // desired state is preserved so the next boot restores them.
+    // desired state is preserved, so `--autostart-services` can restore them.
     supervisor.shutdown_all().await;
     outcome
 }
