@@ -185,9 +185,11 @@ function sparkSvg(values, w, h, accent) {
 
 /// Line chart with wash, hairline gridlines, and a pointer-tracked
 /// crosshair + tooltip. Values reachable without hover via the scale row.
+/// Updates existing SVG geometry in place on poll ticks so an active hover
+/// crosshair/tooltip is never snapped shut mid-inspection.
 function renderChart(container, points, pick, fmt) {
-  container.innerHTML = '';
   if (!points || points.length < 2) {
+    container._chartState = null;
     container.innerHTML = '<div class="chart-empty">Collecting samples…</div>';
     return;
   }
@@ -201,49 +203,65 @@ function renderChart(container, points, pick, fmt) {
   const line = values.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
   const area = `${x(0).toFixed(1)},${H - 8} ${line} ${x(points.length - 1).toFixed(1)},${H - 8}`;
 
-  container.innerHTML = `
-    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
-      <line class="gridline" x1="0" y1="8" x2="${W}" y2="8"></line>
-      <line class="gridline" x1="0" y1="${H / 2}" x2="${W}" y2="${H / 2}"></line>
-      <line class="gridline" x1="0" y1="${H - 8}" x2="${W}" y2="${H - 8}"></line>
-      <polygon class="wash" points="${area}"></polygon>
-      <polyline class="series" points="${line}"></polyline>
-      <circle class="dot" r="4" cx="-10" cy="-10"></circle>
-    </svg>
-    <div class="crosshair" hidden></div>
-    <div class="chart-tip" hidden><span class="tip-value"></span><span class="tip-time"></span></div>
-    <div class="chart-scale"><span>${timeOf(points[0].t_ms).slice(0, 5)}</span><span>peak ${fmt(dataMax)}</span><span>${timeOf(points[points.length - 1].t_ms).slice(0, 5)}</span></div>`;
+  container._chartState = { points, values, x, y, fmt, W, H };
 
-  const svg = container.querySelector('svg');
-  const crosshair = container.querySelector('.crosshair');
-  const tip = container.querySelector('.chart-tip');
-  const tipValue = tip.querySelector('.tip-value');
-  const tipTime = tip.querySelector('.tip-time');
-  const dot = container.querySelector('.dot');
+  let svg = container.querySelector('svg');
+  if (!svg) {
+    container.innerHTML = `
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+        <line class="gridline" x1="0" y1="8" x2="${W}" y2="8"></line>
+        <line class="gridline" x1="0" y1="${H / 2}" x2="${W}" y2="${H / 2}"></line>
+        <line class="gridline" x1="0" y1="${H - 8}" x2="${W}" y2="${H - 8}"></line>
+        <polygon class="wash"></polygon>
+        <polyline class="series"></polyline>
+        <circle class="dot" r="4" cx="-10" cy="-10"></circle>
+      </svg>
+      <div class="crosshair" hidden></div>
+      <div class="chart-tip" hidden><span class="tip-value"></span><span class="tip-time"></span></div>
+      <div class="chart-scale"><span></span><span></span><span></span></div>`;
 
-  svg.addEventListener('pointermove', (ev) => {
-    const rect = svg.getBoundingClientRect();
-    const fx = (ev.clientX - rect.left) / rect.width;
-    const i = Math.max(0, Math.min(points.length - 1, Math.round(fx * (points.length - 1))));
-    const px = (x(i) / W) * rect.width;
-    crosshair.hidden = false;
-    crosshair.style.left = px + 'px';
-    crosshair.style.height = (rect.height * (H - 12) / H) + 'px';
-    dot.setAttribute('cx', x(i));
-    dot.setAttribute('cy', y(values[i]));
-    tip.hidden = false;
-    tipValue.textContent = fmt(values[i]);
-    tipTime.textContent = timeOf(points[i].t_ms);
-    const tx = Math.max(44, Math.min(rect.width - 44, px));
-    tip.style.left = tx + 'px';
-    tip.style.top = '2px';
-  });
-  svg.addEventListener('pointerleave', () => {
-    crosshair.hidden = true;
-    tip.hidden = true;
-    dot.setAttribute('cx', -10);
-    dot.setAttribute('cy', -10);
-  });
+    svg = container.querySelector('svg');
+    const crosshair = container.querySelector('.crosshair');
+    const tip = container.querySelector('.chart-tip');
+    const tipValue = tip.querySelector('.tip-value');
+    const tipTime = tip.querySelector('.tip-time');
+    const dot = container.querySelector('.dot');
+
+    svg.addEventListener('pointermove', (ev) => {
+      const st = container._chartState;
+      if (!st) return;
+      const rect = svg.getBoundingClientRect();
+      const fx = (ev.clientX - rect.left) / rect.width;
+      const i = Math.max(0, Math.min(st.points.length - 1, Math.round(fx * (st.points.length - 1))));
+      const px = (st.x(i) / st.W) * rect.width;
+      crosshair.hidden = false;
+      crosshair.style.left = px + 'px';
+      crosshair.style.height = (rect.height * (st.H - 12) / st.H) + 'px';
+      dot.setAttribute('cx', st.x(i));
+      dot.setAttribute('cy', st.y(st.values[i]));
+      tip.hidden = false;
+      tipValue.textContent = st.fmt(st.values[i]);
+      tipTime.textContent = timeOf(st.points[i].t_ms);
+      const tx = Math.max(44, Math.min(rect.width - 44, px));
+      tip.style.left = tx + 'px';
+      tip.style.top = '2px';
+    });
+    svg.addEventListener('pointerleave', () => {
+      crosshair.hidden = true;
+      tip.hidden = true;
+      dot.setAttribute('cx', -10);
+      dot.setAttribute('cy', -10);
+    });
+  }
+
+  container.querySelector('.wash').setAttribute('points', area);
+  container.querySelector('.series').setAttribute('points', line);
+  const scaleSpans = container.querySelectorAll('.chart-scale span');
+  if (scaleSpans.length === 3) {
+    scaleSpans[0].textContent = timeOf(points[0].t_ms).slice(0, 5);
+    scaleSpans[1].textContent = `peak ${fmt(dataMax)}`;
+    scaleSpans[2].textContent = timeOf(points[points.length - 1].t_ms).slice(0, 5);
+  }
 }
 
 // --- Alerts ----------------------------------------------------------------
@@ -951,12 +969,14 @@ function startLogTail(service) {
 
 async function pollLogs(initial) {
   if (!logView.service) return;
-  const name = encodeURIComponent(logView.service);
+  const targetService = logView.service;
+  const name = encodeURIComponent(targetService);
   const path = initial
     ? `/services/${name}/logs?limit=100`
     : `/services/${name}/logs?after=${logView.cursor}&limit=100`;
   try {
     const res = await api(path);
+    if (logView.service !== targetService) return;
     logView.cursor = res.last_id || logView.cursor;
     if ((res.lines || []).length) {
       const out = el('log-output');
@@ -1658,7 +1678,15 @@ function renderFooter(tlds, certs) {
 
 // --- Refresh loop ----------------------------------------------------------
 
+let refreshInFlight = false;
+let refreshQueued = false;
+
 async function refresh() {
+  if (refreshInFlight) {
+    refreshQueued = true;
+    return;
+  }
+  refreshInFlight = true;
   resetAlerts();
   try {
     const status = await api('/status');
@@ -1709,8 +1737,14 @@ async function refresh() {
   } catch (err) {
     renderStatus(null);
     pushAlert('Daemon unreachable', `<div class="alert-body">${esc(err.message)}</div>`, true);
+  } finally {
+    renderAlerts();
+    refreshInFlight = false;
+    if (refreshQueued) {
+      refreshQueued = false;
+      refresh();
+    }
   }
-  renderAlerts();
 }
 
 refresh();

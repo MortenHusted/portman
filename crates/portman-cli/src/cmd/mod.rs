@@ -55,22 +55,33 @@ pub(crate) fn run_sudo(argv: &[&str]) -> Result<()> {
 /// exactly the one this build expects — and no repo checkout is needed.
 /// A brew- or installer-delivered binary can build it just the same.
 pub(crate) fn run_setup_image_build() -> Result<()> {
-    let dir = std::env::temp_dir().join("portman-setup-image");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "portman-setup-image-{}-{nanos}",
+        std::process::id(),
+    ));
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    std::fs::write(
-        dir.join("Dockerfile"),
-        include_str!("../../../portman-netbridge/setup-image/Dockerfile"),
-    )
-    .context("writing embedded Dockerfile")?;
-    std::fs::write(
-        dir.join("entrypoint.sh"),
-        include_str!("../../../portman-netbridge/setup-image/entrypoint.sh"),
-    )
-    .context("writing embedded entrypoint.sh")?;
-    let spec = doctor::setup_image_build_command(&dir);
-    let mut cmd = StdCommand::new(&spec.program);
-    cmd.args(&spec.args).current_dir(&spec.current_dir);
-    run(&mut cmd).with_context(|| format!("building {}", doctor::SETUP_IMAGE))
+    let build_res = (|| -> Result<()> {
+        std::fs::write(
+            dir.join("Dockerfile"),
+            include_str!("../../../portman-netbridge/setup-image/Dockerfile"),
+        )
+        .context("writing embedded Dockerfile")?;
+        std::fs::write(
+            dir.join("entrypoint.sh"),
+            include_str!("../../../portman-netbridge/setup-image/entrypoint.sh"),
+        )
+        .context("writing embedded entrypoint.sh")?;
+        let spec = doctor::setup_image_build_command(&dir);
+        let mut cmd = StdCommand::new(&spec.program);
+        cmd.args(&spec.args).current_dir(&spec.current_dir);
+        run(&mut cmd).with_context(|| format!("building {}", doctor::SETUP_IMAGE))
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    build_res
 }
 
 /// Pipe `contents` into `sudo tee <path>` so the daemon doesn't need root.

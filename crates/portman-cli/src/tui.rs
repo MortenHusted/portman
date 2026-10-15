@@ -1853,12 +1853,12 @@ fn render_status_bar(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
 
 fn render_key_hints(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
     let hints = match state.focus {
-        Panel::Status => " 1/2/3 panel · tab next · r refresh · ? help · q quit ",
+        Panel::Status => " 1/2/3/4 panel · tab next · b bridge · r refresh · ? help · q quit ",
         Panel::Entries => {
             " j/k move · a add · d remove · o open · c copy · r refresh · ? help · q quit "
         }
         Panel::Tlds => " j/k move · a add · d remove · t toggle tls · r refresh · ? help · q quit ",
-        Panel::Services => " j/k move · enter logs · r refresh · ? help · q quit ",
+        Panel::Services => " j/k move · enter/l logs · r refresh · ? help · q quit ",
         Panel::Logs => " k scroll up (pauses follow) · j down · G follow · esc close · q quit ",
     };
     f.render_widget(
@@ -2018,12 +2018,12 @@ fn render_confirm_bridge_disable(f: &mut ratatui::Frame<'_>, area: Rect) {
 }
 
 fn render_help(f: &mut ratatui::Frame<'_>, area: Rect) {
-    let modal = centered_rect(area, 62, 23);
+    let modal = centered_rect(area, 62, 24);
     f.render_widget(Clear, modal);
     let lines = vec![
         Line::from(""),
         Line::from("  Panels"),
-        Line::from("    1 / 2 / 3       focus Status / Entries / TLDs"),
+        Line::from("    1 / 2 / 3 / 4   focus Status / Entries / TLDs / Services"),
         Line::from("    Tab / Shift-Tab cycle panels forward / backward"),
         Line::from(""),
         Line::from("  Navigation"),
@@ -2035,6 +2035,7 @@ fn render_help(f: &mut ratatui::Frame<'_>, area: Rect) {
         Line::from("    d               delete (static entries / TLDs only)"),
         Line::from("    t               toggle TLS (on selected TLD)"),
         Line::from("    b               enable netbridge; disabling asks for confirmation"),
+        Line::from("    Enter / l       open live logs (in Services panel)"),
         Line::from("    o               open URL in browser"),
         Line::from("    c               copy URL to clipboard"),
         Line::from("    r               refresh"),

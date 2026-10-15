@@ -135,6 +135,10 @@ pub(crate) fn detect_legacy_bridge() -> LegacyBridgeStatus {
         return LegacyBridgeStatus::Running { detail };
     }
 
+    if !Path::new(DOCKER_MAC_NET_CONNECT_PLIST).exists() {
+        return LegacyBridgeStatus::NotDetected;
+    }
+
     if let Some(output) = command_stdout("brew", &["services", "list"]) {
         for line in output.lines() {
             if !line.contains("docker-mac-net-connect") {
@@ -151,13 +155,9 @@ pub(crate) fn detect_legacy_bridge() -> LegacyBridgeStatus {
         }
     }
 
-    if Path::new(DOCKER_MAC_NET_CONNECT_PLIST).exists() {
-        return LegacyBridgeStatus::Stopped {
-            detail: DOCKER_MAC_NET_CONNECT_PLIST.to_string(),
-        };
+    LegacyBridgeStatus::Stopped {
+        detail: DOCKER_MAC_NET_CONNECT_PLIST.to_string(),
     }
-
-    LegacyBridgeStatus::NotDetected
 }
 
 pub(crate) fn collect_docker_routes() -> DockerRouteStatus {

@@ -154,6 +154,11 @@ pub(crate) fn install_binaries(
     let daemon_dst = bin_dir.join("portman-daemon");
     let cli_dst = bin_dir.join("portman");
     for (src, dst) in [(daemon_src, &daemon_dst), (cli_src, &cli_dst)] {
+        if let (Ok(s), Ok(d)) = (std::fs::canonicalize(src), std::fs::canonicalize(dst)) {
+            if s == d {
+                continue;
+            }
+        }
         run_sudo(&[
             "install",
             "-m",
@@ -331,47 +336,58 @@ pub(crate) fn launchctl_in_user_context(uid: u32, args: &[&str]) -> StdCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StragglerPattern {
     grep: &'static str,
+    exact: bool,
     requires_sudo: bool,
 }
 
 pub(crate) const STRAGGLER_PATTERNS: &[StragglerPattern] = &[
     StragglerPattern {
         grep: portman_core::paths::DAEMON_BIN_NAME,
+        exact: true,
         requires_sudo: true,
     },
     StragglerPattern {
         grep: "target/release/portman-daemon",
+        exact: false,
         requires_sudo: true,
     },
 ];
+
+fn pgrep_pids(pattern: &StragglerPattern) -> Vec<String> {
+    let flag = if pattern.exact { "-x" } else { "-f" };
+    let Ok(out) = StdCommand::new("pgrep")
+        .arg(flag)
+        .arg(pattern.grep)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let self_pid = std::process::id().to_string();
+    std::str::from_utf8(&out.stdout)
+        .unwrap_or("")
+        .split_ascii_whitespace()
+        .filter(|pid| *pid != self_pid)
+        .map(String::from)
+        .collect()
+}
 
 /// Kill any `portman-daemon` processes still running. Used between bootout and
 /// bootstrap so a dev binary left over from `mise run daemon-root` doesn't end
 /// up shadowing the freshly installed daemon.
 ///
-/// Matches by `pgrep -f` patterns so it catches both the installed path
-/// (`/usr/local/bin/portman-daemon`) and the cargo build output
-/// (`target/release/portman-daemon`). SIGTERM first, 1s grace, SIGKILL for
-/// stragglers.
+/// Matches by `pgrep -x portman-daemon` or full binary path so editors/shells
+/// mentioning `portman-daemon` in their argv are never touched. SIGTERM first,
+/// 1s grace, SIGKILL for stragglers.
 pub(crate) fn sweep_stragglers() {
     for pattern in STRAGGLER_PATTERNS {
-        let Ok(out) = StdCommand::new("pgrep")
-            .arg("-f")
-            .arg(pattern.grep)
-            .output()
-        else {
-            continue;
-        };
-        if !out.status.success() {
-            continue; // pgrep exits 1 when nothing matches — that's fine.
-        }
-        let pids: Vec<&str> = std::str::from_utf8(&out.stdout)
-            .unwrap_or("")
-            .split_ascii_whitespace()
-            .collect();
-        if pids.is_empty() {
+        let pids_owned = pgrep_pids(pattern);
+        if pids_owned.is_empty() {
             continue;
         }
+        let pids: Vec<&str> = pids_owned.iter().map(String::as_str).collect();
         eprintln!(
             "sweeping straggling {}: pids {}",
             pattern.grep,
@@ -382,23 +398,11 @@ pub(crate) fn sweep_stragglers() {
     // Give the processes a beat to exit cleanly before any bootstrap.
     std::thread::sleep(std::time::Duration::from_millis(1000));
     for pattern in STRAGGLER_PATTERNS {
-        let Ok(out) = StdCommand::new("pgrep")
-            .arg("-f")
-            .arg(pattern.grep)
-            .output()
-        else {
-            continue;
-        };
-        if !out.status.success() {
+        let pids_owned = pgrep_pids(pattern);
+        if pids_owned.is_empty() {
             continue;
         }
-        let pids: Vec<&str> = std::str::from_utf8(&out.stdout)
-            .unwrap_or("")
-            .split_ascii_whitespace()
-            .collect();
-        if pids.is_empty() {
-            continue;
-        }
+        let pids: Vec<&str> = pids_owned.iter().map(String::as_str).collect();
         eprintln!(
             "  escalating to SIGKILL for stubborn {}: pids {}",
             pattern.grep,

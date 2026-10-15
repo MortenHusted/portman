@@ -376,6 +376,7 @@ fn resolve(root: &Path, raw: RawConfig) -> Result<ServiceConfig> {
     }
 
     let mut services = BTreeMap::new();
+    let mut seen_hosts: BTreeMap<String, String> = BTreeMap::new();
     for (name, svc) in raw.service {
         validate_service_name(&name)?;
         let def = resolve_service(
@@ -387,6 +388,12 @@ fn resolve(root: &Path, raw: RawConfig) -> Result<ServiceConfig> {
             raw.project.as_deref(),
         )
         .with_context(|| format!("in [service.{name}]"))?;
+        if let Some(host) = &def.host {
+            let owner = format!("[service.{name}]");
+            if let Some(prev) = seen_hosts.insert(host.clone(), owner.clone()) {
+                bail!("host `{host}` is claimed by both {prev} and {owner}");
+            }
+        }
         services.insert(name, def);
     }
 
@@ -397,6 +404,13 @@ fn resolve(root: &Path, raw: RawConfig) -> Result<ServiceConfig> {
         validate_egress_name(&name)?;
         let resolved = resolve_egress(&name, route, &secrets)
             .with_context(|| format!("in [egress.{name}]"))?;
+        let owner = format!("[egress.{name}]");
+        if let Some(prev) = seen_hosts.insert(resolved.host.clone(), owner.clone()) {
+            bail!(
+                "host `{}` is claimed by both {prev} and {owner}",
+                resolved.host
+            );
+        }
         egress.insert(name, resolved);
     }
 
@@ -444,6 +458,9 @@ fn resolve_service(
         );
     }
     let mode = raw.mode.unwrap_or_default();
+    if !matches!(mode, Mode::Http | Mode::Tcp) {
+        bail!("`mode` must be `http` or `tcp`");
+    }
     if mode == Mode::Tcp && host.as_deref().is_some_and(crate::tld::host_is_localhost) {
         bail!("`.localhost` service hosts are HTTP-only because the operating system always resolves them to loopback");
     }
@@ -460,6 +477,7 @@ fn resolve_service(
         (Some(_), Some(_)) => {
             bail!("`ready_port` and `ready_delay_ms` are mutually exclusive")
         }
+        (Some(0), None) => bail!("`ready_port` cannot be 0"),
         (Some(port), None) => ReadyCheck::Port(port),
         (None, Some(ms)) => ReadyCheck::DelayMs(ms),
         // Default: gate on the declared service port; no port → no gate.
@@ -2119,5 +2137,81 @@ mod tests {
         assert_eq!(cfg.egress.len(), 2);
         assert_eq!(cfg.egress["github"].target, "127.0.0.1:1");
         assert!(cfg.egress.contains_key("extra"));
+    }
+
+    #[test]
+    fn service_rejects_egress_or_unknown_mode_and_zero_ready_port() {
+        let dir = tempdir().unwrap();
+        write_config(
+            dir.path(),
+            CONFIG_FILE,
+            r#"
+            [service.web]
+            run = "cmd"
+            port = 3000
+            mode = "egress"
+            "#,
+        );
+        let err = format!("{:#}", load(dir.path()).unwrap_err());
+        assert!(err.contains("`mode` must be `http` or `tcp`"), "{err}");
+
+        write_config(
+            dir.path(),
+            CONFIG_FILE,
+            r#"
+            [service.web]
+            run = "cmd"
+            ready_port = 0
+            "#,
+        );
+        let err = format!("{:#}", load(dir.path()).unwrap_err());
+        assert!(err.contains("`ready_port` cannot be 0"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_hosts_across_services_and_egress_are_rejected() {
+        let dir = tempdir().unwrap();
+        write_config(
+            dir.path(),
+            CONFIG_FILE,
+            r#"
+            [service.a]
+            run = "cmd"
+            port = 3000
+            host = "shared.test"
+
+            [service.b]
+            run = "cmd"
+            port = 3001
+            host = "shared.test"
+            "#,
+        );
+        let err = format!("{:#}", load(dir.path()).unwrap_err());
+        assert!(
+            err.contains("host `shared.test` is claimed by both"),
+            "{err}"
+        );
+
+        write_config(
+            dir.path(),
+            CONFIG_FILE,
+            r#"
+            [service.a]
+            run = "cmd"
+            port = 3000
+            host = "shared.test"
+
+            [egress.api]
+            host = "shared.test"
+            target = "127.0.0.1:8080"
+            secrets = "gh"
+            key = "TOKEN"
+            "#,
+        );
+        let err = format!("{:#}", load(dir.path()).unwrap_err());
+        assert!(
+            err.contains("host `shared.test` is claimed by both"),
+            "{err}"
+        );
     }
 }

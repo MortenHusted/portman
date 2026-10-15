@@ -2,11 +2,6 @@
 members = ["cargo:."]
 
 # Config for 'dist'
-#
-# OPEN ITEM before the first tag: dist builds one app (and one formula) per
-# binary package, so today this would publish portman-cli.rb + portman-daemon.rb.
-# Ship ONE `portman` formula with both binaries by making the daemon a lib
-# crate with its bin target living in a single distributable package.
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.32.0"
