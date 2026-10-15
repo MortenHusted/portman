@@ -59,20 +59,22 @@ fn resolver_contents_for_tld(tld: &str, port: u16) -> String {
 
 /// Write a portman-managed resolver config. Caller must have root (sudo).
 pub fn write_resolver(tld: &str, port: u16) -> Result<()> {
-    let path = resolver_path(tld);
+    let tld = validate_tld(tld)?;
+    let path = resolver_path(&tld);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     #[cfg(target_os = "macos")]
     let contents = resolver_contents(port);
     #[cfg(target_os = "linux")]
-    let contents = resolver_contents_for_tld(tld, port);
+    let contents = resolver_contents_for_tld(&tld, port);
     fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))
 }
 
 /// Remove a portman-managed resolver config if it exists.
 pub fn remove_resolver(tld: &str) -> Result<()> {
-    let path = resolver_path(tld);
+    let tld = validate_tld(tld)?;
+    let path = resolver_path(&tld);
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -100,6 +102,18 @@ pub fn validate_tld(tld: &str) -> Result<String> {
     }
     if t.contains('/') {
         bail!("tld cannot contain slashes");
+    }
+    if t.contains("..") {
+        bail!("tld cannot contain empty labels (`..`)");
+    }
+    for label in t.split('.') {
+        if label.is_empty()
+            || !label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            bail!("tld `{t}` contains invalid DNS characters");
+        }
     }
     if t == "local" {
         bail!("`.local` is intercepted by macOS mDNSResponder — do not manage it");

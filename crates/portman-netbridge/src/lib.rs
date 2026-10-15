@@ -1,17 +1,10 @@
-//! portman-netbridge — native Rust replacement for
-//! `chipmk/docker-mac-net-connect`.
+//! portman-netbridge — native Rust WireGuard bridge between macOS and
+//! the container VM (`colima`, `lima`, Docker Desktop).
 //!
-//! Started 2026-04-23. Port motivation and acceptance criteria live in the
-//! repo-root `PLAN.md` (§ "v1 roadmap"). Phase sequence — and workflow
-//! safety guarantees at each step — live in this crate's `PHASES.md`.
-//!
-//! **Current state: Phase 0 — crate scaffold only.** No functionality is
-//! wired into `portman-daemon` yet. Building this crate has zero impact on
-//! the v0 wrapped-bridge stack running on the user's main driver.
-//!
-//! Do not add heavy dependencies (`boringtun`, `tun`, `libc`-route stuff)
-//! until the phase that actually uses them is being implemented. Each phase
-//! opens a new module in this file; today we have none.
+//! Creates an additive `portman` Docker network (`192.168.99.0/24`),
+//! spawns a one-shot setup container inside the VM to configure the peer
+//! WireGuard interface (`chip0`), and pumps packets between a macOS `utun`
+//! interface and `boringtun` over UDP.
 
 #![doc(html_root_url = "https://docs.rs/portman-netbridge/0.0.1")]
 

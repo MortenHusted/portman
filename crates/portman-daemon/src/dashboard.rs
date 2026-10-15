@@ -39,19 +39,19 @@ pub(crate) async fn run(state: DaemonState, port: u16) -> Result<()> {
     }
 }
 
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn handle_connection(mut stream: TcpStream, state: DaemonState) -> Result<()> {
-    let mut buf = vec![0u8; MAX_HEADER_BYTES + MAX_BODY_BYTES];
-    let n = stream
-        .read(&mut buf)
+    let Some(buf) = tokio::time::timeout(HEADER_READ_TIMEOUT, read_http_request(&mut stream))
         .await
-        .context("reading dashboard request")?;
-    if n == 0 {
+        .context("dashboard request read timed out")??
+    else {
         return Ok(());
-    }
+    };
 
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = HttpRequest::new(&mut headers);
-    let header_len = match req.parse(&buf[..n]) {
+    let header_len = match req.parse(&buf) {
         Ok(Status::Complete(len)) => len,
         Ok(Status::Partial) => return Ok(()),
         Err(e) => return Err(anyhow::anyhow!("parse request: {e:?}")),
@@ -66,11 +66,7 @@ async fn handle_connection(mut stream: TcpStream, state: DaemonState) -> Result<
         Some((path, query)) => (path, query),
         None => (raw_path, ""),
     };
-    let body = if header_len < n {
-        &buf[header_len..n]
-    } else {
-        &[]
-    };
+    let body = &buf[header_len..];
 
     // Security: the dashboard is a localhost control API that can add/remove
     // proxy routes, but any process — or web page — able to reach 127.0.0.1 can
@@ -731,12 +727,105 @@ async fn write_response(
     Ok(())
 }
 
+/// Read a complete HTTP/1.1 request (headers + `Content-Length` body) from
+/// `stream`, even when headers and body arrive in separate TCP writes (e.g.
+/// when proxied through `relay::forward_requests` on `portman.localhost`).
+async fn read_http_request<R>(stream: &mut R) -> Result<Option<Vec<u8>>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 8192];
+
+    let (header_len, content_len) = loop {
+        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut req = HttpRequest::new(&mut headers);
+        match req.parse(&buf) {
+            Ok(Status::Complete(len)) => {
+                let content_len = header_value(&req, "content-length")
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if content_len > MAX_BODY_BYTES {
+                    anyhow::bail!(
+                        "dashboard request body exceeds limit ({content_len} > {MAX_BODY_BYTES})"
+                    );
+                }
+                break (len, content_len);
+            }
+            Ok(Status::Partial) => {
+                if buf.len() >= MAX_HEADER_BYTES {
+                    anyhow::bail!("dashboard request headers exceed {MAX_HEADER_BYTES} bytes");
+                }
+                let n = stream
+                    .read(&mut chunk)
+                    .await
+                    .context("reading dashboard request headers")?;
+                if n == 0 {
+                    if buf.is_empty() {
+                        return Ok(None);
+                    }
+                    anyhow::bail!("client closed mid-headers");
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) => return Err(anyhow::anyhow!("parse request: {e:?}")),
+        }
+    };
+
+    let target_len = header_len + content_len;
+    while buf.len() < target_len {
+        let n = stream
+            .read(&mut chunk)
+            .await
+            .context("reading dashboard request body")?;
+        if n == 0 {
+            anyhow::bail!(
+                "client closed mid-body ({} of {content_len} bytes read)",
+                buf.len().saturating_sub(header_len)
+            );
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    buf.truncate(target_len);
+    Ok(Some(buf))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        config_query_root, host_is_local, origin_is_local, parse_logs_query,
+        config_query_root, host_is_local, origin_is_local, parse_logs_query, read_http_request,
         write_config_preserving_owner,
     };
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn read_http_request_reassembles_split_headers_and_body() {
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let writer = tokio::spawn(async move {
+            client
+                .write_all(b"POST /api/services/start HTTP/1.1\r\nHost: portman.localhost\r\n")
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            client
+                .write_all(b"Content-Type: application/json\r\nContent-Length: 17\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            client.write_all(b"{\"names\":[\"web\"]}").await.unwrap();
+        });
+
+        let raw = read_http_request(&mut server).await.unwrap().unwrap();
+        writer.await.unwrap();
+
+        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut req = httparse::Request::new(&mut headers);
+        let header_len = match req.parse(&raw).unwrap() {
+            httparse::Status::Complete(n) => n,
+            httparse::Status::Partial => panic!("expected complete request"),
+        };
+        assert_eq!(&raw[header_len..], b"{\"names\":[\"web\"]}");
+    }
 
     #[test]
     fn config_root_query_is_url_decoded() {

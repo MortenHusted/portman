@@ -2939,6 +2939,7 @@ mod tests {
         // executable on first exec and can stall it for tens of seconds
         // (observed 25s). Absorb that here, outside timed supervisor paths.
         let _ = std::process::Command::new(path)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();

@@ -28,7 +28,8 @@ impl Registry {
     }
 
     /// Insert or replace the entry for `entry.host`. Returns the previous entry, if any.
-    pub fn upsert(&self, entry: Entry) -> Option<Entry> {
+    pub fn upsert(&self, mut entry: Entry) -> Option<Entry> {
+        entry.host = entry.host.to_ascii_lowercase();
         let mut guard = self.inner.write().expect("registry lock poisoned");
         if let Some(existing) = guard.get(&entry.host) {
             if existing.source == portman_protocol::Source::Builtin
@@ -42,14 +43,15 @@ impl Registry {
 
     /// Remove and return the entry for `host`, if present.
     pub fn remove(&self, host: &str) -> Option<Entry> {
+        let key = host.to_ascii_lowercase();
         let mut guard = self.inner.write().expect("registry lock poisoned");
         if guard
-            .get(host)
+            .get(&key)
             .is_some_and(|entry| entry.source == portman_protocol::Source::Builtin)
         {
             return None;
         }
-        guard.remove(host)
+        guard.remove(&key)
     }
 
     /// Remove any entries whose `container_id` matches. Used on container
@@ -81,10 +83,11 @@ impl Registry {
     /// Look up a single entry by exact hostname. Wildcard entries are only
     /// found by their literal pattern — see [`Registry::lookup`] for resolution.
     pub fn get(&self, host: &str) -> Option<Entry> {
+        let key = host.to_ascii_lowercase();
         self.inner
             .read()
             .expect("registry lock poisoned")
-            .get(host)
+            .get(&key)
             .cloned()
     }
 
@@ -100,13 +103,14 @@ impl Registry {
     /// `*.demo.acme.internal` beats `*.acme.internal` for a name both
     /// could serve.
     pub fn lookup(&self, host: &str) -> Option<(String, Entry)> {
+        let key = host.to_ascii_lowercase();
         let guard = self.inner.read().expect("registry lock poisoned");
-        if let Some(entry) = guard.get(host) {
-            return Some((host.to_string(), entry.clone()));
+        if let Some(entry) = guard.get(&key) {
+            return Some((key, entry.clone()));
         }
         guard
             .iter()
-            .filter(|(pattern, _)| crate::static_store::wildcard_matches(pattern, host))
+            .filter(|(pattern, _)| crate::static_store::wildcard_matches(pattern, &key))
             .max_by_key(|(pattern, _)| pattern.len())
             .map(|(pattern, entry)| (pattern.clone(), entry.clone()))
     }
@@ -334,5 +338,17 @@ mod tests {
         // binds its own stack.
         let entries = vec![at("a.test", "10.0.0.5:3000"), at("b.test", "10.0.0.6:3000")];
         assert!(target_collisions(&entries).is_empty());
+    }
+
+    #[test]
+    fn registry_normalizes_host_case_across_operations() {
+        let r = Registry::new();
+        r.upsert(at("App.Demo.Test", "127.0.0.1:3000"));
+        assert!(r.get("app.demo.test").is_some());
+        assert!(r.get("APP.DEMO.TEST").is_some());
+        let (key, _) = r.lookup("APP.Demo.Test").unwrap();
+        assert_eq!(key, "app.demo.test");
+        assert!(r.remove("APP.DEMO.TEST").is_some());
+        assert!(r.get("app.demo.test").is_none());
     }
 }

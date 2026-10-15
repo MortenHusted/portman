@@ -246,6 +246,15 @@ impl Runtime {
     }
 }
 
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+        forget_own_utun(&self.utun_name);
+    }
+}
+
 fn prevent_child_inheritance(fd: RawFd) -> Result<()> {
     use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 
@@ -267,10 +276,15 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        // Sized so no UDP datagram can arrive truncated — a clipped frame
-        // would feed decapsulate garbage that looks like an auth failure.
+        // Sized so no UDP datagram or 1500-MTU container packet can arrive
+        // truncated — a clipped frame would feed decapsulate garbage that
+        // looks like an auth failure. First 4 bytes of `out` hold the
+        // big-endian AF_INET = 2 prefix required by macOS utun so writing to
+        // `dev_write` needs zero per-packet allocations or copies.
         let mut buf = vec![0u8; usize::from(u16::MAX)];
-        let mut out = vec![0u8; (TUNNEL_MTU as usize) + 128];
+        let mut out = vec![0u8; 4 + usize::from(u16::MAX)];
+        out[..4].copy_from_slice(&[0, 0, 0, 2]);
+        let mut last_authenticated_src: Option<SocketAddr> = None;
         let mut send_warned = false;
         loop {
             let (n, src) = match udp.recv_from(&mut buf).await {
@@ -288,21 +302,18 @@ where
             // redirect every outbound tunnel frame to itself until the
             // real peer's next packet — a silent bridge DoS.
             let mut authenticated = false;
-            let mut inbound: Option<Vec<u8>> = Some(buf[..n].to_vec());
+            let mut first_pass = true;
             loop {
-                let first_pass = inbound.is_some();
-                let input: &[u8] = match &inbound {
-                    Some(v) => v.as_slice(),
-                    None => &[],
-                };
+                let is_first = std::mem::take(&mut first_pass);
+                let input: &[u8] = if is_first { &buf[..n] } else { &[] };
                 let r = {
                     let mut p = peer.lock().await;
-                    p.decapsulate(input, &mut out)
+                    p.decapsulate(input, &mut out[4..])
                 };
                 match r {
                     TunnResult::Err(_) => break,
                     TunnResult::WriteToNetwork(frame) => {
-                        if first_pass {
+                        if is_first {
                             authenticated = true;
                         }
                         // Handshake replies go to the datagram's own source,
@@ -314,18 +325,13 @@ where
                                 send_warned = true;
                             }
                         }
-                        inbound = None;
                     }
                     TunnResult::WriteToTunnelV4(pkt, _) => {
-                        if first_pass {
+                        if is_first {
                             authenticated = true;
                         }
-                        // AF_INET = 2 in big-endian; macOS utun writes
-                        // need this 4-byte prefix or the kernel drops.
-                        let mut framed = Vec::with_capacity(pkt.len() + 4);
-                        framed.extend_from_slice(&[0, 0, 0, 2]);
-                        framed.extend_from_slice(pkt);
-                        if let Err(err) = dev_write.write_all(&framed).await {
+                        let pkt_len = pkt.len();
+                        if let Err(err) = dev_write.write_all(&out[..4 + pkt_len]).await {
                             if !send_warned {
                                 warn!(%err, "netbridge rx pump failed to write utun; further failures muted");
                                 send_warned = true;
@@ -336,15 +342,16 @@ where
                     _ => {
                         // Done / v6: consumed and valid (keepalives land
                         // here), just nothing to forward.
-                        if first_pass {
+                        if is_first {
                             authenticated = true;
                         }
                         break;
                     }
                 }
             }
-            if authenticated {
+            if authenticated && last_authenticated_src != Some(src) {
                 *endpoint.lock().await = Some(src);
+                last_authenticated_src = Some(src);
             }
         }
     })
@@ -357,8 +364,8 @@ fn spawn_tx(
     mut dev_read: tokio::io::ReadHalf<tun::AsyncDevice>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut pkt = vec![0u8; (TUNNEL_MTU as usize) + 64];
-        let mut out = vec![0u8; (TUNNEL_MTU as usize) + 128];
+        let mut pkt = vec![0u8; usize::from(u16::MAX)];
+        let mut out = vec![0u8; usize::from(u16::MAX)];
         let mut send_warned = false;
         loop {
             let n = match dev_read.read(&mut pkt).await {
@@ -440,11 +447,15 @@ fn spawn_route_reconciler(docker: Docker, mode: NetbridgeMode, iface: String) ->
                     BTreeSet::new()
                 }
             };
-            for cmd in startup_route_plan(&iface, &extra_route_cidrs) {
-                if let Err(err) = ensure_route_command(&cmd) {
-                    warn!(cidr = %cmd.cidr, iface = %cmd.iface, %err, "netbridge route reconcile failed");
+            let cmds = startup_route_plan(&iface, &extra_route_cidrs);
+            let _ = tokio::task::spawn_blocking(move || {
+                for cmd in cmds {
+                    if let Err(err) = ensure_route_command(&cmd) {
+                        warn!(cidr = %cmd.cidr, iface = %cmd.iface, %err, "netbridge route reconcile failed");
+                    }
                 }
-            }
+            })
+            .await;
         }
     })
 }
@@ -485,18 +496,23 @@ async fn spawn_setup_container(
         best_effort_remove_setup_container(docker).await;
         return Err(err).context("starting netbridge setup container");
     }
-    // Brief wait so chip0 is up and the VM peer has fired its first
-    // keepalive by the time the host pump starts issuing handshakes.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    if let Err(err) = ensure_setup_container_running(docker).await {
-        best_effort_remove_setup_container(docker).await;
-        return Err(err);
-    }
-    match read_setup_vm_public_key(docker).await {
-        Ok(key) => Ok(key),
-        Err(err) => {
+    // Poll until the setup container is running and has printed `VM_PUBKEY=`,
+    // instead of a fixed 2s sleep that slows normal starts and fails under load.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Err(err) = ensure_setup_container_running(docker).await {
             best_effort_remove_setup_container(docker).await;
-            Err(err)
+            return Err(err);
+        }
+        match read_setup_vm_public_key(docker).await {
+            Ok(key) => return Ok(key),
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => {
+                best_effort_remove_setup_container(docker).await;
+                return Err(err);
+            }
         }
     }
 }

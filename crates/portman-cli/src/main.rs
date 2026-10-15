@@ -264,8 +264,9 @@ async fn main() -> Result<()> {
         let broken_pipe = info
             .payload()
             .downcast_ref::<String>()
-            .map(|s| s.contains("Broken pipe"))
-            .unwrap_or(false);
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .is_some_and(|s| s.contains("Broken pipe"));
         if broken_pipe {
             std::process::exit(0);
         }

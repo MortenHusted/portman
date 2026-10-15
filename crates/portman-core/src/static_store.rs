@@ -165,28 +165,31 @@ impl StaticStore {
 /// Accept either v2 (`Persisted`) or v1 (`PersistedV1`) on-disk shape.
 /// v1 rules get `Mode::Http` by default.
 fn parse_persisted(bytes: &[u8]) -> Result<Persisted> {
-    if let Ok(v2) = serde_json::from_slice::<Persisted>(bytes) {
+    let v2_res = serde_json::from_slice::<Persisted>(bytes);
+    if let Ok(v2) = v2_res {
         return Ok(v2);
     }
-    let v1: PersistedV1 = serde_json::from_slice(bytes)?;
-    Ok(Persisted {
-        version: 2,
-        entries: v1
-            .entries
-            .into_iter()
-            .map(|(h, t)| {
-                (
-                    h,
-                    Rule {
-                        target: t,
-                        mode: Mode::Http,
-                        service: None,
-                        project: None,
-                    },
-                )
-            })
-            .collect(),
-    })
+    if let Ok(v1) = serde_json::from_slice::<PersistedV1>(bytes) {
+        return Ok(Persisted {
+            version: 2,
+            entries: v1
+                .entries
+                .into_iter()
+                .map(|(h, t)| {
+                    (
+                        h,
+                        Rule {
+                            target: t,
+                            mode: Mode::Http,
+                            service: None,
+                            project: None,
+                        },
+                    )
+                })
+                .collect(),
+        });
+    }
+    v2_res.map_err(Into::into)
 }
 
 /// Parse and validate a `host` string (CLI-facing). Accepts DNS-style names,
@@ -206,10 +209,13 @@ pub fn validate_host(host: &str) -> Result<String> {
     if h.starts_with('.') || h.ends_with('.') {
         bail!("host cannot start or end with a dot");
     }
+    if h.contains("..") {
+        bail!("host cannot contain empty labels (`..`), got `{h}`");
+    }
     // Wildcards follow DNS/RFC 6125: a single `*` as the whole leftmost label
     // and nowhere else. Anything looser would make routing and TLS disagree,
     // since a cert can only ever cover the one-label form.
-    if h.contains('*') {
+    let labels_part = if h.contains('*') {
         let rest = h.strip_prefix("*.").ok_or_else(|| {
             anyhow::anyhow!(
                 "`*` is only valid as the whole leftmost label (e.g. *.demo.test), got `{h}`"
@@ -220,6 +226,22 @@ pub fn validate_host(host: &str) -> Result<String> {
         }
         if !rest.contains('.') {
             bail!("wildcard needs a domain under it (e.g. *.demo.test), got `{h}`");
+        }
+        rest
+    } else {
+        h
+    };
+    for label in labels_part.split('.') {
+        if label.is_empty()
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            bail!(
+                "host `{h}` contains invalid DNS characters (allowed: letters, digits, `-`, `.`)"
+            );
         }
     }
     Ok(h.to_ascii_lowercase())
@@ -279,8 +301,15 @@ pub fn validate_target(target: &str) -> Result<String> {
     if host.chars().any(char::is_whitespace) {
         bail!("target host cannot contain whitespace");
     }
-    port.parse::<u16>()
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        bail!("IPv6 target host must be bracketed (e.g. [::1]:3000)");
+    }
+    let port_num = port
+        .parse::<u16>()
         .with_context(|| format!("target port `{port}` is not a valid u16"))?;
+    if port_num == 0 {
+        bail!("target port cannot be 0");
+    }
     Ok(t.to_string())
 }
 
@@ -482,9 +511,25 @@ mod tests {
         assert!(validate_target("127.0.0.1:").is_err());
         assert!(validate_target("127.0.0.1:notaport").is_err());
         assert!(validate_target("127.0.0.1:70000").is_err());
+        assert!(validate_target("127.0.0.1:0").is_err());
+        assert!(validate_target("::1:8080").is_err());
+        assert_eq!(validate_target("[::1]:8080").unwrap(), "[::1]:8080");
         assert_eq!(
             validate_target("  127.0.0.1:3000  ").unwrap(),
             "127.0.0.1:3000"
+        );
+    }
+
+    #[test]
+    fn validate_host_rejects_empty_labels_and_invalid_chars() {
+        assert!(validate_host("foo..test").is_err());
+        assert!(validate_host("foo.-bar.test").is_err());
+        assert!(validate_host("foo.bar-.test").is_err());
+        assert!(validate_host("foo/bar.test").is_err());
+        assert!(validate_host("foo:80.test").is_err());
+        assert_eq!(
+            validate_host("Foo_1.Bar-2.Test").unwrap(),
+            "foo_1.bar-2.test"
         );
     }
 }
