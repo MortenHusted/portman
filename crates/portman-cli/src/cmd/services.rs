@@ -156,6 +156,11 @@ pub(crate) async fn cmd_up(names: Vec<String>) -> Result<()> {
     } else {
         names
     };
+    // An egress-only config is fully applied by the sync. The daemon reads
+    // an empty `ServiceUp` as "every known service", across every root.
+    if targets.is_empty() {
+        return Ok(());
+    }
     let resp = request(Request::ServiceUp {
         names: targets.clone(),
     })
