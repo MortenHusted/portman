@@ -91,10 +91,10 @@ enum Command {
     },
     /// Stop supervised services.
     ///
-    /// With no names, stops every service declared in this repo's
-    /// portman.toml — or everything, when run outside a repo.
+    /// With no names, stops the services this repo's portman.toml declares
+    /// and this repo owns. Outside a repo, names are required.
     Down {
-        /// Services to stop. Omit for every service the repo declares.
+        /// Services to stop. Omit for every service the repo declares and owns.
         #[arg(value_name = "SERVICE")]
         names: Vec<String>,
         /// Stop and remove every service definition owned by this repo root.

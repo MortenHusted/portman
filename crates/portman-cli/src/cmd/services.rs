@@ -266,9 +266,10 @@ pub(crate) async fn cmd_down(
         };
     }
 
-    // With no explicit names, scope the stop to this repo's stack when
-    // inside one; outside a repo, empty names mean "everything the daemon
-    // knows" — confirm that intent by requiring the repo context.
+    // With no explicit names, stop the services this repo declares *and*
+    // owns. Service names are global, so a declared name can belong to
+    // another root that synced it first; the daemon stops by name alone.
+    // Outside a repo there is no scope, so names are required.
     let names = if names.is_empty() {
         let cwd = std::env::current_dir().context("resolving current directory")?;
         let Some(root) = portman_core::service_config::discover_root(&cwd) else {
@@ -281,14 +282,39 @@ pub(crate) async fn cmd_down(
         // it as "outside a repo" sent a user with a one-character TOML typo
         // looking in entirely the wrong place.
         let config = portman_core::service_config::load(&root)?;
-        let service_names: Vec<String> = config.services.keys().cloned().collect();
-        if service_names.is_empty() {
+        if config.services.is_empty() {
             bail!(
                 "no [service.<name>] blocks in this repo — only egress routes, which \
                  follow the config (remove the block, `portman up`); nothing to stop"
             );
         }
-        service_names
+        let services = match request(Request::ServiceStatus).await? {
+            Response::ServiceStatuses { services } => services,
+            other => return other.unexpected(),
+        };
+        let mut owned = Vec::new();
+        for status in services
+            .iter()
+            .filter(|s| config.services.contains_key(&s.name))
+        {
+            match &status.root {
+                Some(owner) if *owner == root => owned.push(status.name.clone()),
+                Some(owner) => eprintln!(
+                    "skipping `{}`: owned by {}, not this repo (name it to stop it anyway)",
+                    status.name,
+                    owner.display()
+                ),
+                None => eprintln!(
+                    "skipping `{}`: the daemon did not report its owner (upgrade it, or name the service)",
+                    status.name
+                ),
+            }
+        }
+        if owned.is_empty() {
+            println!("nothing to stop: no services owned by {}", root.display());
+            return Ok(());
+        }
+        owned
     } else {
         names
     };
