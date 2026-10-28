@@ -1411,8 +1411,8 @@ impl Supervisor {
     /// Every known block with its owner and consumers (services by name,
     /// egress routes as `egress:<name>`). Coordinates only — never a value.
     pub(crate) fn secrets_blocks(&self) -> Vec<portman_protocol::SecretsBlockInfo> {
-        let blocks = self.inner.secrets.lock().expect("secrets lock poisoned");
         let slots = self.inner.slots.lock().expect("slots lock poisoned");
+        let blocks = self.inner.secrets.lock().expect("secrets lock poisoned");
         let routes = self.inner.egress.lock().expect("egress lock poisoned");
         blocks
             .iter()
@@ -4831,6 +4831,38 @@ mod tests {
         std::fs::write(&path, before).unwrap();
         sup.remove_global_block("demo").unwrap();
         assert!(load_persisted(&path).unwrap().secrets.is_empty());
+    }
+
+    /// The dashboard's block listing and every persist hold the slots and
+    /// secrets locks together; taken in opposite orders, the two deadlock.
+    #[test]
+    fn secrets_listing_racing_persist_snapshots_never_deadlocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = test_supervisor(&dir, CollectSink::new());
+        let lister = {
+            let sup = sup.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20_000 {
+                    sup.secrets_blocks();
+                }
+            })
+        };
+        let persister = {
+            let inner = sup.inner.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20_000 {
+                    persisted_snapshot(&inner);
+                }
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !(lister.is_finished() && persister.is_finished()) {
+            assert!(
+                Instant::now() < deadline,
+                "secrets_blocks and persisted_snapshot deadlocked"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[tokio::test]
