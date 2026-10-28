@@ -156,8 +156,8 @@ pub(crate) async fn cmd_up(names: Vec<String>) -> Result<()> {
     } else {
         names
     };
-    // An egress-only config is fully applied by the sync. The daemon reads
-    // an empty `ServiceUp` as "every known service", across every root.
+    // An egress-only config is fully applied by the sync. The daemon refuses
+    // an empty `ServiceUp`; older daemons started every service with it.
     if targets.is_empty() {
         return Ok(());
     }

@@ -302,16 +302,14 @@ async fn handle_sync_services(
 }
 
 async fn handle_service_up(state: &DaemonState, names: Vec<String>) -> Response {
-    let names = if names.is_empty() { None } else { Some(names) };
-    match state.supervisor.up(names.as_deref()).await {
+    match state.supervisor.up(&names).await {
         Ok(_) => handle_service_status(state),
         Err(e) => err(format!("{e:#}")),
     }
 }
 
 async fn handle_service_down(state: &DaemonState, names: Vec<String>) -> Response {
-    let names = if names.is_empty() { None } else { Some(names) };
-    match state.supervisor.down(names.as_deref()).await {
+    match state.supervisor.down(&names).await {
         Ok(_) => handle_service_status(state),
         Err(e) => err(format!("{e:#}")),
     }
@@ -1343,6 +1341,121 @@ mod tests {
         assert!(matches!(response, Response::Err { .. }));
     }
 
+    fn sleeper(name: &str, dir: &std::path::Path) -> portman_protocol::ServiceDefinition {
+        portman_protocol::ServiceDefinition {
+            name: name.into(),
+            run: vec!["/bin/sleep".into(), "300".into()],
+            dir: dir.to_path_buf(),
+            port: None,
+            host: None,
+            mode: Mode::Http,
+            ready: portman_protocol::ReadyCheck::None,
+            depends: vec![],
+            restart: portman_protocol::RestartPolicy::Never,
+            stop_grace_ms: 300,
+            env_files: vec![],
+            env: Default::default(),
+            secrets: vec![],
+            secrets_optional: false,
+            watch: Vec::new(),
+            watch_mode: Default::default(),
+            watch_debounce_ms: 500,
+            groups: Vec::new(),
+            project: None,
+        }
+    }
+
+    /// Each service's desired state and pid, once every desired-up service
+    /// reports a running pid.
+    async fn settled_services(state: &DaemonState) -> Vec<(String, bool, Option<u32>)> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let services: Vec<_> = state
+                .supervisor
+                .status()
+                .into_iter()
+                .map(|s| (s.name, s.desired_up, s.pid))
+                .collect();
+            if services.iter().all(|(_, up, pid)| *up == pid.is_some()) {
+                return services;
+            }
+            assert!(std::time::Instant::now() < deadline, "{services:?}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// An empty name list used to mean every known service, across every
+    /// root. Both lifecycle requests refuse it and leave every service as it
+    /// was; named requests still act.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn service_up_and_down_refuse_an_empty_name_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        for (root, name) in [("a", "running"), ("b", "idle")] {
+            let root = dir.path().join(root);
+            std::fs::create_dir(&root).unwrap();
+            let response = dispatch(
+                Request::SyncServices {
+                    root: root.clone(),
+                    services: vec![sleeper(name, &root)],
+                    secrets: Default::default(),
+                    egress: Default::default(),
+                },
+                &state,
+            )
+            .await;
+            assert!(
+                matches!(response, Response::SyncReport { .. }),
+                "{response:?}"
+            );
+        }
+        let response = dispatch(
+            Request::ServiceUp {
+                names: vec!["running".into()],
+            },
+            &state,
+        )
+        .await;
+        assert!(
+            matches!(response, Response::ServiceStatuses { .. }),
+            "{response:?}"
+        );
+        let before = settled_services(&state).await;
+
+        for request in [
+            Request::ServiceUp { names: vec![] },
+            Request::ServiceDown { names: vec![] },
+        ] {
+            match dispatch(request, &state).await {
+                Response::Err { message } => assert!(
+                    message.contains("an empty list no longer means every service"),
+                    "{message}"
+                ),
+                other => panic!("expected err, got {other:?}"),
+            }
+            assert_eq!(settled_services(&state).await, before);
+        }
+
+        let response = dispatch(
+            Request::ServiceDown {
+                names: vec!["running".into()],
+            },
+            &state,
+        )
+        .await;
+        assert!(
+            matches!(response, Response::ServiceStatuses { .. }),
+            "{response:?}"
+        );
+        assert_eq!(
+            settled_services(&state).await,
+            vec![
+                ("idle".into(), false, None),
+                ("running".into(), false, None)
+            ]
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn logs_query_unknown_service_returns_err() {
         let dir = tempfile::tempdir().unwrap();
@@ -1658,7 +1771,7 @@ mod tests {
         state.supervisor.set_managed_broker();
         assert!(!state.runner.can_start("app.localhost", Some("container")));
         assert!(state.runner.start("app.localhost").await.is_err());
-        assert!(state.supervisor.up(None).await.is_err());
+        assert!(state.supervisor.up(&["web".to_string()]).await.is_err());
         let spec = portman_protocol::EgressSpec {
             require_caller_token: false,
             secrets: "test".into(),

@@ -441,7 +441,7 @@ mod tests {
         )
         .await
         .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["leaky".to_string()]).await.unwrap();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let line = loop {
@@ -489,7 +489,7 @@ mod tests {
         )
         .await
         .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["toy".to_string()]).await.unwrap();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {

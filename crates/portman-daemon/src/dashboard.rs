@@ -512,17 +512,6 @@ async fn handle_batch(
             .await;
         }
     };
-    if parsed.names.is_empty() {
-        // An empty list means "everything" at the IPC layer — far too big a
-        // hammer to hand a web endpoint. Be explicit or be refused.
-        return api_json(
-            stream,
-            Response::Err {
-                message: "names must not be empty".into(),
-            },
-        )
-        .await;
-    }
     api_json(
         stream,
         handlers::dispatch(request(parsed.names), &state).await,
