@@ -743,36 +743,13 @@ impl Supervisor {
             }
         }
 
-        for name in &to_stop {
-            self.stop_and_join(name).await;
-        }
-
-        {
-            let mut slots = self.inner.slots.lock().expect("slots lock poisoned");
-            for name in &report.removed {
-                if let Some(slot) = slots.remove(name) {
-                    self.inner.routes.deregister(&slot.def);
-                }
-            }
-            for def in services {
-                match slots.get_mut(&def.name) {
-                    Some(slot) => {
-                        // A replaced definition may have moved or dropped its
-                        // host; release the old route (restart re-registers).
-                        if slot.def.host != def.host {
-                            self.inner.routes.deregister(&slot.def);
-                        }
-                        slot.def = def;
-                    }
-                    None => {
-                        let name = def.name.clone();
-                        slots.insert(name, Slot::new(root.to_path_buf(), def, false));
-                    }
-                }
-            }
-        }
-        {
+        // Every remaining refusal is decided here, before any service is
+        // stopped or replaced, so an error leaves nothing changed. Checks and
+        // writes share one hold of both locks: a global block edit takes the
+        // secrets lock but not sync_gate, and must not land between them.
+        let (removed, release_hosts) = {
             let mut blocks = self.inner.secrets.lock().expect("secrets lock poisoned");
+            let mut routes = self.inner.egress.lock().expect("egress lock poisoned");
             // Block names are global like service names: a repo block that
             // collides with a daemon-global one (or another root's) would
             // silently swap which coordinates every consumer resolves.
@@ -811,26 +788,10 @@ impl Supervisor {
                 )
                 .with_context(|| format!("in [egress.{name}]"))?;
             }
-            blocks.retain(|_, b| b.root.as_deref() != Some(root));
-            for (name, config) in secrets {
-                blocks.insert(
-                    name,
-                    PersistedSecrets {
-                        root: Some(root.to_path_buf()),
-                        config,
-                    },
-                );
-            }
-        }
-        {
-            // Egress routes have no lifecycle of their own: syncing them IS
-            // the start, removing them is the stop. Re-seed under the same
-            // rule as secrets — this root's set replaces what it had before.
-            let mut routes = self.inner.egress.lock().expect("egress lock poisoned");
             // A name this root is about to claim, already held by another
             // root, would be silently clobbered by the insert below — this
             // root's route would suddenly carry that root's key. Same
-            // global-name rule as services: refuse before mutating anything.
+            // global-name rule as services.
             for name in egress.keys() {
                 if let Some(held) = routes.get(name) {
                     if held.root != root {
@@ -842,6 +803,20 @@ impl Supervisor {
                     }
                 }
             }
+
+            blocks.retain(|_, b| b.root.as_deref() != Some(root));
+            for (name, config) in secrets {
+                blocks.insert(
+                    name,
+                    PersistedSecrets {
+                        root: Some(root.to_path_buf()),
+                        config,
+                    },
+                );
+            }
+            // Egress routes have no lifecycle of their own: syncing them IS
+            // the start, removing them is the stop. Re-seed under the same
+            // rule as secrets — this root's set replaces what it had before.
             let mut removed = Vec::new();
             let mut release_hosts: Vec<portman_protocol::EgressRoute> = Vec::new();
             routes.retain(|name, r| {
@@ -872,19 +847,48 @@ impl Supervisor {
                     },
                 );
             }
-            drop(routes);
-            for route in removed {
-                self.inner.routes.deregister_egress(&route);
+            (removed, release_hosts)
+        };
+        for route in removed {
+            self.inner.routes.deregister_egress(&route);
+        }
+        for route in release_hosts {
+            self.inner.routes.deregister_egress(&route);
+        }
+        for route in egress.values() {
+            self.inner.routes.register_egress(route);
+        }
+        self.inner.secrets_source.invalidate();
+
+        for name in &to_stop {
+            self.stop_and_join(name).await;
+        }
+
+        {
+            let mut slots = self.inner.slots.lock().expect("slots lock poisoned");
+            for name in &report.removed {
+                if let Some(slot) = slots.remove(name) {
+                    self.inner.routes.deregister(&slot.def);
+                }
             }
-            for route in release_hosts {
-                self.inner.routes.deregister_egress(&route);
-            }
-            for route in egress.values() {
-                self.inner.routes.register_egress(route);
+            for def in services {
+                match slots.get_mut(&def.name) {
+                    Some(slot) => {
+                        // A replaced definition may have moved or dropped its
+                        // host; release the old route (restart re-registers).
+                        if slot.def.host != def.host {
+                            self.inner.routes.deregister(&slot.def);
+                        }
+                        slot.def = def;
+                    }
+                    None => {
+                        let name = def.name.clone();
+                        slots.insert(name, Slot::new(root.to_path_buf(), def, false));
+                    }
+                }
             }
         }
         self.persist();
-        self.inner.secrets_source.invalidate();
 
         for name in restart_after {
             self.up(Some(&[name])).await?;
@@ -3976,6 +3980,172 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already defined"), "{err}");
+    }
+
+    /// Root `b` and root `a` each run a service and own a block and an
+    /// egress route; `a` then re-syncs a config that would update `a-web`,
+    /// drop `a-old` and add `a-new`, plus `extra_secrets` / `extra_egress`.
+    /// The sync must be refused with `expected` and leave every service
+    /// running and the in-memory and persisted state as they were.
+    async fn assert_refused_sync_changes_nothing(
+        extra_secrets: Map<String, SecretsProviderConfig>,
+        extra_egress: Map<String, EgressRoute>,
+        expected: &str,
+    ) {
+        let dir = tempdir().unwrap();
+        let sup = test_supervisor(&dir, CollectSink::new());
+        let root_a = dir.path().join("a");
+        let root_b = dir.path().join("b");
+        std::fs::create_dir(&root_a).unwrap();
+        std::fs::create_dir(&root_b).unwrap();
+        sup.set_global_block("shared".into(), local_block("TOKEN"))
+            .unwrap();
+        sup.sync(
+            &root_b,
+            vec![def("b-web", &["/bin/sleep", "300"], &root_b)],
+            Map::from([("b-keys".to_string(), local_block("TOKEN"))]),
+            Map::from([(
+                "b-api".to_string(),
+                keyed_route("b-api.internal", "b-keys", "TOKEN"),
+            )]),
+        )
+        .await
+        .unwrap();
+        sup.sync(
+            &root_a,
+            vec![
+                def("a-web", &["/bin/sleep", "300"], &root_a),
+                def("a-old", &["/bin/sleep", "300"], &root_a),
+            ],
+            Map::from([("a-keys".to_string(), local_block("TOKEN"))]),
+            Map::from([(
+                "a-api".to_string(),
+                keyed_route("a-api.internal", "a-keys", "TOKEN"),
+            )]),
+        )
+        .await
+        .unwrap();
+        sup.up(None).await.unwrap();
+        let names = ["a-old", "a-web", "b-web"];
+        let mut pids = Vec::new();
+        for name in names {
+            wait_for_state(&sup, name, StateKind::Ready, Duration::from_secs(20)).await;
+            pids.push(running_pid(&sup, name).await);
+        }
+        let state = serde_json::to_string(&persisted_snapshot(&sup.inner)).unwrap();
+        let file = std::fs::read(dir.path().join("services.json")).unwrap();
+
+        let mut secrets = Map::from([("a-keys".to_string(), local_block("TOKEN"))]);
+        secrets.extend(extra_secrets);
+        let mut egress = Map::from([(
+            "a-api".to_string(),
+            keyed_route("a-api.internal", "a-keys", "TOKEN"),
+        )]);
+        egress.extend(extra_egress);
+        let err = sup
+            .sync(
+                &root_a,
+                vec![
+                    def("a-web", &["/bin/sleep", "301"], &root_a),
+                    def("a-new", &["/bin/sleep", "300"], &root_a),
+                ],
+                secrets,
+                egress,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains(expected), "{err:#}");
+        assert_eq!(
+            serde_json::to_string(&persisted_snapshot(&sup.inner)).unwrap(),
+            state,
+            "a refused sync changed services, blocks or routes"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("services.json")).unwrap(),
+            file,
+            "a refused sync changed services.json"
+        );
+        for (name, pid) in names.into_iter().zip(pids) {
+            assert_eq!(pid_of(&sup, name).await, Some(pid), "{name} was stopped");
+            assert!(
+                nix::sys::signal::kill(Pid::from_raw(pid as i32), None).is_ok(),
+                "{name}'s process must still run"
+            );
+        }
+        sup.down(None).await.unwrap();
+    }
+
+    fn local_block(key: &str) -> SecretsProviderConfig {
+        SecretsProviderConfig::Local {
+            keys: vec![key.into()],
+        }
+    }
+
+    fn keyed_route(host: &str, block: &str, key: &str) -> EgressRoute {
+        let mut route = egress_route(host);
+        route.spec.secrets = block.into();
+        route.spec.key = key.into();
+        route
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sync_refused_on_a_global_block_name_changes_nothing() {
+        assert_refused_sync_changes_nothing(
+            Map::from([("shared".to_string(), local_block("TOKEN"))]),
+            Map::new(),
+            "[secrets.shared] is already defined globally",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sync_refused_on_another_roots_block_name_changes_nothing() {
+        assert_refused_sync_changes_nothing(
+            Map::from([("b-keys".to_string(), local_block("TOKEN"))]),
+            Map::new(),
+            "[secrets.b-keys] is already defined by",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sync_refused_on_a_missing_egress_block_changes_nothing() {
+        assert_refused_sync_changes_nothing(
+            Map::new(),
+            Map::from([(
+                "a-missing".to_string(),
+                keyed_route("a-missing.internal", "nope", "TOKEN"),
+            )]),
+            "[egress.a-missing] references [secrets.nope]",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sync_refused_on_a_disallowed_egress_key_changes_nothing() {
+        assert_refused_sync_changes_nothing(
+            Map::new(),
+            Map::from([(
+                "a-wrong-key".to_string(),
+                keyed_route("a-wrong-key.internal", "a-keys", "OTHER"),
+            )]),
+            "in [egress.a-wrong-key]",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sync_refused_on_another_roots_egress_route_name_changes_nothing() {
+        assert_refused_sync_changes_nothing(
+            Map::new(),
+            Map::from([(
+                "b-api".to_string(),
+                keyed_route("a-b-api.internal", "a-keys", "TOKEN"),
+            )]),
+            "egress route name `b-api` is already defined by",
+        )
+        .await;
     }
 
     /// A [`RouteBinder`] over real registry/static-store with `.internal`
