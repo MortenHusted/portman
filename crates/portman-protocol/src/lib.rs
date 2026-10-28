@@ -285,13 +285,14 @@ pub enum Request {
         #[serde(default)]
         egress: std::collections::BTreeMap<String, EgressRoute>,
     },
-    /// Start services by name (dependencies come up with them). Empty =
-    /// every known service.
+    /// Start services by name (dependencies come up with them). Names are
+    /// required: an empty list is refused. Older daemons read it as every
+    /// known service.
     ServiceUp {
         #[serde(default)]
         names: Vec<String>,
     },
-    /// Stop services by name. Empty = every known service.
+    /// Stop services by name. Names are required, as for `ServiceUp`.
     ServiceDown {
         #[serde(default)]
         names: Vec<String>,

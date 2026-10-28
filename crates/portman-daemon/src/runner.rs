@@ -122,9 +122,7 @@ impl Starter for Runner {
         // Native service first: during migration the same host can also
         // carry a pitchfork mapping — native winning is the cutover.
         if let Some(service) = self.supervisor.service_for_host(host) {
-            self.supervisor
-                .up(Some(std::slice::from_ref(&service)))
-                .await?;
+            self.supervisor.up(std::slice::from_ref(&service)).await?;
             info!(%service, %host, "starting native service");
             return Ok(format!("starting service {service}"));
         }
@@ -311,7 +309,7 @@ mod tests {
             "expected the native backend, got: {detail}"
         );
 
-        supervisor.down(None).await.unwrap();
+        supervisor.down(&["native-web".to_string()]).await.unwrap();
     }
 
     struct DiscardSink;

@@ -137,8 +137,8 @@ async fn egress_only_up_syncs_without_starting_services() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // The daemon reads an empty `ServiceUp` as "every known service", so
-    // the sync must be the only request.
+    // An empty `ServiceUp` is refused, and older daemons started every
+    // service with it, so the sync must be the only request.
     let requests = sandbox.requests();
     assert!(
         matches!(

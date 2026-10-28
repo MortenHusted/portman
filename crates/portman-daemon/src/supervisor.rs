@@ -891,7 +891,7 @@ impl Supervisor {
         self.persist();
 
         for name in restart_after {
-            self.up(Some(&[name])).await?;
+            self.up(&[name]).await?;
         }
         Ok(report)
     }
@@ -1155,12 +1155,16 @@ impl Supervisor {
         Some(value)
     }
 
-    /// Mark services desired-up and ensure their runner tasks exist. `None`
-    /// means every known service. Named services pull their transitive
-    /// dependencies up with them. Returns the (sorted) set acted on.
-    pub(crate) async fn up(&self, names: Option<&[String]>) -> Result<Vec<String>> {
+    /// Mark the named services desired-up and ensure their runner tasks
+    /// exist. They pull their transitive dependencies up with them. Names
+    /// are required: there is no start-everything. Returns the (sorted) set
+    /// acted on.
+    pub(crate) async fn up(&self, names: &[String]) -> Result<Vec<String>> {
         if self.managed_broker() {
             bail!("managed broker mode cannot start services");
+        }
+        if names.is_empty() {
+            bail!("name the services to start; an empty list no longer means every service");
         }
         let targets = self.expand_targets(names, true)?;
         for name in &targets {
@@ -1211,9 +1215,13 @@ impl Supervisor {
         Ok(targets)
     }
 
-    /// Mark services desired-down and stop them, waiting for a clean exit.
-    /// `None` means every known service. Dependencies are left alone.
-    pub(crate) async fn down(&self, names: Option<&[String]>) -> Result<Vec<String>> {
+    /// Mark the named services desired-down and stop them, waiting for a
+    /// clean exit. Names are required: there is no stop-everything.
+    /// Dependencies are left alone.
+    pub(crate) async fn down(&self, names: &[String]) -> Result<Vec<String>> {
+        if names.is_empty() {
+            bail!("name the services to stop; an empty list no longer means every service");
+        }
         let targets = self.expand_targets(names, false)?;
         for name in &targets {
             self.stop_and_join(name).await;
@@ -1239,7 +1247,7 @@ impl Supervisor {
         }
         // Rewrites the slot set, like sync — serialise with it.
         let _gate = self.inner.sync_gate.lock().await;
-        let targets = self.expand_targets(Some(names), false)?;
+        let targets = self.expand_targets(names, false)?;
         {
             let slots = self.inner.slots.lock().expect("slots lock poisoned");
             for (name, slot) in slots.iter() {
@@ -1537,7 +1545,7 @@ impl Supervisor {
         };
         if !desired.is_empty() {
             info!(services = ?desired, "restoring desired-up services");
-            self.up(Some(&desired)).await?;
+            self.up(&desired).await?;
         }
         Ok(())
     }
@@ -1571,21 +1579,18 @@ impl Supervisor {
         signal_group(marker.pgid, Signal::SIGKILL);
     }
 
-    /// Resolve `names` (or all) to existing services; with `expand_deps`,
-    /// close the set over transitive `depends`.
-    fn expand_targets(&self, names: Option<&[String]>, expand_deps: bool) -> Result<Vec<String>> {
+    /// Resolve `names` to existing services; with `expand_deps`, close the
+    /// set over transitive `depends`.
+    fn expand_targets(&self, names: &[String], expand_deps: bool) -> Result<Vec<String>> {
         let slots = self.inner.slots.lock().expect("slots lock poisoned");
-        let mut targets: Vec<String> = match names {
-            None => slots.keys().cloned().collect(),
-            Some(names) => {
-                for name in names {
-                    if !slots.contains_key(name) {
-                        bail!("unknown service `{name}` — run `portman up` from the repo to sync its config");
-                    }
-                }
-                names.to_vec()
+        for name in names {
+            if !slots.contains_key(name) {
+                bail!(
+                    "unknown service `{name}` — run `portman up` from the repo to sync its config"
+                );
             }
-        };
+        }
+        let mut targets = names.to_vec();
         if expand_deps {
             let mut seen: std::collections::BTreeSet<String> = targets.iter().cloned().collect();
             let mut queue = targets.clone();
@@ -2806,7 +2811,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(Some(&["probe".to_string()])).await.unwrap();
+        sup.up(&["probe".to_string()]).await.unwrap();
         wait_for_state(&sup, "probe", StateKind::Failed, Duration::from_secs(20)).await;
         wait_for_line(&sink, |l| l.trim().parse::<u32>().is_ok()).await;
 
@@ -2891,7 +2896,7 @@ mod tests {
         sup.sync(&repo, vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(Some(&["shimmy".to_string()])).await.unwrap();
+        sup.up(&["shimmy".to_string()]).await.unwrap();
         wait_for_state(&sup, "shimmy", StateKind::Failed, Duration::from_secs(20)).await;
         wait_for_line(&sink, |l| l.starts_with("PATH=")).await;
 
@@ -2922,7 +2927,7 @@ mod tests {
         )
         .await
         .unwrap();
-        sup.up(Some(&["shimmy2".to_string()])).await.unwrap();
+        sup.up(&["shimmy2".to_string()]).await.unwrap();
         wait_for_state(&sup, "shimmy2", StateKind::Failed, Duration::from_secs(20)).await;
         let detail = sup
             .status()
@@ -2961,7 +2966,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(Some(&["porty".to_string()])).await.unwrap();
+        sup.up(&["porty".to_string()]).await.unwrap();
 
         // Not ready while nothing listens.
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -2973,7 +2978,7 @@ mod tests {
             .unwrap();
         wait_for_state(&sup, "porty", StateKind::Ready, Duration::from_secs(20)).await;
 
-        sup.down(None).await.unwrap();
+        sup.down(&["porty".to_string()]).await.unwrap();
     }
 
     /// Watch tests run against real filesystem notifications, so they need a
@@ -3054,7 +3059,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(Some(&["watchy".to_string()])).await.unwrap();
+        sup.up(&["watchy".to_string()]).await.unwrap();
         wait_for_state(&sup, "watchy", StateKind::Ready, Duration::from_secs(20)).await;
         let first = running_pid(&sup, "watchy").await;
 
@@ -3070,7 +3075,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         wait_for_state(&sup, "watchy", StateKind::Ready, Duration::from_secs(20)).await;
-        sup.down(None).await.unwrap();
+        sup.down(&["watchy".to_string()]).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3091,7 +3096,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(Some(&["budget".to_string()])).await.unwrap();
+        sup.up(&["budget".to_string()]).await.unwrap();
         wait_for_state(&sup, "budget", StateKind::Ready, Duration::from_secs(20)).await;
 
         for (i, content) in ["v2", "v3"].iter().enumerate() {
@@ -3108,7 +3113,7 @@ mod tests {
             wait_for_state(&sup, "budget", StateKind::Ready, Duration::from_secs(20)).await;
         }
 
-        sup.down(None).await.unwrap();
+        sup.down(&["budget".to_string()]).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3137,7 +3142,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(Some(&["revive".to_string()])).await.unwrap();
+        sup.up(&["revive".to_string()]).await.unwrap();
         wait_for_state(&sup, "revive", StateKind::Failed, Duration::from_secs(20)).await;
 
         // The build lands — the service should come back on its own, with no
@@ -3145,7 +3150,7 @@ mod tests {
         std::fs::write(&built, "artifact").unwrap();
         wait_for_state(&sup, "revive", StateKind::Ready, Duration::from_secs(20)).await;
 
-        sup.down(None).await.unwrap();
+        sup.down(&["revive".to_string()]).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3165,9 +3170,9 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(Some(&["sticky".to_string()])).await.unwrap();
+        sup.up(&["sticky".to_string()]).await.unwrap();
         wait_for_state(&sup, "sticky", StateKind::Ready, Duration::from_secs(20)).await;
-        sup.down(None).await.unwrap();
+        sup.down(&["sticky".to_string()]).await.unwrap();
         wait_for_state(&sup, "sticky", StateKind::Stopped, Duration::from_secs(20)).await;
 
         touch_next_second(&trigger, "v2").await;
@@ -3200,7 +3205,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(Some(&["late".to_string()])).await.unwrap();
+        sup.up(&["late".to_string()]).await.unwrap();
         wait_for_state(&sup, "late", StateKind::Ready, Duration::from_secs(20)).await;
         let first = running_pid(&sup, "late").await;
 
@@ -3217,7 +3222,7 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        sup.down(None).await.unwrap();
+        sup.down(&["late".to_string()]).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3277,7 +3282,7 @@ mod tests {
                 .unwrap();
             let a = {
                 let sup = sup.clone();
-                tokio::spawn(async move { sup.up(Some(&["racer".to_string()])).await })
+                tokio::spawn(async move { sup.up(&["racer".to_string()]).await })
             };
             let b = {
                 let sup = sup.clone();
@@ -3288,7 +3293,6 @@ mod tests {
             assert!(a.await.is_ok(), "up panicked on iteration {i}");
             assert!(b.await.is_ok(), "sync panicked on iteration {i}");
         }
-        sup.down(None).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3321,7 +3325,7 @@ mod tests {
         let ups: Vec<_> = (0..8)
             .map(|_| {
                 let sup = sup.clone();
-                tokio::spawn(async move { sup.up(Some(&["solo".to_string()])).await })
+                tokio::spawn(async move { sup.up(&["solo".to_string()]).await })
             })
             .collect();
         for u in ups {
@@ -3347,7 +3351,7 @@ mod tests {
             1,
             "exactly one child must have spawned"
         );
-        sup.down(None).await.unwrap();
+        sup.down(&["solo".to_string()]).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3367,7 +3371,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(Some(&["stdin-holder".to_string()])).await.unwrap();
+        sup.up(&["stdin-holder".to_string()]).await.unwrap();
 
         wait_for_state(
             &sup,
@@ -3380,7 +3384,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(sup.status()[0].state, StateKind::Ready);
 
-        sup.down(None).await.unwrap();
+        sup.down(&["stdin-holder".to_string()]).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3395,7 +3399,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(Some(&["never-ready".to_string()])).await.unwrap();
+        sup.up(&["never-ready".to_string()]).await.unwrap();
 
         wait_for_state(
             &sup,
@@ -3421,7 +3425,7 @@ mod tests {
             .unwrap();
 
         let started = Instant::now();
-        sup.up(Some(&["crashy".to_string()])).await.unwrap();
+        sup.up(&["crashy".to_string()]).await.unwrap();
         wait_for_state(&sup, "crashy", StateKind::Failed, Duration::from_secs(20)).await;
         let elapsed = started.elapsed();
 
@@ -3455,7 +3459,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(Some(&["stubborn".to_string()])).await.unwrap();
+        sup.up(&["stubborn".to_string()]).await.unwrap();
         wait_for_state(&sup, "stubborn", StateKind::Ready, Duration::from_secs(20)).await;
         let deadline = Instant::now() + Duration::from_secs(2);
         while sink.count_containing("up") == 0 && Instant::now() < deadline {
@@ -3464,7 +3468,7 @@ mod tests {
         let pid = sup.status()[0].pid.unwrap();
 
         let stop_started = Instant::now();
-        sup.down(Some(&["stubborn".to_string()])).await.unwrap();
+        sup.down(&["stubborn".to_string()]).await.unwrap();
         let stop_elapsed = stop_started.elapsed();
 
         assert_eq!(sup.status()[0].state, StateKind::Stopped);
@@ -3491,7 +3495,9 @@ mod tests {
         sup.sync(dir.path(), vec![dep, top], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["dep".to_string(), "top".to_string()])
+            .await
+            .unwrap();
 
         // While dep serves its readiness delay, top must hold in Pending.
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -3504,7 +3510,9 @@ mod tests {
         assert_eq!(states["top"], StateKind::Pending);
 
         wait_for_state(&sup, "top", StateKind::Ready, Duration::from_secs(20)).await;
-        sup.down(None).await.unwrap();
+        sup.down(&["dep".to_string(), "top".to_string()])
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3522,7 +3530,9 @@ mod tests {
         sup.sync(dir.path(), vec![db.clone(), web], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["db".to_string(), "web".to_string()])
+            .await
+            .unwrap();
 
         wait_for_state(&sup, "db", StateKind::Failed, Duration::from_secs(20)).await;
         wait_for_state(&sup, "web", StateKind::Failed, Duration::from_secs(20)).await;
@@ -3548,7 +3558,9 @@ mod tests {
         wait_for_state(&sup, "web", StateKind::Ready, Duration::from_secs(20)).await;
         let web = sup.status().into_iter().find(|s| s.name == "web").unwrap();
         assert!(web.detail.is_empty(), "{web:?}");
-        sup.down(None).await.unwrap();
+        sup.down(&["db".to_string(), "web".to_string()])
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3565,10 +3577,10 @@ mod tests {
             .await
             .unwrap();
 
-        let started = sup.up(Some(&["b".to_string()])).await.unwrap();
+        let started = sup.up(&["b".to_string()]).await.unwrap();
         assert_eq!(started, vec!["a".to_string(), "b".to_string()]);
         wait_for_state(&sup, "b", StateKind::Ready, Duration::from_secs(20)).await;
-        sup.down(None).await.unwrap();
+        sup.down(&["a".to_string(), "b".to_string()]).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3580,9 +3592,9 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["keeper".to_string()]).await.unwrap();
         wait_for_state(&sup, "keeper", StateKind::Ready, Duration::from_secs(20)).await;
-        sup.down(None).await.unwrap();
+        sup.down(&["keeper".to_string()]).await.unwrap();
 
         // 0600 on the state file.
         let meta = std::fs::metadata(dir.path().join("services.json")).unwrap();
@@ -3606,7 +3618,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["keeper".to_string()]).await.unwrap();
         wait_for_state(&sup, "keeper", StateKind::Ready, Duration::from_secs(20)).await;
         // Shutdown (not `down`) leaves desired_up = true on disk.
         sup.shutdown_all().await;
@@ -3647,7 +3659,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sup_a.up(None).await.unwrap();
+        sup_a.up(&["binder".to_string()]).await.unwrap();
         wait_for_state(&sup_a, "binder", StateKind::Ready, Duration::from_secs(60)).await;
         let old_pid = running_pid(&sup_a, "binder").await;
 
@@ -3682,7 +3694,7 @@ mod tests {
         let new_pid = running_pid(&sup_b, "binder").await;
         assert_ne!(new_pid, old_pid, "must respawn, not adopt");
 
-        sup_b.down(None).await.unwrap();
+        sup_b.down(&["binder".to_string()]).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3783,7 +3795,9 @@ mod tests {
         sup.sync(dir.path(), vec![one.clone(), two], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["one".to_string(), "two".to_string()])
+            .await
+            .unwrap();
         wait_for_state(&sup, "one", StateKind::Ready, Duration::from_secs(20)).await;
         wait_for_state(&sup, "two", StateKind::Ready, Duration::from_secs(20)).await;
         let two_pid = sup
@@ -3816,7 +3830,7 @@ mod tests {
             "removed service process must be stopped"
         );
 
-        sup.down(None).await.unwrap();
+        sup.down(&["one".to_string()]).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3831,7 +3845,9 @@ mod tests {
         sup.sync(dir.path(), vec![one, two], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["one".to_string(), "two".to_string()])
+            .await
+            .unwrap();
         wait_for_state(&sup, "one", StateKind::Ready, Duration::from_secs(20)).await;
         wait_for_state(&sup, "two", StateKind::Ready, Duration::from_secs(20)).await;
         let two_pid = sup
@@ -3865,7 +3881,7 @@ mod tests {
         assert!(sup.forget(&[]).await.is_err());
         assert!(sup.forget(&["nope".to_string()]).await.is_err());
 
-        sup.down(None).await.unwrap();
+        sup.down(&["one".to_string()]).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3911,7 +3927,9 @@ mod tests {
         sup.sync(&other_root, vec![worker], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["web".to_string(), "worker".to_string()])
+            .await
+            .unwrap();
         wait_for_state(&sup, "web", StateKind::Ready, Duration::from_secs(20)).await;
         wait_for_state(&sup, "worker", StateKind::Ready, Duration::from_secs(20)).await;
         let statuses = sup.status();
@@ -3953,7 +3971,7 @@ mod tests {
             nix::sys::signal::kill(Pid::from_raw(worker_pid as i32), None).is_ok(),
             "another root's service process must stay running"
         );
-        sup.down(None).await.unwrap();
+        sup.down(&["worker".to_string()]).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4025,7 +4043,13 @@ mod tests {
         )
         .await
         .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&[
+            "a-old".to_string(),
+            "a-web".to_string(),
+            "b-web".to_string(),
+        ])
+        .await
+        .unwrap();
         let names = ["a-old", "a-web", "b-web"];
         let mut pids = Vec::new();
         for name in names {
@@ -4073,7 +4097,13 @@ mod tests {
                 "{name}'s process must still run"
             );
         }
-        sup.down(None).await.unwrap();
+        sup.down(&[
+            "a-old".to_string(),
+            "a-web".to_string(),
+            "b-web".to_string(),
+        ])
+        .await
+        .unwrap();
     }
 
     fn local_block(key: &str) -> SecretsProviderConfig {
@@ -4208,12 +4238,12 @@ mod tests {
             registry.get("web.internal").is_none(),
             "sync alone must not route"
         );
-        sup.up(None).await.unwrap();
+        sup.up(&["web".to_string()]).await.unwrap();
         let entry = registry.get("web.internal").expect("route derived on up");
         assert_eq!(entry.source, portman_protocol::Source::Service);
         assert_eq!(entry.target, "127.0.0.1:34567");
 
-        sup.down(None).await.unwrap();
+        sup.down(&["web".to_string()]).await.unwrap();
         assert!(
             registry.get("web.internal").is_none(),
             "route removed on down"
@@ -4480,13 +4510,13 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["web".to_string()]).await.unwrap();
         let entry = registry.get("web.internal").unwrap();
         assert_eq!(entry.source, portman_protocol::Source::Service);
         assert_eq!(entry.target, "127.0.0.1:34568");
 
         // Down does NOT bare-remove: the static fallback is re-seeded.
-        sup.down(None).await.unwrap();
+        sup.down(&["web".to_string()]).await.unwrap();
         let entry = registry.get("web.internal").expect("static route restored");
         assert_eq!(entry.source, portman_protocol::Source::Static);
         assert_eq!(entry.target, "127.0.0.1:9080");
@@ -4500,9 +4530,9 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["web".to_string()]).await.unwrap();
         assert!(registry.get("web.unmanaged").is_none());
-        sup.down(None).await.unwrap();
+        sup.down(&["web".to_string()]).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4513,7 +4543,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["web".to_string()]).await.unwrap();
         assert!(registry.get("web.internal").is_some());
 
         // The service disappears from the config → stopped + unrouted.
@@ -4633,7 +4663,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["mix".to_string()]).await.unwrap();
         wait_for_state(&sup, "mix", StateKind::Failed, Duration::from_secs(20)).await;
         wait_for_line(&sink, |l| l.starts_with("FROM_PROVIDER=")).await;
 
@@ -4659,13 +4689,13 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["flaky".to_string()]).await.unwrap();
 
         // Two transient failures back off, the third attempt comes up.
         wait_for_state(&sup, "flaky", StateKind::Ready, Duration::from_secs(20)).await;
         let status = sup.status().remove(0);
         assert!(status.restarts >= 2, "expected backoff retries: {status:?}");
-        sup.down(None).await.unwrap();
+        sup.down(&["flaky".to_string()]).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4679,7 +4709,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["envless".to_string()]).await.unwrap();
 
         wait_for_state(&sup, "envless", StateKind::Failed, Duration::from_secs(20)).await;
         let status = sup.status().remove(0);
@@ -4699,7 +4729,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["rejected".to_string()]).await.unwrap();
 
         wait_for_state(&sup, "rejected", StateKind::Failed, Duration::from_secs(20)).await;
         let status = sup.status().remove(0);
@@ -4720,7 +4750,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["fallback".to_string()]).await.unwrap();
 
         wait_for_state(&sup, "fallback", StateKind::Ready, Duration::from_secs(20)).await;
         let status = sup.status().remove(0);
@@ -4728,7 +4758,7 @@ mod tests {
             status.detail.contains("env_files only"),
             "status must flag the degraded start: {status:?}"
         );
-        sup.down(None).await.unwrap();
+        sup.down(&["fallback".to_string()]).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4740,7 +4770,7 @@ mod tests {
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
             .unwrap();
-        sup.up(None).await.unwrap();
+        sup.up(&["boots".to_string()]).await.unwrap();
         wait_for_state(&sup, "boots", StateKind::Ready, Duration::from_secs(20)).await;
         let pid = sup.status()[0].pid.unwrap();
 
