@@ -967,8 +967,8 @@ impl RouteCommand {
 }
 
 /// utun names this process has created. A route pointing at one of these is
-/// portman's to repair; a route pointing at any other live utun belongs to
-/// something else (chipmk's bridge, a VPN) and is left strictly alone.
+/// portman's to repair. Outside our dedicated subnet, routes pointing at any
+/// other live utun belong to something else and are left alone.
 static OWN_UTUNS: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
 
 fn remember_own_utun(name: &str) {
@@ -1053,16 +1053,19 @@ fn startup_route_plan(iface: &str, extra_cidrs: &BTreeSet<String>) -> Vec<RouteC
 enum ExistingRoute {
     /// Already points where we want it.
     Correct,
-    /// Points at a utun that is dead, or is one of ours — repair it.
+    /// Our dedicated subnet, or a utun that is dead or one of ours — repair it.
     Repair,
-    /// Points at a live utun somebody else owns. Not ours to touch.
+    /// Another subnet via a live utun somebody else owns. Not ours to touch.
     Foreign,
 }
 
-fn classify_existing_route(existing_iface: &str, wanted_iface: &str) -> ExistingRoute {
+fn classify_existing_route(cidr: &str, existing_iface: &str, wanted_iface: &str) -> ExistingRoute {
     if existing_iface == wanted_iface {
         ExistingRoute::Correct
-    } else if !interface_is_alive(existing_iface) || is_own_utun(existing_iface) {
+    } else if cidr == PORTMAN_SUBNET_CIDR
+        || !interface_is_alive(existing_iface)
+        || is_own_utun(existing_iface)
+    {
         ExistingRoute::Repair
     } else {
         ExistingRoute::Foreign
@@ -1072,12 +1075,10 @@ fn classify_existing_route(existing_iface: &str, wanted_iface: &str) -> Existing
 fn ensure_route_command(cmd: &RouteCommand) -> Result<()> {
     if cmd.verb == "add" {
         if let Some(existing) = specific_route_utun_interface(&cmd.cidr) {
-            match classify_existing_route(&existing, &cmd.iface) {
+            match classify_existing_route(&cmd.cidr, &existing, &cmd.iface) {
                 ExistingRoute::Correct => return Ok(()),
-                // A route left behind by a previous start — dead interface, or
-                // a tunnel of ours that isn't the live one — is why the bridge
-                // used to stay broken until someone ran `route change` by hand.
-                // Repair it rather than accepting it forever.
+                // The dedicated subnet belongs to this runtime even if its
+                // previous utun name has since been recycled for a VPN.
                 ExistingRoute::Repair => {
                     info!(
                         cidr = %cmd.cidr,
@@ -1109,7 +1110,8 @@ fn ensure_route_command(cmd: &RouteCommand) -> Result<()> {
         Ok(()) => Ok(()),
         Err(err) if cmd.verb == "add" => match specific_route_utun_interface(&cmd.cidr) {
             Some(existing)
-                if classify_existing_route(&existing, &cmd.iface) != ExistingRoute::Repair =>
+                if classify_existing_route(&cmd.cidr, &existing, &cmd.iface)
+                    != ExistingRoute::Repair =>
             {
                 debug!(cidr = %cmd.cidr, %existing, "route already present; leaving it in place");
                 Ok(())
@@ -1384,7 +1386,7 @@ destination: 172.18.0.0
     #[test]
     fn a_route_already_pointing_at_us_is_left_alone() {
         assert_eq!(
-            classify_existing_route("utun9", "utun9"),
+            classify_existing_route(PORTMAN_SUBNET_CIDR, "utun9", "utun9"),
             ExistingRoute::Correct
         );
     }
@@ -1395,7 +1397,7 @@ destination: 172.18.0.0
         // repairing it can't disrupt anyone — this is the case that kept the
         // bridge silently broken.
         assert_eq!(
-            classify_existing_route("utun-does-not-exist", "utun9"),
+            classify_existing_route("172.18.0.0/16", "utun-does-not-exist", "utun9"),
             ExistingRoute::Repair
         );
     }
@@ -1473,7 +1475,7 @@ destination: 172.18.0.0
         // While claimed (a live tunnel of ours): ours to repair.
         remember_own_utun(&name);
         assert_eq!(
-            classify_existing_route(&name, "utun9"),
+            classify_existing_route("172.18.0.0/16", &name, "utun9"),
             ExistingRoute::Repair
         );
         // After shutdown forgets it, the kernel may recycle the name for a
@@ -1483,8 +1485,13 @@ destination: 172.18.0.0
         // would race the claimed window above.
         forget_own_utun(&name);
         assert_eq!(
-            classify_existing_route(&name, "utun9"),
+            classify_existing_route("172.18.0.0/16", &name, "utun9"),
             ExistingRoute::Foreign
+        );
+        assert_eq!(
+            classify_existing_route(PORTMAN_SUBNET_CIDR, &name, "utun9"),
+            ExistingRoute::Repair,
+            "Portman's dedicated subnet must recover even when its old interface is reused"
         );
     }
 

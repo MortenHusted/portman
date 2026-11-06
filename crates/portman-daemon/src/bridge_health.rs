@@ -5,8 +5,8 @@
 //!      containers on them (via `bollard`, reusing the socket the daemon already
 //!      opened for the container-events watcher).
 //!   2. For each such network, read its subnet(s) and ask the macOS
-//!      routing table whether that subnet is routed via any `utun`
-//!      interface.
+//!      routing table whether that subnet is routed via the active bridge
+//!      interface (or a live legacy `utun` when the native bridge is disabled).
 //!   3. Reduce to a single assessment — `healthy` | `routes_missing` |
 //!      `offline` | `unknown` — and publish it to a `RwLock<String>` the
 //!      IPC Status handler reads.
@@ -49,14 +49,18 @@ pub(crate) fn new_shared() -> Shared {
 /// to match the shape of the other daemon tasks the `tokio::select!` in
 /// `main` awaits — the loop itself is infinite so the function never
 /// actually returns `Ok`.
-pub(crate) async fn run(docker: Docker, shared: Shared) -> anyhow::Result<()> {
+pub(crate) async fn run(
+    docker: Docker,
+    shared: Shared,
+    bridge_ifindex: crate::upstream::BridgeIfIndex,
+) -> anyhow::Result<()> {
     let mut ticker = tokio::time::interval(ASSESSMENT_PERIOD);
     // First tick fires immediately, which is what we want — establish an
     // assessment ASAP after startup rather than leaving the menubar on
     // "unknown" for 5s.
     loop {
         ticker.tick().await;
-        let assessment = assess(&docker).await;
+        let assessment = assess(&docker, &bridge_ifindex).await;
         debug!(
             assessment = assessment.as_str(),
             "bridge health assessment updated"
@@ -67,7 +71,10 @@ pub(crate) async fn run(docker: Docker, shared: Shared) -> anyhow::Result<()> {
     }
 }
 
-async fn assess(docker: &Docker) -> BridgeAssessment {
+async fn assess(
+    docker: &Docker,
+    bridge_ifindex: &crate::upstream::BridgeIfIndex,
+) -> BridgeAssessment {
     // Find docker networks that currently have at least one Portman-labelled
     // container on them. Unrelated compose/default networks are not Portman
     // health inputs.
@@ -90,9 +97,10 @@ async fn assess(docker: &Docker) -> BridgeAssessment {
     // A dead tunnel outranks a missing route in the report: it's the more
     // specific, more confusing failure, and the one that looks fine from the
     // routing table alone.
+    let expected_ifindex = *bridge_ifindex.read().expect("bridge ifindex lock poisoned");
     let mut missing = false;
     for subnet in &subnets {
-        match subnet_routed_via_live_utun(subnet).await {
+        match subnet_routed_via_live_utun(subnet, expected_ifindex).await {
             RouteState::Live => {}
             RouteState::Dead => return BridgeAssessment::TunnelDead,
             RouteState::Missing => missing = true,
@@ -196,17 +204,25 @@ fn parse_route_interface(line: &str) -> Option<String> {
     iface.starts_with("utun").then(|| iface.to_string())
 }
 
-/// Does the host route `subnet` via a utun that **actually exists**?
-///
-/// Checking only that a route exists is what let a total outage report
-/// `healthy`: a failed bridge start left the subnet pointed at a utun that had
-/// since been destroyed, and every packet was black-holed while `route get`
-/// kept happily naming the dead interface.
-async fn subnet_routed_via_live_utun(subnet: &str) -> RouteState {
-    match route_utun_for_subnet(subnet).await {
-        None => RouteState::Missing,
-        Some(iface) if nix::net::if_::if_nametoindex(iface.as_str()).is_ok() => RouteState::Live,
-        Some(_) => RouteState::Dead,
+/// A route is healthy only when its interface exists and matches the active
+/// runtime. With no native runtime, retain support for a live legacy bridge.
+async fn subnet_routed_via_live_utun(subnet: &str, expected_ifindex: Option<u32>) -> RouteState {
+    classify_route_interface(
+        route_utun_for_subnet(subnet).await.as_deref(),
+        expected_ifindex,
+    )
+}
+
+fn classify_route_interface(iface: Option<&str>, expected_ifindex: Option<u32>) -> RouteState {
+    let Some(iface) = iface else {
+        return RouteState::Missing;
+    };
+    match nix::net::if_::if_nametoindex(iface) {
+        Err(_) => RouteState::Dead,
+        Ok(index) if expected_ifindex.is_some_and(|expected| expected != index) => {
+            RouteState::Missing
+        }
+        Ok(_) => RouteState::Live,
     }
 }
 
@@ -223,6 +239,33 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn health_rejects_a_live_interface_that_is_not_the_current_bridge() {
+        let iface = "lo0";
+        let index = nix::net::if_::if_nametoindex(iface).unwrap();
+        assert_eq!(
+            classify_route_interface(Some(iface), Some(index)),
+            RouteState::Live
+        );
+        assert_eq!(
+            classify_route_interface(Some(iface), None),
+            RouteState::Live
+        );
+        assert_eq!(
+            classify_route_interface(None, Some(index)),
+            RouteState::Missing
+        );
+        assert_eq!(
+            classify_route_interface(Some("utun-does-not-exist"), Some(index)),
+            RouteState::Dead
+        );
+        assert_eq!(
+            classify_route_interface(Some(iface), Some(index + 1)),
+            RouteState::Missing,
+            "a live VPN interface does not prove Portman's route is healthy"
+        );
+    }
 
     #[test]
     fn health_scope_requires_portman_host_label() {
