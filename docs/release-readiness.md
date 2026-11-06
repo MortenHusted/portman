@@ -51,11 +51,16 @@ portman doctor
 checkout. If the image needs to be refreshed without reinstalling launchd
 services, run `portman bridge prepare`.
 
-Route installation is conservative while docker-mac-net-connect is still
-running: if a subnet already has a specific `utun` route, Portman leaves it in
-place and keeps reconciling. After the legacy bridge stops and the route
+Portman reconciles its dedicated `192.168.99.0/24` route to the current bridge
+every five seconds, even if the route points at another live `utun` (for example,
+a recycled interface name now used by a VPN). For other Docker subnets, route
+installation is conservative while docker-mac-net-connect is still running:
+Portman leaves specific routes through foreign live `utun` interfaces in place
+and keeps reconciling. After the legacy bridge stops and the route
 disappears, Portman can claim the missing labelled-network route without
-mutating chipmk resources or Docker containers.
+mutating chipmk resources or Docker containers. While the native bridge is up,
+health reports `routes_missing` for routes through a different live interface;
+interface existence alone does not prove the route reaches Portman's bridge.
 
 `portman doctor` is the read-only default-driver check. It reports daemon
 reachability, bridge health/mode, setup-image status, docker-mac-net-connect

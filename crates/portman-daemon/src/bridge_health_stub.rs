@@ -14,7 +14,11 @@ pub(crate) fn new_shared() -> Shared {
     Arc::new(RwLock::new(BridgeAssessment::Healthy))
 }
 
-pub(crate) async fn run(_docker: Docker, _shared: Shared) -> anyhow::Result<()> {
+pub(crate) async fn run(
+    _docker: Docker,
+    _shared: Shared,
+    _bridge_ifindex: crate::upstream::BridgeIfIndex,
+) -> anyhow::Result<()> {
     loop {
         tokio::time::sleep(Duration::from_secs(3600)).await;
     }

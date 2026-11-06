@@ -393,7 +393,11 @@ pub async fn daemon_main() -> Result<()> {
     let dashboard = tokio::spawn(dashboard::run(state.clone(), args.dashboard_port));
     // Hand bridge_health a clone of the Docker handle before docker_events
     // takes ownership; bollard::Docker is a cheap Arc internally.
-    let bridge_health_task = bridge_health::run(docker.clone(), bridge_health_shared);
+    let bridge_health_task = bridge_health::run(
+        docker.clone(),
+        bridge_health_shared,
+        netbridge_handle.ifindex.clone(),
+    );
     let bridge_health_task = tokio::spawn(async move {
         if managed_broker {
             std::future::pending::<()>().await;
