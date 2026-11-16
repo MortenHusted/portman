@@ -723,32 +723,18 @@ mod tests {
         let on_s1 = built(S1, OptIn);
         let (may, wait) = (true, false);
         let (container, network) = (Some(SetupContainer), Some(SetupContainerAndNetwork));
-        let sweep = Step::Sweep;
+        let sweep = |session, leftovers| Step::Sweep(Session(session), leftovers);
         // (enabled, session, running, may_start, owed) → step
         let table = [
-            (
-                OFF,
-                S1,
-                None,
-                may,
-                container,
-                sweep(Session(1), SetupContainer),
-            ),
-            (
-                OFF,
-                S1,
-                None,
-                wait,
-                container,
-                sweep(Session(1), SetupContainer),
-            ),
+            (OFF, S1, None, may, container, sweep(1, SetupContainer)),
+            (OFF, S1, None, wait, container, sweep(1, SetupContainer)),
             (
                 OFF,
                 S2,
                 None,
                 may,
                 network,
-                sweep(Session(2), SetupContainerAndNetwork),
+                sweep(2, SetupContainerAndNetwork),
             ),
             (OFF, S1, None, may, None, Step::Keep),
             (OFF, None, None, may, network, Step::Keep),
