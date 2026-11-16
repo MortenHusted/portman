@@ -402,7 +402,6 @@ async fn converge<E: BridgeEngine>(
                 Wake::Closed => return Ok(()),
             },
             Step::Start(session) => {
-                owed = Some(Leftovers::SetupContainer);
                 let started = try_start(&engine, session, intent.mode, &mut attempts).await;
                 if let Some(bridge) = started {
                     epoch += 1;
@@ -1628,6 +1627,8 @@ mod tests {
     async fn a_disable_with_no_bridge_running_removes_the_network() {
         let mut rig = Rig::start();
         assert_eq!(rig.next_sweep().await, (Session(1), SetupContainer));
+        rig.send(Control::SetMode(DockerMode)).await;
+        rig.no_sweep_follows().await;
 
         rig.send(Control::Disable).await;
 
