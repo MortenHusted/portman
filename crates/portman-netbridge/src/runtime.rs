@@ -118,11 +118,14 @@ impl Runtime {
         options: RuntimeOptions,
         host_kp: &Keypair,
     ) -> Result<Self> {
-        info!(
-            host_pub = %host_kp.public_base64(),
-            mode = options.mode.as_str(),
-            "netbridge host key generated"
-        );
+        let host_pub = host_kp.public_base64();
+        if is_new_host_key(&host_pub) {
+            info!(
+                %host_pub,
+                mode = options.mode.as_str(),
+                "netbridge host key generated"
+            );
+        }
 
         // Ordering is load-bearing: everything that can realistically fail —
         // docker network, route discovery, the setup container — happens before
@@ -235,6 +238,19 @@ impl Drop for Runtime {
         }
         forget_own_utun(&self.utun_name);
     }
+}
+
+/// The host key of the last start. The retries of one start share its key.
+static LAST_HOST_KEY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Whether `host_pub` differs from the key of the start before this one.
+fn is_new_host_key(host_pub: &str) -> bool {
+    let mut last = LAST_HOST_KEY.lock().expect("host key lock poisoned");
+    if last.as_deref() == Some(host_pub) {
+        return false;
+    }
+    *last = Some(host_pub.to_string());
+    true
 }
 
 /// Creates the utun and installs its routes. On a failure it drops the
@@ -1423,6 +1439,17 @@ destination: 172.18.0.0
             network_removal(Err(&server_err(500, "boom"))),
             NetworkRemoval::Unknown(_)
         ));
+    }
+
+    #[test]
+    fn a_host_key_is_new_once_and_a_retry_with_it_is_not() {
+        let (first, second) = (Keypair::generate(), Keypair::generate());
+
+        assert!(is_new_host_key(&first.public_base64()));
+        assert!(!is_new_host_key(&first.public_base64()));
+        assert!(!is_new_host_key(&first.public_base64()));
+        assert!(is_new_host_key(&second.public_base64()));
+        assert!(!is_new_host_key(&second.public_base64()));
     }
 
     fn server_err(status_code: u16, message: &str) -> DockerError {
