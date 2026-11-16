@@ -734,7 +734,12 @@ async fn remove_existing_setup_container(docker: &Docker, _held: &ListenPort) ->
     // asynchronous on docker's side, and auto_remove means it may already have
     // been in flight — either way, creating the replacement while the old one
     // still exists just moves the race one step later.
-    wait_for_setup_container_gone(docker).await
+    wait_for_setup_container_gone(docker).await?;
+    info!(
+        container = SETUP_CONTAINER,
+        "netbridge setup container removed"
+    );
+    Ok(())
 }
 
 /// Poll until the setup container no longer exists. Bounded: if docker is wedged
@@ -925,7 +930,10 @@ async fn remove_portman_network_if_owned(docker: &Docker, _held: &ListenPort) ->
         .await;
     match network_removal(inspected.as_ref().map(|net| net.labels.as_ref())) {
         NetworkRemoval::Remove => match docker.remove_network(PORTMAN_NETWORK).await {
-            Ok(()) => true,
+            Ok(()) => {
+                info!(network = PORTMAN_NETWORK, "docker network removed");
+                true
+            }
             Err(err) => {
                 warn!(
                     network = PORTMAN_NETWORK,

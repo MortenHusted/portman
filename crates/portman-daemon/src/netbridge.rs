@@ -654,6 +654,10 @@ impl BridgeEngine for LinkedEngine {
 
     async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) -> Cleanup {
         let Ok(docker) = docker_of(&self.link, session) else {
+            info!(
+                session = session.0,
+                "netbridge cleanup skipped: the engine session that it was planned on has ended"
+            );
             return Cleanup::Owed;
         };
         portman_netbridge::runtime::remove_leftovers(&docker, self.listen_port, leftovers).await
@@ -1671,6 +1675,87 @@ mod tests {
             listen_port,
         };
         (engine, fake)
+    }
+
+    /// What this thread logs at info and above while the guard lives.
+    #[derive(Clone, Default)]
+    struct Logged(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logged {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Logged {
+        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+            let logged = Self::default();
+            let writer = logged.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            (logged, tracing::subscriber::set_default(subscriber))
+        }
+
+        /// Takes the lines that were logged since the last call.
+        fn lines(&self) -> Vec<String> {
+            let bytes = std::mem::take(&mut *self.0.lock().unwrap());
+            let text = String::from_utf8(bytes).unwrap();
+            text.lines().map(String::from).collect()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cleanup_logs_each_removal_once_and_nothing_when_nothing_is_left() {
+        let (engine, _fake) = engine_with_leftovers(FREE_PORT);
+        let (logged, _guard) = Logged::capture();
+
+        engine
+            .remove_leftovers(Session(1), SetupContainerAndNetwork)
+            .await;
+
+        let lines = logged.lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for (line, removed) in lines.iter().zip(["portman-netbridge-setup", "network"]) {
+            assert!(line.contains("INFO"), "{line}");
+            assert!(line.contains("removed"), "{line}");
+            assert!(line.contains(removed), "{line}");
+        }
+
+        engine
+            .remove_leftovers(Session(1), SetupContainerAndNetwork)
+            .await;
+
+        assert_eq!(logged.lines(), [] as [&str; 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cleanup_that_is_skipped_logs_the_reason_once() {
+        let another_daemons_bridge = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let taken = another_daemons_bridge.local_addr().unwrap().port();
+        let (on_a_taken_port, _fake) = engine_with_leftovers(taken);
+        let (on_a_free_port, _fake) = engine_with_leftovers(FREE_PORT);
+        let (logged, _guard) = Logged::capture();
+
+        on_a_taken_port
+            .remove_leftovers(Session(1), SetupContainerAndNetwork)
+            .await;
+        let lines = logged.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("the listen port is taken"), "{lines:?}");
+
+        on_a_free_port
+            .remove_leftovers(Session(2), SetupContainerAndNetwork)
+            .await;
+        let lines = logged.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("session"), "{lines:?}");
     }
 
     #[tokio::test(start_paused = true)]
