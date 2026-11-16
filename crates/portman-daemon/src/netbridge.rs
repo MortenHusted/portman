@@ -61,6 +61,12 @@ use crate::engine::{Engine, Link, Session};
 /// the daemon exits or a `Disable` arrives.
 const ENABLE_ENV: &str = "PORTMAN_NETBRIDGE";
 
+/// How long the engine of a new session has to say whether it runs a
+/// bridge's setup container. bollard bounds only the wait for a response
+/// head, so a VM that froze with its socket open would hold the loop, and
+/// with it every control message, without this.
+const SETUP_CHECK_BUDGET: Duration = Duration::from_secs(3);
+
 const RETRY_BASE: Duration = Duration::from_secs(5);
 const RETRY_CAP: Duration = Duration::from_secs(60);
 
@@ -410,7 +416,7 @@ async fn converge<E: BridgeEngine>(
             attempts = Attempts::new();
             if let (Some(session), Some(running)) = (session, running.as_mut()) {
                 let setup_container = running.bridge.setup_container_id();
-                if engine.runs_container(session, setup_container).await {
+                if still_runs(&engine, session, setup_container).await {
                     info!(
                         session = session.0,
                         "netbridge kept for a new docker session"
@@ -488,6 +494,15 @@ fn take(
     wanted.apply(msg);
     persist(state_path, &wanted.saved);
     *attempts = Attempts::new();
+}
+
+/// Whether the engine of `session` runs `container`, as far as it says
+/// within [`SETUP_CHECK_BUDGET`].
+async fn still_runs(engine: &impl BridgeEngine, session: Session, container: &str) -> bool {
+    let check = engine.runs_container(session, container);
+    tokio::time::timeout(SETUP_CHECK_BUDGET, check)
+        .await
+        .unwrap_or(false)
 }
 
 enum Wake {
@@ -703,7 +718,7 @@ fn forces_enabled(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tempfile::{tempdir, TempDir};
     use tokio::time::Instant;
@@ -931,6 +946,8 @@ mod tests {
         /// Each time the loop asked whether a bridge's setup container
         /// runs: the session it asked on and the phase it had published.
         container_asks: Arc<Mutex<Vec<(Session, BridgePhase)>>>,
+        /// An engine that froze with its socket open never ends an ask.
+        engine_froze: Arc<AtomicBool>,
         stops: mpsc::UnboundedSender<Stop>,
         stops_may_end: watch::Receiver<bool>,
     }
@@ -1000,6 +1017,9 @@ mod tests {
             };
             let asked = (session, *probe.phase.borrow());
             probe.container_asks.lock().unwrap().push(asked);
+            if probe.engine_froze.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             probe.setup_container.lock().unwrap().as_deref() == Some(id)
         }
 
@@ -1057,6 +1077,7 @@ mod tests {
         phase_at_utun_ask: Arc<Mutex<Vec<BridgePhase>>>,
         setup_container: Arc<Mutex<Option<String>>>,
         container_asks: Arc<Mutex<Vec<(Session, BridgePhase)>>>,
+        engine_froze: Arc<AtomicBool>,
         _dir: TempDir,
     }
 
@@ -1095,6 +1116,7 @@ mod tests {
             let phase_at_utun_ask = Arc::new(Mutex::new(Vec::new()));
             let setup_container = Arc::new(Mutex::new(None));
             let container_asks = Arc::new(Mutex::new(Vec::new()));
+            let engine_froze = Arc::new(AtomicBool::new(false));
             let (handle, rx, phase_tx) = handle_pair();
             let engine = TestEngine {
                 sessions: session_seen,
@@ -1108,6 +1130,7 @@ mod tests {
                     phase_at_utun_ask: phase_at_utun_ask.clone(),
                     setup_container: setup_container.clone(),
                     container_asks: container_asks.clone(),
+                    engine_froze: engine_froze.clone(),
                     stops: stop_seen,
                     stops_may_end: may_end,
                 }),
@@ -1133,6 +1156,7 @@ mod tests {
                 phase_at_utun_ask,
                 setup_container,
                 container_asks,
+                engine_froze,
                 _dir: dir,
             }
         }
@@ -1166,6 +1190,11 @@ mod tests {
         /// container.
         fn engine_runs(&self, container: Option<&str>) {
             *self.setup_container.lock().unwrap() = container.map(String::from);
+        }
+
+        /// The engine froze with its socket open.
+        fn engine_freezes(&self) {
+            self.engine_froze.store(true, Ordering::SeqCst);
         }
 
         fn container_asks(&self) -> Vec<(Session, BridgePhase)> {
@@ -1514,6 +1543,52 @@ mod tests {
             assert!(rig.no_stop_began(), "a stop of a bridge that is gone");
             assert!(rig.ifindex().is_some());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_check_that_never_ends_holds_a_disable_no_longer_than_its_budget() {
+        let mut rig = Rig::up().await;
+        rig.engine_freezes();
+        rig.engine_session(S2);
+
+        let sent = Instant::now();
+        rig.send(Control::Disable).await;
+        rig.reaches(BridgePhase::Disabled).await;
+
+        assert_eq!(sent.elapsed(), SETUP_CHECK_BUDGET);
+        assert_eq!(rig.container_asks().len(), 1);
+        assert_eq!(rig.bridges_held(), 0);
+        assert!(rig.no_stop_began(), "a stop asks an engine that froze");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_check_that_never_ends_replaces_the_bridge_when_its_budget_is_spent() {
+        let mut rig = Rig::up().await;
+        rig.engine_freezes();
+
+        let opened = Instant::now();
+        rig.engine_session(S2);
+        rig.reaches(BridgePhase::Up { epoch: 2 }).await;
+
+        let rebuilt = rig.next_attempt().await;
+        assert_eq!(Some(rebuilt.session), S2);
+        assert_eq!(rebuilt.at - opened, SETUP_CHECK_BUDGET);
+        assert_eq!(rig.bridges_held(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_inspect_that_never_ends_is_a_container_that_does_not_run() {
+        let (engine, fake) = empty_engine(FREE_PORT);
+        let id = "aaaaaaaaaaaa1111";
+        fake.hang(&format!("/containers/{id}/json"));
+
+        let asked = Instant::now();
+        let runs = tokio::time::timeout(LONGEST_WAIT, still_runs(&engine, Session(1), id))
+            .await
+            .expect("the check waited for the engine");
+
+        assert!(!runs);
+        assert_eq!(asked.elapsed(), SETUP_CHECK_BUDGET);
     }
 
     #[tokio::test(start_paused = true)]

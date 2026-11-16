@@ -749,6 +749,9 @@ pub(crate) mod tests {
         /// The body of the inspect response for each path. The engine
         /// answers 404 for any other path.
         holds: Mutex<HashMap<String, String>>,
+        /// The paths whose inspect gets the head of a response and never
+        /// its body.
+        hangs: Mutex<Vec<String>>,
         /// The method and path of each [`Asked::Other`].
         calls: Mutex<Vec<String>>,
         stream_ends: watch::Sender<u64>,
@@ -797,6 +800,7 @@ pub(crate) mod tests {
                 socket: Mutex::new(socket),
                 listed: Mutex::new(Listed::Containers("[]".into())),
                 holds: Default::default(),
+                hangs: Default::default(),
                 calls: Default::default(),
                 stream_ends: watch::Sender::new(0),
                 probed: Default::default(),
@@ -875,11 +879,7 @@ pub(crate) mod tests {
                         let failed = r#"{"message":"the engine is shutting down"}"#;
                         respond(&mut pipe, "500 Internal Server Error", failed).await;
                     }
-                    Listed::Hangs => {
-                        let head = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n";
-                        pipe.write_all(head).await.unwrap();
-                        std::future::pending::<()>().await;
-                    }
+                    Listed::Hangs => never_finish(&mut pipe).await,
                 }
             } else if request_line.contains("/events?") {
                 asked(Asked::Events);
@@ -919,6 +919,9 @@ pub(crate) mod tests {
             let path = url.trim_start_matches(ENGINE_URL);
             let path = path.split('?').next().unwrap();
             self.calls.lock().unwrap().push(format!("{method} {path}"));
+            if self.hangs.lock().unwrap().iter().any(|hung| hung == path) {
+                never_finish(pipe).await;
+            }
             let held = match method {
                 "GET" => self.holds.lock().unwrap().get(path).cloned(),
                 "DELETE" => {
@@ -943,6 +946,13 @@ pub(crate) mod tests {
         #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
         pub(crate) fn hold(&self, path: &str, json: &str) {
             self.holds.lock().unwrap().insert(path.into(), json.into());
+        }
+
+        /// Makes the engine answer an inspect of `path` as a VM does that
+        /// froze with its socket open.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        pub(crate) fn hang(&self, path: &str) {
+            self.hangs.lock().unwrap().push(path.into());
         }
 
         #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -1001,6 +1011,13 @@ pub(crate) mod tests {
         pub(crate) fn lists(&self) -> Vec<u128> {
             self.times(Asked::List)
         }
+    }
+
+    /// Sends the head of a response and never its body.
+    async fn never_finish(pipe: &mut tokio::io::DuplexStream) {
+        let head = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n";
+        pipe.write_all(head).await.unwrap();
+        std::future::pending::<()>().await;
     }
 
     async fn respond(pipe: &mut tokio::io::DuplexStream, status: &str, json: &str) {
