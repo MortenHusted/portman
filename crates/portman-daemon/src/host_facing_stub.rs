@@ -5,11 +5,12 @@ use portman_core::{Registry, TlsStore};
 use tokio::sync::watch;
 
 use crate::certs::CertManager;
+use crate::netbridge::BridgePhase;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     _registry: Registry,
-    _state_rx: watch::Receiver<bool>,
+    _phase_rx: watch::Receiver<BridgePhase>,
     _http_port: u16,
     _tls_port: u16,
     _cert_manager: CertManager,

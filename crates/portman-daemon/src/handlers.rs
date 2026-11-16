@@ -464,7 +464,7 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
         .read()
         .map(|g| *g)
         .unwrap_or(portman_protocol::BridgeAssessment::Unknown);
-    let bridge_enabled = *state.netbridge.enabled.read().await;
+    let bridge_enabled = state.netbridge.phase.borrow().epoch().is_some();
     let bridge_mode = *state.netbridge.mode.read().await;
     Response::Status {
         managed_broker: state.supervisor.managed_broker(),
@@ -833,7 +833,7 @@ pub(crate) mod tests {
             registry.clone(),
             supervisor.clone(),
         );
-        let (netbridge_handle, _rx, _state_tx) = crate::netbridge::handle_pair();
+        let (netbridge_handle, _rx, _phase_tx) = crate::netbridge::handle_pair();
         DaemonState {
             docker,
             registry,

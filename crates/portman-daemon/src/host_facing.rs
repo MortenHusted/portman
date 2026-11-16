@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::certs::CertManager;
+use crate::netbridge::BridgePhase;
 use crate::runner::Starter;
 use crate::upstream::BridgeIfIndex;
 use crate::{dns, proxy, tls_proxy};
@@ -65,13 +66,13 @@ impl RunningServices {
     }
 }
 
-/// Long-running task. Subscribes to `state_rx`; spawns the
+/// Long-running task. Subscribes to `phase_rx`; spawns the
 /// container-facing listeners when the bridge comes up and aborts
 /// them when it goes down.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     registry: Registry,
-    mut state_rx: watch::Receiver<bool>,
+    mut phase_rx: watch::Receiver<BridgePhase>,
     http_port: u16,
     tls_port: u16,
     cert_manager: CertManager,
@@ -83,7 +84,7 @@ pub(crate) async fn run(
     let addrs = container_facing_addrs(http_port, tls_port);
 
     loop {
-        let want_up = *state_rx.borrow_and_update();
+        let want_up = phase_rx.borrow_and_update().epoch().is_some();
 
         match (&services, want_up) {
             (None, true) => {
@@ -105,7 +106,7 @@ pub(crate) async fn run(
             _ => {}
         }
 
-        if state_rx.changed().await.is_err() {
+        if phase_rx.changed().await.is_err() {
             // Sender dropped → daemon is exiting.
             if let Some(running) = services.take() {
                 running.abort();

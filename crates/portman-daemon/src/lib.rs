@@ -157,8 +157,8 @@ pub(crate) struct DaemonState {
     /// tint the sailboat icon green/yellow/red.
     pub bridge_health: bridge_health::Shared,
     /// Handle the IPC server uses to send Enable/Disable to the
-    /// netbridge task. Also carries a shared `enabled` flag for
-    /// synchronous status reads.
+    /// netbridge task. Also carries the bridge phase for synchronous
+    /// status reads.
     pub netbridge: netbridge::Handle,
     /// Previous Docker CPU samples, keyed by full container id. Docker stats
     /// reports monotonic counters; this lets IPC snapshots compute a delta
@@ -264,7 +264,7 @@ pub async fn daemon_main() -> Result<()> {
     let cert_manager = CertManager::new(cert_dir()?, caroot);
 
     let bridge_health_shared = bridge_health::new_shared();
-    let (netbridge_handle, netbridge_rx, netbridge_state_tx) = netbridge::handle_pair();
+    let (netbridge_handle, netbridge_rx, netbridge_phase_tx) = netbridge::handle_pair();
     let resource_samples = resources::new_shared_samples();
     let service_sampler = resources::new_shared_system();
     let resource_history = resources::new_shared_history();
@@ -408,14 +408,14 @@ pub async fn daemon_main() -> Result<()> {
     // runtime via `Request::BridgeEnable` / `BridgeDisable`, which
     // forward through `netbridge_handle` as `Control` messages.
     let netbridge_state_path = portman_core::paths::netbridge_state_path()?;
-    // Subscribe a state receiver *before* spawning the netbridge task
-    // so the very first state publish isn't missed.
-    let host_facing_rx = netbridge_handle.state_rx.clone();
+    // Subscribe a phase receiver *before* spawning the netbridge task
+    // so the very first phase publish isn't missed.
+    let host_facing_rx = netbridge_handle.phase.clone();
     let netbridge_task = netbridge::run(
         docker.clone(),
         netbridge_handle,
         netbridge_rx,
-        netbridge_state_tx,
+        netbridge_phase_tx,
         netbridge_state_path,
     );
     let netbridge_task = tokio::spawn(async move {

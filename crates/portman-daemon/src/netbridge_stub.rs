@@ -16,36 +16,51 @@ pub(crate) enum Control {
     SetMode(NetbridgeMode),
 }
 
+/// Mirrors the macOS phase so readers compile on both platforms. Linux
+/// only ever publishes `Disabled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum BridgePhase {
+    Disabled,
+    WaitingForDocker,
+    Starting,
+    Up { epoch: u64 },
+}
+
+impl BridgePhase {
+    pub(crate) fn epoch(self) -> Option<u64> {
+        match self {
+            BridgePhase::Up { epoch } => Some(epoch),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Handle {
     #[allow(dead_code)]
     pub tx: mpsc::Sender<Control>,
-    pub enabled: Arc<RwLock<bool>>,
     pub mode: Arc<RwLock<NetbridgeMode>>,
-    pub state_rx: watch::Receiver<bool>,
+    pub phase: watch::Receiver<BridgePhase>,
     /// Never published on Linux — container IPs are natively routable, so
     /// upstream connects stay unscoped. Present to keep the Handle shape
     /// identical across platforms.
     pub ifindex: crate::upstream::BridgeIfIndex,
 }
 
-pub(crate) struct StateTx(pub watch::Sender<bool>);
-
-pub(crate) fn handle_pair() -> (Handle, mpsc::Receiver<Control>, StateTx) {
+pub(crate) fn handle_pair() -> (Handle, mpsc::Receiver<Control>, watch::Sender<BridgePhase>) {
     let (tx, rx) = mpsc::channel(8);
-    let enabled = Arc::new(RwLock::new(false));
     let mode = Arc::new(RwLock::new(NetbridgeMode::OptIn));
-    let (state_tx, state_rx) = watch::channel(false);
+    let (phase_tx, phase) = watch::channel(BridgePhase::Disabled);
     (
         Handle {
             tx,
-            enabled,
             mode,
-            state_rx,
+            phase,
             ifindex: crate::upstream::new_bridge_ifindex(),
         },
         rx,
-        StateTx(state_tx),
+        phase_tx,
     )
 }
 
@@ -53,19 +68,12 @@ pub(crate) async fn run(
     _docker: Docker,
     handle: Handle,
     mut rx: mpsc::Receiver<Control>,
-    state_tx: StateTx,
+    _phase_tx: watch::Sender<BridgePhase>,
     _state_path: PathBuf,
 ) -> Result<()> {
     while let Some(msg) = rx.recv().await {
         match msg {
-            Control::Enable => {
-                *handle.enabled.write().await = false;
-                let _ = state_tx.0.send(false);
-            }
-            Control::Disable => {
-                *handle.enabled.write().await = false;
-                let _ = state_tx.0.send(false);
-            }
+            Control::Enable | Control::Disable => {}
             Control::SetMode(new_mode) => {
                 *handle.mode.write().await = new_mode;
             }
