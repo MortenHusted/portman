@@ -1644,6 +1644,7 @@ function renderStatus(status) {
     el('version').textContent = '';
     el('daemon-ports').textContent = '';
     el('bridge-pill').hidden = true;
+    el('docker-pill').hidden = true;
     return;
   }
   el('version').textContent = 'v' + status.version;
@@ -1665,6 +1666,17 @@ function renderStatus(status) {
       `<div class="alert-body">mode=${esc(status.bridge_mode)} · netbridge=${esc(phase)}</div>`,
       assessment === 'tunnel_dead'
     );
+  }
+
+  // An older daemon sends no `docker`. A connected engine gets no pill, and
+  // neither does managed-broker mode, which uses none.
+  const docker = status.docker;
+  const dockerPill = el('docker-pill');
+  dockerPill.hidden = !docker || docker.state === 'connected' || docker.state === 'disabled';
+  if (!dockerPill.hidden) {
+    el('docker-label').textContent = `docker ${String(docker.state).replace(/_/g, ' ')}`
+      + (docker.reason ? ` · ${docker.reason}` : '');
+    dockerPill.title = [docker.socket, docker.detail].filter(Boolean).join(' · ');
   }
 }
 
