@@ -309,7 +309,7 @@ struct Debt {
 }
 
 impl Debt {
-    fn on(&self, session: Option<Session>) -> Option<Leftovers> {
+    fn owed_on(&self, session: Option<Session>) -> Option<Leftovers> {
         (self.swept != session).then_some(if self.network {
             Leftovers::SetupContainerAndNetwork
         } else {
@@ -434,7 +434,7 @@ async fn converge<E: BridgeEngine>(
         )
         .await;
         let may_start = attempts.retry_after.is_none();
-        match plan(&intent, session, built, may_start, debt.on(session)) {
+        match plan(&intent, session, built, may_start, debt.owed_on(session)) {
             Step::Keep => match next_wake(&mut rx, &mut engine, attempts.retry_after).await {
                 Wake::Control(msg) => {
                     take(msg, &mut wanted, &mut attempts, &mut debt, &state_path);
@@ -1210,7 +1210,6 @@ mod tests {
             *self.setup_container.lock().unwrap() = container.map(String::from);
         }
 
-        /// The engine froze with its socket open.
         fn engine_freezes(&self) {
             self.engine_froze.store(true, Ordering::SeqCst);
         }
