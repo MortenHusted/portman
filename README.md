@@ -390,12 +390,66 @@ The proxy terminates TLS and speaks plain HTTP to the backend, so every request 
 
 For host services from inside a container, Docker's normal callback name works: `host.docker.internal:<port>`. On macOS with the native bridge enabled, portman also exposes container-facing DNS/HTTP/TLS on `192.168.99.1`. See [`docs/release-readiness.md`](./docs/release-readiness.md).
 
+## Containers resolving portman names
+
+A container does not resolve portman hostnames by default. On macOS, while the native bridge is enabled, portman runs a DNS forwarder in the Docker VM at `192.168.99.129`. To make a container resolve portman hostnames, give it that address as its resolver:
+
+```yaml
+services:
+  api:
+    image: acme/api
+    dns: [192.168.99.129]
+```
+
+With `docker run`, pass `--dns 192.168.99.129`.
+
+The forwarder sends only names under your managed TLDs to portman. Every other name goes to the resolver that the VM already uses, so the other lookups of the container keep their answers. A name under a managed TLD that portman does not hold also goes on to the VM's resolver, and `host.docker.internal` never goes to portman. portman changes nothing in `/etc/resolver` or in the Mac's own name resolution for this.
+
+HTTP routes need no extra network. Their names resolve to portman's proxy at `192.168.99.1`, which a container on a compose network reaches without joining another network.
+
+A TCP route to a container resolves to the address of that container. Docker blocks traffic between two bridge networks, so a container connects to such a route by name only when it also joins the `portman` network:
+
+```yaml
+services:
+  api:
+    image: acme/api
+    dns: [192.168.99.129]
+    networks: [default, portman]
+
+networks:
+  portman:
+    external: true
+```
+
+For a TCP service on the host, keep using `host.docker.internal:<port>`.
+
+### When portman is down
+
+The forwarder keeps running when the daemon stops or the bridge is down. Its restart policy is `always`, so the engine starts it again after a VM restart. The times below were measured on colima with Docker Engine 29.
+
+| Lookup | While portman is down |
+|---|---|
+| A name outside your managed TLDs | Resolves as before, with no added delay. |
+| `host.docker.internal` | Resolves as before, with no added delay. |
+| A portman hostname | Fails, after about 10 s with musl and 16 s with glibc. |
+| Another name under a managed TLD | Resolves, after 5 to 9 s. The forwarder waits for portman before it asks the VM's resolver. |
+
+`portman bridge disable` removes the forwarder together with the `portman` network. A container that still has `192.168.99.129` as its only resolver then resolves no name at all. Remove the `dns` line from that container, or enable the bridge again.
+
+`portman uninstall` stops the daemon and leaves the forwarder running. To remove the forwarder too, run `portman bridge disable` before you uninstall, or run `docker rm -f portman-netbridge-dns` afterwards.
+
+### Check the forwarder
+
+`portman doctor` prints one `dns forwarder` line. For a forwarder that runs, it starts a short-lived container that looks one registered hostname up through `192.168.99.129`, and prints the answer.
+
+The forwarder needs a setup image that has `dnsmasq`. An install from before this feature has an older image. The bridge then works as before, and `portman doctor` reports the forwarder as unavailable. Run `portman bridge prepare` to build the current image. A bridge that is up gets the forwarder within a minute.
+
 ## Status
 
 I run my full multi-repo stack under portman daily on macOS; that is the main body of testing it has. Known limits:
 
 - Linux compiles, passes unit tests, and has an end-to-end CI job, but very little real-world use. Treat it as experimental.
-- Container-to-container DNS (containers resolving each other's portman names) is designed but not built. See [`docs/c2c-implementation-brief.md`](./docs/c2c-implementation-brief.md).
+- Containers resolve portman hostnames only on macOS with the native bridge, and only when they opt in with a `dns` line. Linux has no forwarder.
 - Let's Encrypt TLS mode is reserved in the config schema but not implemented.
 
 Architecture and design decisions live in [`CLAUDE.md`](./CLAUDE.md) and [`CONCEPTS.md`](./CONCEPTS.md); the verification matrix is [`docs/release-readiness.md`](./docs/release-readiness.md).

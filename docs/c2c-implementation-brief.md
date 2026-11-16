@@ -1,5 +1,13 @@
 # portman — container↔container / container↔host-static DNS implementation brief
 
+> **Superseded.** portman did not build the DNS forwarding of this brief.
+> Containers resolve portman hostnames through a split DNS forwarder in the
+> Docker VM. The README section "Containers resolving portman names" and the
+> section "Container DNS Forwarder" in `docs/release-readiness.md` describe
+> it. This brief forwards unmanaged names inside the daemon, so every
+> container lookup would depend on the daemon and the bridge. It stays here
+> as a record of that design.
+
 ## Context
 
 portman v0 is shipped (commits `2d48c96`..`dfbbe04`). Host-side DNS + HTTP/TLS proxy work: a human at a terminal types `curl http://crm.test` and it reaches a container, or `http://crm.acme` and it reaches a host-local Rails app. The connectivity matrix *one direction* is solved.
@@ -242,7 +250,7 @@ Not a line-by-line guide — just where to start reading:
 
 - **`crates/portman-daemon/src/dns.rs`**: `DnsHandler::handle_request` is where phase A's forwarding and phase B's source rewrite both land
 - **`crates/portman-daemon/src/main.rs`**: `connect_docker` auto-detects the docker socket — add a `discover_bridge_gateway` step after it for phase B
-- **`crates/portman-daemon/src/docker_events.rs`**: watch for `network.create` on `bridge` to invalidate the cached gateway IP
+- **`crates/portman-daemon/src/engine.rs`** (the Docker event loop, which was in `docker_events.rs` when this brief was written): watch for `network.create` on `bridge` to invalidate the cached gateway IP
 - **`crates/portman-protocol/src/lib.rs`**: `Response::Status` grows `container_host_ip: Option<String>`
 - **`crates/portman-cli/src/main.rs`**: new `compose`, `doctor` subcommands for phase C
 - **`macos/Portman/Sources/Portman/*.swift`**: show container-host IP in the About pane; no other UI work needed for phases A+B
