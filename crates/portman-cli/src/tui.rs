@@ -798,7 +798,7 @@ async fn mutate_add_entry(host: &str, target: &str, mode: Mode) -> Result<()> {
 /// Set the v1 netbridge state via IPC and wait for status to reflect it.
 async fn mutate_bridge(req: Request, desired: bool) -> Result<()> {
     match send(req).await? {
-        Response::Ok => wait_for_bridge_state(desired).await,
+        Response::Ok => wait_for_bridge_state(desired).await.map(drop),
         other => other.unexpected(),
     }
 }

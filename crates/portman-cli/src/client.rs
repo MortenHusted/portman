@@ -101,10 +101,31 @@ impl Pauses {
     }
 }
 
+/// How a wait for the bridge ended, when it ended without an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Settled {
+    /// The bridge is as the command asked.
+    Reached,
+    /// The user wants the bridge and no container engine is connected, so
+    /// no wait can see it come up. The daemon starts it when one connects.
+    WaitsForDocker,
+}
+
+impl Settled {
+    /// The line a command prints. `done` says what the command did.
+    pub(crate) fn line(self, done: &str) -> String {
+        match self {
+            Settled::Reached => done.to_string(),
+            Settled::WaitsForDocker => format!("{done}; the bridge starts when Docker connects"),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Poll {
     Reached,
     Pending,
+    WaitsForDocker,
     /// The bridge was on its way up and is now off, so another client
     /// disabled it and no later poll will find it up.
     TurnedOff,
@@ -113,10 +134,13 @@ enum Poll {
 /// What one poll of the phase tells a wait. `previous` is the phase of the
 /// poll before it. A `disabled` with no poll before it can be the phase from
 /// before the daemon took the request, so only a phase that becomes
-/// `disabled` ends a wait for up.
+/// `disabled` ends a wait for up. The daemon reports `waiting_for_docker`
+/// only for a bridge that the user wants, so that phase ends a wait for up
+/// at the first read that shows it.
 fn poll(desired_enabled: bool, previous: Option<BridgePhase>, phase: BridgePhase) -> Poll {
     match (desired_enabled, phase) {
         (true, BridgePhase::Up) | (false, BridgePhase::Disabled) => Poll::Reached,
+        (true, BridgePhase::WaitingForDocker) => Poll::WaitsForDocker,
         (true, BridgePhase::Disabled)
             if previous.is_some_and(|before| before != BridgePhase::Disabled) =>
         {
@@ -129,7 +153,7 @@ fn poll(desired_enabled: bool, previous: Option<BridgePhase>, phase: BridgePhase
 fn timed_out(desired_enabled: bool, last: BridgePhase) -> String {
     let word = last.display_word();
     match (desired_enabled, last) {
-        (true, BridgePhase::Starting | BridgePhase::WaitingForDocker) => format!(
+        (true, BridgePhase::Starting) => format!(
             "netbridge is still {word} after 60s. It stays enabled. If a start fails, the daemon \
              logs the reason and tries again. To stop it, run `portman bridge disable`."
         ),
@@ -140,11 +164,11 @@ fn timed_out(desired_enabled: bool, last: BridgePhase) -> String {
 
 /// Poll until the bridge is up, or until it is off and gone. The daemon
 /// applies bridge changes asynchronously.
-pub(crate) async fn wait_for_bridge_state(desired_enabled: bool) -> Result<()> {
+pub(crate) async fn wait_for_bridge_state(desired_enabled: bool) -> Result<Settled> {
     wait_for_state(bridge_status, desired_enabled).await
 }
 
-async fn wait_for_state<F>(mut read: impl FnMut() -> F, desired_enabled: bool) -> Result<()>
+async fn wait_for_state<F>(mut read: impl FnMut() -> F, desired_enabled: bool) -> Result<Settled>
 where
     F: Future<Output = Result<BridgeStatus>>,
 {
@@ -153,7 +177,8 @@ where
     loop {
         let phase = read().await?.phase();
         match poll(desired_enabled, previous, phase) {
-            Poll::Reached => return Ok(()),
+            Poll::Reached => return Ok(Settled::Reached),
+            Poll::WaitsForDocker => return Ok(Settled::WaitsForDocker),
             Poll::TurnedOff => bail!("netbridge was disabled before it came up"),
             Poll::Pending => previous = Some(phase),
         }
@@ -167,6 +192,7 @@ where
 enum ModePoll {
     Reached,
     Pending,
+    WaitsForDocker,
     SetByAnother(NetbridgeMode),
     TurnedOff,
 }
@@ -180,7 +206,8 @@ enum ModePoll {
 /// With `wait_for_up` the bridge was up before the request. A daemon that
 /// sends the phase sends `disabled` only for a bridge that nobody wants, so
 /// that `disabled` is final. A daemon that sends no phase reads as disabled
-/// while it replaces the bridge, so that wait goes on.
+/// while it replaces the bridge, so that wait goes on. The new mode beside
+/// `waiting_for_docker` ends the wait, as it ends a wait for up in [`poll`].
 fn mode_poll(
     wanted: NetbridgeMode,
     wait_for_up: bool,
@@ -196,6 +223,8 @@ fn mode_poll(
     }
     if !wait_for_up || now.phase() == BridgePhase::Up {
         ModePoll::Reached
+    } else if now.sent_phase == BridgePhase::WaitingForDocker {
+        ModePoll::WaitsForDocker
     } else if now.sent_phase == BridgePhase::Disabled {
         ModePoll::TurnedOff
     } else {
@@ -208,7 +237,7 @@ fn mode_poll(
 pub(crate) async fn wait_for_bridge_mode(
     wanted: NetbridgeMode,
     before: BridgeStatus,
-) -> Result<()> {
+) -> Result<Settled> {
     wait_for_mode(bridge_status, wanted, before).await
 }
 
@@ -216,7 +245,7 @@ async fn wait_for_mode<F>(
     mut read: impl FnMut() -> F,
     wanted: NetbridgeMode,
     before: BridgeStatus,
-) -> Result<()>
+) -> Result<Settled>
 where
     F: Future<Output = Result<BridgeStatus>>,
 {
@@ -228,7 +257,8 @@ where
     loop {
         let now = read().await?;
         match mode_poll(wanted, wait_for_up, previous, now) {
-            ModePoll::Reached => return Ok(()),
+            ModePoll::Reached => return Ok(Settled::Reached),
+            ModePoll::WaitsForDocker => return Ok(Settled::WaitsForDocker),
             ModePoll::SetByAnother(mode) => bail!(
                 "another command set the netbridge mode to {}",
                 NetbridgeMode::display_word(mode)
@@ -267,7 +297,19 @@ mod tests {
             (ENABLE, None, Up, Poll::Reached),
             (ENABLE, Some(Starting), Up, Poll::Reached),
             (ENABLE, None, Starting, Poll::Pending),
-            (ENABLE, None, WaitingForDocker, Poll::Pending),
+            (ENABLE, None, WaitingForDocker, Poll::WaitsForDocker),
+            (
+                ENABLE,
+                Some(Disabled),
+                WaitingForDocker,
+                Poll::WaitsForDocker,
+            ),
+            (
+                ENABLE,
+                Some(Starting),
+                WaitingForDocker,
+                Poll::WaitsForDocker,
+            ),
             (ENABLE, Some(Starting), Starting, Poll::Pending),
             (ENABLE, None, Stopping, Poll::Pending),
             (ENABLE, None, Disabled, Poll::Pending),
@@ -280,6 +322,7 @@ mod tests {
             (DISABLE, None, Stopping, Poll::Pending),
             (DISABLE, None, Starting, Poll::Pending),
             (DISABLE, None, WaitingForDocker, Poll::Pending),
+            (DISABLE, Some(Up), WaitingForDocker, Poll::Pending),
             (DISABLE, None, Up, Poll::Pending),
             (DISABLE, Some(Stopping), Up, Poll::Pending),
         ];
@@ -294,12 +337,10 @@ mod tests {
 
     #[test]
     fn an_enable_that_times_out_says_the_bridge_stays_wanted_and_how_to_stop_it() {
-        for still_wanted in [Starting, WaitingForDocker] {
-            let message = timed_out(ENABLE, still_wanted);
-            assert!(message.contains("stays enabled"), "{message}");
-            assert!(message.contains("If a start fails"), "{message}");
-            assert!(message.contains("`portman bridge disable`"), "{message}");
-        }
+        let message = timed_out(ENABLE, Starting);
+        assert!(message.contains("stays enabled"), "{message}");
+        assert!(message.contains("If a start fails"), "{message}");
+        assert!(message.contains("`portman bridge disable`"), "{message}");
         for (desired_enabled, last) in [(ENABLE, Disabled), (DISABLE, Stopping), (DISABLE, Up)] {
             let message = timed_out(desired_enabled, last);
             assert!(!message.contains("stays enabled"), "{message}");
@@ -413,7 +454,28 @@ mod tests {
                 for_up,
                 Docker,
                 sent(Docker, WaitingForDocker),
+                ModePoll::WaitsForDocker,
+            ),
+            (
+                Docker,
+                for_up,
+                OptIn,
+                sent(Docker, WaitingForDocker),
+                ModePoll::WaitsForDocker,
+            ),
+            (
+                Docker,
+                for_up,
+                OptIn,
+                sent(OptIn, WaitingForDocker),
                 ModePoll::Pending,
+            ),
+            (
+                Docker,
+                mode_only,
+                OptIn,
+                sent(Docker, WaitingForDocker),
+                ModePoll::Reached,
             ),
             (
                 Docker,
@@ -521,6 +583,42 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn an_enable_returns_at_the_read_that_finds_the_bridge_waiting_for_docker() {
+        let mut already_waiting = Script::new(&[sent(Docker, WaitingForDocker)]);
+        let settled = wait_for_state(|| already_waiting.read(), ENABLE).await;
+        assert_eq!(settled.unwrap(), Settled::WaitsForDocker);
+        assert_eq!(already_waiting.read_at.len(), 1);
+
+        let mut read_too_early =
+            Script::new(&[sent(Docker, Disabled), sent(Docker, WaitingForDocker)]);
+        let settled = wait_for_state(|| read_too_early.read(), ENABLE).await;
+        assert_eq!(settled.unwrap(), Settled::WaitsForDocker);
+        assert_eq!(read_too_early.pauses(), millis([10]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_waits_through_a_bridge_that_waits_for_docker() {
+        let mut script = Script::new(&[sent(Docker, WaitingForDocker), sent(Docker, Disabled)]);
+
+        let settled = wait_for_state(|| script.read(), DISABLE).await;
+
+        assert_eq!(settled.unwrap(), Settled::Reached);
+        assert_eq!(script.read_at.len(), 2);
+    }
+
+    #[test]
+    fn a_command_says_that_the_bridge_starts_when_docker_connects() {
+        assert_eq!(
+            Settled::Reached.line("netbridge enabled"),
+            "netbridge enabled"
+        );
+        assert_eq!(
+            Settled::WaitsForDocker.line("netbridge enabled"),
+            "netbridge enabled; the bridge starts when Docker connects"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn an_enable_waits_through_a_start_with_pauses_that_grow_to_half_a_second() {
         let mut statuses = vec![sent(OptIn, Disabled)];
         statuses.extend([sent(OptIn, Starting); 8]);
@@ -577,15 +675,24 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_mode_change_on_a_bridge_that_was_not_up_ends_when_the_new_mode_shows() {
-        for not_up in [Disabled, Starting] {
+        for not_up in [Disabled, Starting, WaitingForDocker] {
             let mut script = Script::new(&[sent(OptIn, not_up), sent(Docker, not_up)]);
 
-            wait_for_mode(|| script.read(), Docker, sent(OptIn, not_up))
-                .await
-                .unwrap();
+            let settled = wait_for_mode(|| script.read(), Docker, sent(OptIn, not_up)).await;
 
+            assert_eq!(settled.unwrap(), Settled::Reached, "{not_up:?}");
             assert_eq!(script.read_at.len(), 2, "{not_up:?}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_mode_change_returns_when_the_bridge_it_waits_for_waits_for_docker() {
+        let mut script = Script::new(&[sent(OptIn, Stopping), sent(Docker, WaitingForDocker)]);
+
+        let settled = wait_for_mode(|| script.read(), Docker, sent(OptIn, Up)).await;
+
+        assert_eq!(settled.unwrap(), Settled::WaitsForDocker);
+        assert_eq!(script.read_at.len(), 2);
     }
 
     #[tokio::test(start_paused = true)]

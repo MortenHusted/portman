@@ -61,8 +61,8 @@ pub(crate) async fn cmd_doctor() -> Result<()> {
 pub(crate) async fn cmd_bridge(req: Request, desired_enabled: bool, verb: &str) -> Result<()> {
     match request(req).await? {
         Response::Ok => {
-            wait_for_bridge_state(desired_enabled).await?;
-            println!("netbridge {verb}");
+            let settled = wait_for_bridge_state(desired_enabled).await?;
+            println!("{}", settled.line(&format!("netbridge {verb}")));
             Ok(())
         }
         other => other.unexpected(),
@@ -84,11 +84,12 @@ pub(crate) async fn cmd_bridge_mode(mode: Option<String>) -> Result<()> {
     let before = bridge_status().await?;
     match request(Request::BridgeSetMode { mode }).await? {
         Response::Ok => {
-            wait_for_bridge_mode(mode, before).await?;
-            println!(
+            let settled = wait_for_bridge_mode(mode, before).await?;
+            let done = format!(
                 "netbridge mode set to {}",
                 NetbridgeMode::display_word(mode)
             );
+            println!("{}", settled.line(&done));
             Ok(())
         }
         other => other.unexpected(),
