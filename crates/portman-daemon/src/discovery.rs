@@ -73,14 +73,14 @@ pub(crate) struct Plan {
     pub skipped: Vec<Skipped>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Skipped {
     pub id: String,
     pub host: String,
     pub reason: Skip,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Skip {
     InvalidHost(String),
     ReservedHost,
@@ -91,6 +91,9 @@ pub(crate) enum Skip {
     NoAddress(String),
     /// A newer container, named by its short id, holds the same host.
     HostTakenBy(String),
+    /// A route from this source holds the same host. [`plan`] never gives
+    /// this reason, because only the registry knows its other routes.
+    HostHeldBy(Source),
 }
 
 impl fmt::Display for Skip {
@@ -110,6 +113,15 @@ impl fmt::Display for Skip {
                 "network mode `{mode}` gives the container no address of its own"
             ),
             Skip::HostTakenBy(id) => write!(f, "container {id} is newer and holds the hostname"),
+            Skip::HostHeldBy(source) => {
+                let route = match source {
+                    Source::Static => "a static rule",
+                    Source::Service => "a service route",
+                    Source::Egress => "an egress route",
+                    Source::Builtin | Source::Container | Source::Unknown => "another route",
+                };
+                write!(f, "{route} holds the hostname")
+            }
         }
     }
 }

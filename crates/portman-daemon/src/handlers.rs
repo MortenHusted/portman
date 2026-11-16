@@ -781,14 +781,14 @@ fn format_duration(d: std::time::Duration) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
 
     /// A DaemonState over temp stores and a lazy (never-connected) Docker
     /// handle — enough to exercise dispatch arms that don't touch Docker.
-    fn test_state(dir: &TempDir) -> DaemonState {
+    pub(crate) fn test_state(dir: &TempDir) -> DaemonState {
         let docker = {
             // bollard checks the socket path exists at construction; give it
             // a real (never-accepting) socket.

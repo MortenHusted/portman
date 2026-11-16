@@ -1,7 +1,7 @@
 //! Container route reconcile. A Docker event only says when to look. One list
 //! of the running containers says which container routes the registry holds.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +15,7 @@ use portman_core::{Mode, Registry};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
-use crate::discovery::{self, Skipped};
+use crate::discovery::{self, Container, Skip, Skipped};
 use crate::DaemonState;
 
 /// Delays between lists that no wake caused. The loop takes these steps while
@@ -103,7 +103,7 @@ pub(crate) async fn run(docker: Docker, state: DaemonState) -> Result<()> {
     let mut events = docker.events(Some(options)).fuse();
     info!("streaming docker events");
 
-    let mut reported = HashSet::new();
+    let mut reported = Vec::new();
     let mut relist = Relist::default();
     loop {
         let retry = match reconcile(&docker, &state, &mut reported).await {
@@ -130,13 +130,12 @@ pub(crate) async fn run(docker: Docker, state: DaemonState) -> Result<()> {
     }
 }
 
-/// Lists the labelled running containers once and makes the registry's
-/// container entries match. Returns whether a container that holds a host has
-/// no address yet.
+/// Lists the labelled running containers once and applies the list. Returns
+/// what [`apply`] returns.
 async fn reconcile(
     docker: &Docker,
     state: &DaemonState,
-    reported: &mut HashSet<Skipped>,
+    reported: &mut Vec<Skipped>,
 ) -> Result<bool> {
     let filters = HashMap::from([("label", vec![discovery::LABEL_HOST])]);
     let options = ListContainersOptionsBuilder::default()
@@ -150,7 +149,14 @@ async fn reconcile(
         .into_iter()
         .filter_map(discovery::observe)
         .collect();
-    let plan = discovery::plan(&containers, |host| state.host_is_routable(host));
+    Ok(apply(state, &containers, reported))
+}
+
+/// Makes the registry's container entries match `containers` and warns once
+/// for each container that gets no route, for as long as its reason lasts.
+/// Returns whether a container still waits for an address.
+fn apply(state: &DaemonState, containers: &[Container], reported: &mut Vec<Skipped>) -> bool {
+    let plan = discovery::plan(containers, |host| state.host_is_routable(host));
 
     let diff = state.registry.replace_container_entries(plan.entries);
     for entry in &diff.removed {
@@ -171,7 +177,13 @@ async fn reconcile(
         );
     }
 
-    for skipped in &plan.skipped {
+    let mut skipped = plan.skipped;
+    skipped.extend(diff.shadowed.iter().map(|(entry, holder)| Skipped {
+        id: entry.container_id.clone().unwrap_or_default(),
+        host: entry.host.clone(),
+        reason: Skip::HostHeldBy(*holder),
+    }));
+    for skipped in &skipped {
         if !reported.contains(skipped) {
             warn!(
                 host = %skipped.host,
@@ -181,12 +193,12 @@ async fn reconcile(
             );
         }
     }
-    *reported = plan.skipped.into_iter().collect();
+    *reported = skipped;
 
     if !plan.waiting.is_empty() {
         debug!(ids = ?plan.waiting, "labelled containers have no address yet");
     }
-    Ok(!plan.waiting.is_empty())
+    !plan.waiting.is_empty()
 }
 
 /// Waits for an event that can change the container routes, then drains the
@@ -383,6 +395,86 @@ mod tests {
         fn make_writer(&self) -> Self {
             self.clone()
         }
+    }
+
+    const ID: &str = "aaaaaaaaaaaa1111";
+    const SHORT_ID: &str = "aaaaaaaaaaaa";
+
+    fn labelled(host: &str) -> Container {
+        Container {
+            id: ID.into(),
+            created: 100,
+            host: host.into(),
+            port: None,
+            mode: Mode::Http,
+            project: None,
+            addresses: vec![("bridge".into(), [172, 17, 0, 2].into())],
+            unaddressable: None,
+        }
+    }
+
+    fn warnings_about(logs: &Logs, id: &str) -> usize {
+        logs.text()
+            .lines()
+            .filter(|line| line.contains("WARN") && line.contains(id))
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_label_that_a_service_route_shadows_is_warned_once_and_routes_after_the_release() {
+        let (logs, _guard) = Logs::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::handlers::tests::test_state(&dir);
+        state.known_tlds.write().unwrap().insert("test".into());
+        let service = portman_core::Entry {
+            host: "web.demo.test".into(),
+            target: "127.0.0.1:3070".into(),
+            source: portman_core::Source::Service,
+            mode: Mode::Http,
+            container_id: None,
+            project: None,
+            egress: None,
+        };
+        state.registry.upsert(service.clone());
+        let containers = [labelled("web.demo.test")];
+        let mut reported = Vec::new();
+
+        assert!(!apply(&state, &containers, &mut reported));
+        assert!(!apply(&state, &containers, &mut reported));
+        assert_eq!(state.registry.get("web.demo.test"), Some(service));
+        assert_eq!(warnings_about(&logs, SHORT_ID), 1, "{}", logs.text());
+
+        state.registry.remove("web.demo.test");
+        assert!(state.container_resync.notified().now_or_never().is_some());
+        apply(&state, &containers, &mut reported);
+
+        let route = state
+            .registry
+            .get("web.demo.test")
+            .expect("container route");
+        assert_eq!(route.source, portman_core::Source::Container);
+        assert_eq!(route.target, "172.17.0.2:80");
+        assert_eq!(warnings_about(&logs, SHORT_ID), 1, "{}", logs.text());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_network_container_is_warned_once_and_never_waits() {
+        let (logs, _guard) = Logs::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::handlers::tests::test_state(&dir);
+        state.known_tlds.write().unwrap().insert("test".into());
+        let containers = [Container {
+            addresses: vec![],
+            unaddressable: Some("host".into()),
+            ..labelled("web.demo.test")
+        }];
+        let mut reported = Vec::new();
+
+        assert!(!apply(&state, &containers, &mut reported));
+        assert!(!apply(&state, &containers, &mut reported));
+
+        assert!(state.registry.get("web.demo.test").is_none());
+        assert_eq!(warnings_about(&logs, SHORT_ID), 1, "{}", logs.text());
     }
 
     #[tokio::test]
