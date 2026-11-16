@@ -1,6 +1,6 @@
 //! Background assessment of "is the host ↔ VM bridge healthy?".
 //!
-//! Every 5 seconds:
+//! Every 5 seconds, and when the engine link changes:
 //!   1. Ask Docker for the set of networks that currently have Portman-labelled
 //!      containers on them. With no engine connected the assessment is
 //!      `offline` and nothing is asked.
@@ -57,11 +57,17 @@ pub(crate) async fn run(
     bridge_ifindex: crate::upstream::BridgeIfIndex,
 ) -> anyhow::Result<()> {
     let mut ticker = tokio::time::interval(ASSESSMENT_PERIOD);
+    let mut link = engine.watch();
     // First tick fires immediately, which is what we want — establish an
     // assessment ASAP after startup rather than leaving the menubar on
-    // "unknown" for 5s.
+    // "unknown" for 5s. A change of the engine link is assessed at once, so
+    // that the assessment does not stay `offline` for a period after the
+    // engine connects.
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            Ok(()) = link.changed() => {}
+        }
         let assessment = assess(&engine, &bridge_ifindex).await;
         debug!(
             assessment = assessment.as_str(),
@@ -270,6 +276,21 @@ mod tests {
             RouteState::Missing,
             "a live VPN interface does not prove Portman's route is healthy"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_engine_that_connects_is_assessed_before_the_next_period() {
+        let (engine, publisher) = crate::engine::channel();
+        let shared = new_shared();
+        let ifindex = crate::upstream::new_bridge_ifindex();
+        tokio::spawn(run(engine, shared.clone(), ifindex));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(*shared.read().unwrap(), BridgeAssessment::Offline);
+
+        let _engine = crate::engine::tests::connect(&publisher);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        assert_eq!(*shared.read().unwrap(), BridgeAssessment::Healthy);
     }
 
     #[tokio::test]

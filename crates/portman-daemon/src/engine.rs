@@ -100,8 +100,8 @@ impl Engine {
         self.link.borrow().session()
     }
 
-    /// The link itself, for a task that acts when the session changes.
-    /// Only the macOS bridge does.
+    /// The link itself, for a task that acts when it changes. Only the
+    /// macOS bridge and its health check do.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn watch(&self) -> watch::Receiver<Link> {
         self.link.clone()
@@ -933,12 +933,18 @@ pub(crate) mod tests {
     /// it, which serves and lists no containers.
     pub(crate) fn connected() -> (Engine, Arc<FakeEngine>) {
         let (engine, publisher) = channel();
+        (engine, connect(&publisher))
+    }
+
+    /// Opens the first session of a link, with an engine that serves and
+    /// lists no containers.
+    pub(crate) fn connect(publisher: &watch::Sender<Link>) -> Arc<FakeEngine> {
         let (docker, fake) = FakeEngine::start(0, vec![]);
         publisher.send_replace(Link::Connected {
             session: Session(1),
             docker,
         });
-        (engine, fake)
+        fake
     }
 
     const HOUR: Duration = Duration::from_secs(3600);
