@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::time::Duration;
 
-use portman_protocol::{BridgePhase, NetbridgeMode, Response};
+use portman_protocol::{BridgePhase, DockerState, DockerStatus, NetbridgeMode, Response};
 use serde_json::Value;
 
 pub(crate) const SETUP_IMAGE: &str = "portman-netbridge/setup:local";
@@ -21,6 +21,8 @@ pub(crate) struct DaemonSnapshot {
     pub bridge_assessment: Option<portman_protocol::BridgeAssessment>,
     pub bridge_phase: Option<BridgePhase>,
     pub bridge_mode: Option<NetbridgeMode>,
+    /// `None` also for a daemon that predates the field.
+    pub docker: Option<DockerStatus>,
 }
 
 impl DaemonSnapshot {
@@ -33,6 +35,7 @@ impl DaemonSnapshot {
                 bridge_enabled,
                 bridge_phase,
                 bridge_mode,
+                docker,
                 ..
             }) => Self {
                 reachable: true,
@@ -40,6 +43,7 @@ impl DaemonSnapshot {
                 bridge_assessment: Some(bridge_assessment),
                 bridge_phase: Some(bridge_phase.or_from_enabled(bridge_enabled)),
                 bridge_mode: Some(bridge_mode),
+                docker,
             },
             _ => Self {
                 reachable: false,
@@ -47,6 +51,7 @@ impl DaemonSnapshot {
                 bridge_assessment: None,
                 bridge_phase: None,
                 bridge_mode: None,
+                docker: None,
             },
         }
     }
@@ -79,6 +84,13 @@ pub(crate) enum DockerRouteStatus {
     Routes(Vec<DockerRouteDiagnostic>),
     NoLabelledContainers,
     DockerUnavailable { message: String },
+}
+
+impl DockerRouteStatus {
+    /// Whether an engine answered the `docker` CLI.
+    pub(crate) fn cli_answered(&self) -> bool {
+        !matches!(self, DockerRouteStatus::DockerUnavailable { .. })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,13 +300,25 @@ fn replacement_ready(outcomes: &[CheckOutcome]) -> bool {
 pub(crate) fn render_report(report: &DoctorReport) -> String {
     let legacy = check_legacy_bridge(&report.legacy_bridge);
     let legacy_running = legacy.state != CheckState::Ok;
-    let outcomes = [
-        check_daemon(&report.daemon),
+    let cli_answers = [
+        !matches!(
+            report.setup_image,
+            SetupImageStatus::DockerUnavailable { .. }
+        ),
+        report.docker_routes.cli_answered(),
+    ];
+    let mut outcomes = vec![check_daemon(&report.daemon)];
+    outcomes.extend(check_docker(
+        report.daemon.docker.as_ref(),
+        &cli_answers,
+        "setup image and labelled docker networks lines",
+    ));
+    outcomes.extend([
         check_setup_image(&report.setup_image),
         legacy,
         check_container_facing(&report.container_facing),
         check_docker_routes(&report.docker_routes),
-    ];
+    ]);
     let ready = replacement_ready(&outcomes);
 
     let mut lines = Vec::new();
@@ -352,6 +376,51 @@ fn bridge_guidance(phase: Option<BridgePhase>) -> &'static [&'static str] {
             "use `portman bridge mode docker` and `portman bridge enable` for labelled Docker bridge replacement",
         ],
     }
+}
+
+/// The daemon's own view of the engine. A daemon that reports none gets no
+/// line. The setup image check and the docker networks check ask the
+/// `docker` CLI.
+fn check_docker(
+    docker: Option<&DockerStatus>,
+    cli_answers: &[bool],
+    cli_lines: &str,
+) -> Option<CheckOutcome> {
+    let docker = docker?;
+    let state = match docker.state {
+        DockerState::Disconnected => CheckState::Fail,
+        _ => CheckState::Ok,
+    };
+    let mut lines = vec![format!("docker: {}", docker.summary())];
+    lines.extend(docker_cli_note(Some(docker), cli_answers, cli_lines));
+    Some(CheckOutcome {
+        state,
+        lines,
+        gates_ready: true,
+    })
+}
+
+/// The daemon and the `docker` CLI each choose their socket, so one can
+/// have an engine while the other has none. The note says so, and names the
+/// lines that show the CLI's result. `cli_answers` holds, for each check
+/// that ran the CLI, whether an engine answered it.
+pub(crate) fn docker_cli_note(
+    docker: Option<&DockerStatus>,
+    cli_answers: &[bool],
+    cli_lines: &str,
+) -> Option<String> {
+    let found = match docker?.state {
+        DockerState::Connected if cli_answers.contains(&false) => {
+            "a check got no answer from an engine, and the daemon is connected to one"
+        }
+        DockerState::Disconnected if cli_answers.contains(&true) => {
+            "a check reached an engine, and the daemon is connected to none"
+        }
+        _ => return None,
+    };
+    Some(format!(
+        "docker CLI: {found}; the {cli_lines} below come from the `docker` CLI"
+    ))
 }
 
 fn check_docker_routes(status: &DockerRouteStatus) -> CheckOutcome {
@@ -683,6 +752,7 @@ mod tests {
             bridge_assessment: Some(portman_protocol::BridgeAssessment::Healthy),
             bridge_phase: Some(BridgePhase::Up),
             bridge_mode: Some(NetbridgeMode::Docker),
+            docker: None,
         }
     }
 
@@ -760,6 +830,131 @@ mod tests {
 
         assert_eq!(status(true).bridge_phase, Some(BridgePhase::Up));
         assert_eq!(status(false).bridge_phase, Some(BridgePhase::Disabled));
+    }
+
+    fn connected_docker() -> DockerStatus {
+        DockerStatus {
+            state: DockerState::Connected,
+            socket: Some("/run/demo/docker.sock".to_string()),
+            version: Some("29.2.1".to_string()),
+            ..DockerStatus::default()
+        }
+    }
+
+    fn disconnected_docker() -> DockerStatus {
+        DockerStatus {
+            state: DockerState::Disconnected,
+            socket: Some("/run/demo/docker.sock".to_string()),
+            reason: Some("no socket".to_string()),
+            ..DockerStatus::default()
+        }
+    }
+
+    fn with_docker(docker: Option<DockerStatus>) -> DoctorReport {
+        let mut report = ready_but_for_the_bridge(BridgePhase::Up);
+        report.daemon.docker = docker;
+        report
+    }
+
+    #[test]
+    fn doctor_says_whether_docker_is_connected_and_why_not() {
+        let connected = render_report(&with_docker(Some(connected_docker())));
+        assert!(
+            connected.contains("\ndocker: connected to /run/demo/docker.sock, engine 29.2.1\n"),
+            "{connected}"
+        );
+        assert!(connected.contains("replacement: ready"), "{connected}");
+
+        let disconnected = render_report(&with_docker(Some(disconnected_docker())));
+        assert!(
+            disconnected.contains("\ndocker: disconnected, no socket at /run/demo/docker.sock\n"),
+            "{disconnected}"
+        );
+        assert!(
+            disconnected.contains("replacement: needs attention"),
+            "{disconnected}"
+        );
+    }
+
+    #[test]
+    fn doctor_prints_no_docker_line_for_a_daemon_that_does_not_report_the_engine() {
+        let json = r#"{"kind":"status","version":"0.1.5","running_since":"5s","dns_port":5335}"#;
+        let daemon = DaemonSnapshot::from_status(Some(serde_json::from_str(json).unwrap()));
+        assert_eq!(daemon.docker, None);
+
+        let rendered = render_report(&with_docker(None));
+        assert!(!rendered.contains("\ndocker"), "{rendered}");
+        assert!(rendered.contains("replacement: ready"), "{rendered}");
+    }
+
+    #[test]
+    fn doctor_reads_the_engine_state_that_the_daemon_reports() {
+        let json = r#"{"kind":"status","docker":{"state":"disconnected","socket":"/run/demo/docker.sock","reason":"no socket"}}"#;
+        let daemon = DaemonSnapshot::from_status(Some(serde_json::from_str(json).unwrap()));
+        assert_eq!(daemon.docker, Some(disconnected_docker()));
+    }
+
+    #[test]
+    fn a_note_says_when_the_docker_cli_and_the_daemon_see_different_engines() {
+        let (answered, failed, mixed) = (&[true][..], &[false][..], &[true, false][..]);
+        // (the daemon's engine state, whether each `docker` CLI check got an
+        // answer) → the note names
+        let table = [
+            (Some(connected_docker()), answered, None),
+            (Some(connected_docker()), failed, Some("got no answer")),
+            (Some(connected_docker()), mixed, Some("got no answer")),
+            (Some(disconnected_docker()), failed, None),
+            (
+                Some(disconnected_docker()),
+                answered,
+                Some("reached an engine"),
+            ),
+            (
+                Some(disconnected_docker()),
+                mixed,
+                Some("reached an engine"),
+            ),
+            (None, answered, None),
+            (None, failed, None),
+            (Some(DockerStatus::default()), answered, None),
+            (Some(DockerStatus::default()), failed, None),
+        ];
+        for (docker, cli_answers, names) in table {
+            let note = docker_cli_note(docker.as_ref(), cli_answers, "labelled docker networks");
+            assert_eq!(
+                note.is_some(),
+                names.is_some(),
+                "docker={docker:?} cli_answers={cli_answers:?} note={note:?}"
+            );
+            if let (Some(note), Some(names)) = (note, names) {
+                assert!(note.starts_with("docker CLI: "), "{note}");
+                assert!(note.contains(names), "{note}");
+                assert!(note.contains("labelled docker networks"), "{note}");
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_notes_a_docker_cli_that_disagrees_with_the_daemon() {
+        // The `docker` CLI of the report answers both of its checks.
+        let agree = render_report(&with_docker(Some(connected_docker())));
+        assert!(!agree.contains("docker CLI:"), "{agree}");
+
+        let cli_only = render_report(&with_docker(Some(disconnected_docker())));
+        assert!(
+            cli_only.contains("docker CLI: a check reached an engine"),
+            "{cli_only}"
+        );
+
+        let mut report = with_docker(Some(connected_docker()));
+        report.docker_routes = DockerRouteStatus::DockerUnavailable {
+            message: "Cannot connect to the Docker daemon".to_string(),
+        };
+        let daemon_only = render_report(&report);
+        assert!(
+            daemon_only.contains("docker CLI: a check got no answer"),
+            "{daemon_only}"
+        );
     }
 
     fn open_container_facing() -> ContainerFacingStatus {

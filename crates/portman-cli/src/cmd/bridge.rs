@@ -16,6 +16,7 @@ pub(crate) async fn cmd_bridge_status() -> Result<()> {
             bridge_enabled,
             bridge_phase,
             bridge_mode,
+            docker,
             ..
         } => {
             println!("bridge:    {bridge_assessment}");
@@ -24,7 +25,19 @@ pub(crate) async fn cmd_bridge_status() -> Result<()> {
                 bridge_phase.or_from_enabled(bridge_enabled).display_word()
             );
             println!("mode:      {}", NetbridgeMode::display_word(bridge_mode));
-            for line in doctor::render_docker_routes(&doctor::collect_docker_routes()) {
+            let routes = doctor::collect_docker_routes();
+            if let Some(docker) = &docker {
+                println!("docker:    {}", docker.summary());
+            }
+            let note = doctor::docker_cli_note(
+                docker.as_ref(),
+                &[routes.cli_answered()],
+                "labelled docker networks lines",
+            );
+            for line in note
+                .into_iter()
+                .chain(doctor::render_docker_routes(&routes))
+            {
                 println!("{line}");
             }
             Ok(())
