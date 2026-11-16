@@ -60,6 +60,9 @@ pub(crate) enum BridgePhase {
     Up {
         epoch: u64,
     },
+    /// A bridge still runs and the next step removes it. The phase that
+    /// follows is published only when that bridge is gone.
+    Stopping,
 }
 
 impl BridgePhase {
@@ -78,6 +81,7 @@ impl From<BridgePhase> for portman_protocol::BridgePhase {
             BridgePhase::WaitingForDocker => Self::WaitingForDocker,
             BridgePhase::Starting => Self::Starting,
             BridgePhase::Up { .. } => Self::Up,
+            BridgePhase::Stopping => Self::Stopping,
         }
     }
 }
@@ -163,16 +167,29 @@ fn plan(
 }
 
 /// `Up` only for a bridge that [`plan`] keeps, so that nothing binds to a
-/// utun the next step removes.
+/// utun the next step removes. A bridge that `plan` removes is `Stopping`,
+/// so that a reader waiting for the bridge to be off or to be up again does
+/// not take the removal for done.
 fn phase(intent: &NetbridgeState, session: Option<Session>, running: Option<Built>) -> BridgePhase {
-    match (session, running) {
-        _ if !intent.enabled => BridgePhase::Disabled,
-        (None, _) => BridgePhase::WaitingForDocker,
-        (Some(session), Some(built)) if built.session == session && built.mode == intent.mode => {
+    match (running, session) {
+        (Some(built), Some(session))
+            if intent.enabled && built.session == session && built.mode == intent.mode =>
+        {
             BridgePhase::Up { epoch: built.epoch }
         }
-        _ => BridgePhase::Starting,
+        (Some(_), _) => BridgePhase::Stopping,
+        (None, _) if !intent.enabled => BridgePhase::Disabled,
+        (None, None) => BridgePhase::WaitingForDocker,
+        (None, Some(_)) => BridgePhase::Starting,
     }
+}
+
+/// The mode that status reports beside [`phase`]: the running bridge's mode
+/// while one exists, and the wanted mode otherwise. A client that waits for
+/// a mode change to finish therefore never sees the new mode beside the
+/// bridge that was built for the old one.
+fn reported_mode(intent: &NetbridgeState, running: Option<Built>) -> NetbridgeMode {
+    running.map_or(intent.mode, |built| built.mode)
 }
 
 /// One start sequence: a first attempt and its retries. They share one host
@@ -233,7 +250,7 @@ pub(crate) async fn run(
                 &handle,
                 &phase_tx,
                 phase(&intent, session, built),
-                intent.mode,
+                reported_mode(&intent, built),
                 running.as_ref(),
             )
             .await;
@@ -294,8 +311,9 @@ pub(crate) async fn run(
 
 /// The one place that tells the rest of the daemon what the bridge is
 /// doing. The ifindex goes first, so that a reader woken by `Up` finds it
-/// set. The mode goes last, so that a reader that sees a new mode never
-/// pairs it with the phase of the bridge built for the old mode.
+/// set. The mode goes last, so that a reader that takes the mode first and
+/// the phase second never pairs a new mode with the phase of the bridge
+/// built for the old mode.
 async fn publish(
     handle: &Handle,
     phase_tx: &watch::Sender<BridgePhase>,
@@ -438,14 +456,17 @@ mod tests {
         let table = [
             (OFF, OptIn, S1, None, BridgePhase::Disabled),
             (OFF, OptIn, None, None, BridgePhase::Disabled),
-            (OFF, OptIn, S1, on_s1, BridgePhase::Disabled),
             (ON, OptIn, None, None, BridgePhase::WaitingForDocker),
-            (ON, OptIn, None, on_s1, BridgePhase::WaitingForDocker),
             (ON, OptIn, S1, None, BridgePhase::Starting),
-            (ON, DockerMode, S1, on_s1, BridgePhase::Starting),
-            (ON, OptIn, S2, on_s1, BridgePhase::Starting),
             (ON, OptIn, S1, on_s1, up),
             (ON, DockerMode, S2, built(S2, DockerMode), up),
+            (OFF, OptIn, S1, on_s1, BridgePhase::Stopping),
+            (OFF, DockerMode, S1, on_s1, BridgePhase::Stopping),
+            (ON, DockerMode, S1, on_s1, BridgePhase::Stopping),
+            (ON, OptIn, None, on_s1, BridgePhase::Stopping),
+            (ON, OptIn, S2, on_s1, BridgePhase::Stopping),
+            (OFF, OptIn, None, on_s1, BridgePhase::Stopping),
+            (OFF, OptIn, S2, on_s1, BridgePhase::Stopping),
         ];
         for (enabled, mode, session, running, want) in table {
             assert_eq!(
@@ -457,22 +478,41 @@ mod tests {
     }
 
     #[test]
-    fn phase_is_up_only_for_a_bridge_that_plan_keeps() {
+    fn a_bridge_is_up_while_plan_keeps_it_and_stopping_otherwise() {
         for enabled in [OFF, ON] {
             for mode in [OptIn, DockerMode] {
                 for session in [None, S1, S2] {
                     for running in [None, built(S1, OptIn), built(S2, DockerMode)] {
                         let intent = intent(enabled, mode);
-                        let kept = running.is_some()
-                            && plan(&intent, session, running, true) == Step::Keep;
+                        let kept = plan(&intent, session, running, true) == Step::Keep;
+                        let phase = phase(&intent, session, running);
                         assert_eq!(
-                            phase(&intent, session, running).epoch().is_some(),
-                            kept,
+                            (phase.epoch().is_some(), phase == BridgePhase::Stopping),
+                            (running.is_some() && kept, running.is_some() && !kept),
                             "enabled={enabled} mode={mode:?} session={session:?} running={running:?}"
                         );
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_new_mode_is_reported_once_the_bridge_built_for_the_old_one_is_gone() {
+        let on_s1 = built(S1, OptIn);
+        // (wanted mode, running) → reported mode
+        let table = [
+            (OptIn, None, OptIn),
+            (DockerMode, None, DockerMode),
+            (OptIn, on_s1, OptIn),
+            (DockerMode, on_s1, OptIn),
+        ];
+        for (mode, running, want) in table {
+            assert_eq!(
+                reported_mode(&intent(ON, mode), running),
+                want,
+                "mode={mode:?} running={running:?}"
+            );
         }
     }
 

@@ -271,6 +271,8 @@ mod tests {
             (None, up(1), Rebind::Bind(1)),
             (Some(1), up(1), Rebind::Keep),
             (Some(1), up(2), Rebind::Bind(2)),
+            (None, BridgePhase::Stopping, Rebind::Keep),
+            (Some(1), BridgePhase::Stopping, Rebind::Drop),
             (Some(1), BridgePhase::Starting, Rebind::Drop),
             (Some(1), BridgePhase::WaitingForDocker, Rebind::Drop),
             (Some(1), BridgePhase::Disabled, Rebind::Drop),

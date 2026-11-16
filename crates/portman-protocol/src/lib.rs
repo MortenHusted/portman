@@ -520,9 +520,10 @@ pub enum Response {
         /// Default preserves backward compat with pre-Phase-A.3 daemons.
         #[serde(default)]
         bridge_assessment: BridgeAssessment,
-        /// Whether the v1 in-process netbridge is up (i.e. owning the
-        /// `portman` docker network + utun tunnel). False for a bridge the
-        /// user wants that is not up; `bridge_phase` tells that one apart.
+        /// Whether the v1 in-process netbridge runs (i.e. owns the
+        /// `portman` docker network + utun tunnel): it is up or still
+        /// stopping. False for a bridge the user wants that is not up;
+        /// `bridge_phase` tells that one apart.
         /// Distinct from `bridge_assessment`, which describes health
         /// of whichever bridge is routing — including the wrapped
         /// chipmk bridge in v0.
@@ -531,7 +532,8 @@ pub enum Response {
         /// What the in-process netbridge is doing.
         #[serde(default)]
         bridge_phase: BridgePhase,
-        /// Route ownership mode for the native netbridge.
+        /// Route ownership mode for the native netbridge: the mode of the
+        /// running bridge, or the mode the next one is built for.
         #[serde(default = "default_netbridge_mode")]
         bridge_mode: NetbridgeMode,
         /// TCP port the web dashboard binds to on 127.0.0.1.

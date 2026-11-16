@@ -2,7 +2,7 @@
 
 use portman_core::paths::{cert_dir as cert_dir_path, socket_path};
 use portman_core::{Mode, NetbridgeMode, Request, Response, VERSION};
-use portman_protocol::TldInfo;
+use portman_protocol::{BridgePhase, TldInfo};
 
 use crate::DaemonState;
 
@@ -464,8 +464,10 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
         .read()
         .map(|g| *g)
         .unwrap_or(portman_protocol::BridgeAssessment::Unknown);
-    let bridge_phase = portman_protocol::BridgePhase::from(*state.netbridge.phase.borrow());
+    // Mode first, phase second: `netbridge::publish` writes them in the
+    // opposite order, and the pair is consistent only when read this way.
     let bridge_mode = *state.netbridge.mode.read().await;
+    let bridge_phase = BridgePhase::from(*state.netbridge.phase.borrow());
     Response::Status {
         managed_broker: state.supervisor.managed_broker(),
         egress_grants_version: 1,
@@ -479,7 +481,7 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
         data_dir,
         cert_dir: certs,
         bridge_assessment,
-        bridge_enabled: bridge_phase == portman_protocol::BridgePhase::Up,
+        bridge_enabled: matches!(bridge_phase, BridgePhase::Up | BridgePhase::Stopping),
         bridge_phase,
         bridge_mode,
         dashboard_port: state.dashboard_port,
@@ -1847,6 +1849,7 @@ pub(crate) mod tests {
             (Published::WaitingForDocker, Wire::WaitingForDocker, false),
             (Published::Starting, Wire::Starting, false),
             (Published::Up { epoch: 3 }, Wire::Up, true),
+            (Published::Stopping, Wire::Stopping, true),
         ];
         for (published, want_phase, want_enabled) in table {
             phase_tx.send_replace(published);
