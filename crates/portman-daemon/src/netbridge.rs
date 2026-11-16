@@ -3,7 +3,8 @@
 //! Long-running task that owns zero or one `Runtime` and converges it on
 //! what the user asked for: the on/off flag and the route mode persisted in
 //! `~/Library/Application Support/portman/netbridge.json`. The
-//! `PORTMAN_NETBRIDGE` env var forces the flag on for one daemon run.
+//! `PORTMAN_NETBRIDGE` env var turns the bridge on for one daemon run. It
+//! is never persisted, and a `Disable` ends it.
 //!
 //! Control flow:
 //!
@@ -33,7 +34,8 @@ use tracing::{info, warn};
 /// Env var override. Useful for the first-run path where the user's
 /// `netbridge.json` doesn't exist yet and they want to flip the bridge
 /// on from the LaunchDaemon plist before `portman bridge enable`
-/// lands. Presence (non-empty, not "0"/"false") forces enabled=true.
+/// lands. Presence (non-empty, not "0"/"false") turns the bridge on until
+/// the daemon exits or a `Disable` arrives.
 const ENABLE_ENV: &str = "PORTMAN_NETBRIDGE";
 
 const RETRY_BASE: Duration = Duration::from_secs(5);
@@ -223,19 +225,29 @@ fn backoff(failures: u32) -> Duration {
 pub(crate) async fn run(
     engine: impl BridgeStarter,
     handle: Handle,
-    mut rx: mpsc::Receiver<Control>,
+    rx: mpsc::Receiver<Control>,
     phase_tx: watch::Sender<BridgePhase>,
     state_path: PathBuf,
 ) -> Result<()> {
-    let mut intent = netbridge_state::load(&state_path);
-    let env_forces = env_forces_enabled();
+    let forced_on = env_forces_enabled();
+    converge(engine, handle, rx, phase_tx, state_path, forced_on).await
+}
+
+async fn converge(
+    engine: impl BridgeStarter,
+    handle: Handle,
+    mut rx: mpsc::Receiver<Control>,
+    phase_tx: watch::Sender<BridgePhase>,
+    state_path: PathBuf,
+    mut forced_on: bool,
+) -> Result<()> {
+    let mut saved = netbridge_state::load(&state_path);
     info!(
-        persisted_enabled = intent.enabled,
-        mode = intent.mode.as_str(),
-        env = env_forces,
+        persisted_enabled = saved.enabled,
+        mode = saved.mode.as_str(),
+        env = forced_on,
         "netbridge subsystem starting"
     );
-    intent.enabled |= env_forces;
 
     // The boot-time Docker handle is the only engine session there is.
     let session = Some(Session(0));
@@ -244,6 +256,10 @@ pub(crate) async fn run(
     let mut epoch = 0;
 
     loop {
+        let intent = NetbridgeState {
+            enabled: saved.enabled || forced_on,
+            mode: saved.mode,
+        };
         loop {
             let built = running.as_ref().map(|r| r.built);
             publish(
@@ -288,16 +304,19 @@ pub(crate) async fn run(
                 // `None` means every sender is gone, so the daemon is exiting.
                 let Some(msg) = msg else { return Ok(()) };
                 match msg {
-                    Control::Enable => intent.enabled = true,
-                    Control::Disable => intent.enabled = false,
+                    Control::Enable => saved.enabled = true,
+                    Control::Disable => {
+                        saved.enabled = false;
+                        forced_on = false;
+                    }
                     Control::SetMode(mode) => {
-                        if intent.mode != mode {
+                        if saved.mode != mode {
                             info!(mode = mode.as_str(), "netbridge mode changed");
                         }
-                        intent.mode = mode;
+                        saved.mode = mode;
                     }
                 }
-                persist(&state_path, &intent);
+                persist(&state_path, &saved);
                 attempts = Attempts::new();
             }
             () = tokio::time::sleep(attempts.retry_after.unwrap_or_default()),
@@ -574,6 +593,10 @@ mod tests {
 
     impl Rig {
         fn start() -> Self {
+            Self::start_with_env_override(false)
+        }
+
+        fn start_with_env_override(forced_on: bool) -> Self {
             let dir = tempdir().unwrap();
             let state_path = dir.path().join("netbridge.json");
             let (seen, attempts) = mpsc::unbounded_channel();
@@ -582,12 +605,13 @@ mod tests {
                 seen,
             };
             let (handle, rx, phase_tx) = handle_pair();
-            tokio::spawn(run(
+            tokio::spawn(converge(
                 engine,
                 handle.clone(),
                 rx,
                 phase_tx,
                 state_path.clone(),
+                forced_on,
             ));
             Rig {
                 handle,
@@ -674,6 +698,25 @@ mod tests {
             "the disable waited for the retry timer"
         );
         assert!(!netbridge_state::load(&rig.state_path).enabled);
+        rig.no_attempt_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_env_override_runs_the_bridge_and_is_never_saved() {
+        let mut rig = Rig::start_with_env_override(true);
+        let unasked = rig.next_attempt().await;
+        assert!(!unasked.saved.enabled);
+
+        rig.send(Control::SetMode(DockerMode)).await;
+        let in_new_mode = rig.next_attempt().await;
+        assert_eq!(in_new_mode.saved.mode, DockerMode);
+        assert!(
+            !in_new_mode.saved.enabled,
+            "a mode change saved the override"
+        );
+
+        rig.send(Control::Disable).await;
+        rig.reaches(BridgePhase::Disabled).await;
         rig.no_attempt_follows().await;
     }
 }
