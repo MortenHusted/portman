@@ -1685,6 +1685,13 @@ mod tests {
     }"#;
     const NETWORK: &str = "/networks/portman";
     const OWN_NETWORK: &str = r#"{"Labels": {"dev.portman.managed": "1"}}"#;
+    const FORWARDER: &str = "/containers/portman-netbridge-dns/json";
+    const OWN_FORWARDER: &str = r#"{
+        "Id": "dddd2222",
+        "Config": {"Labels": {"dev.portman.managed": "1", "dev.portman.role": "dns-forwarder"}},
+        "State": {"Running": true}
+    }"#;
+    const FORWARDER_BY_ID: &str = "/containers/dddd2222";
 
     /// A listen port that nobody holds: a bind to port 0 gets a port that
     /// the system picks. A port that a test binds and frees is not safe,
@@ -1699,6 +1706,7 @@ mod tests {
         let (engine, fake) = empty_engine(listen_port);
         fake.hold(SETUP_CONTAINER, OWN_SETUP_CONTAINER);
         fake.hold(NETWORK, OWN_NETWORK);
+        fake.hold(FORWARDER, OWN_FORWARDER);
         (engine, fake)
     }
 
@@ -1883,11 +1891,14 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn with_the_listen_port_free_the_network_goes_only_when_it_is_asked_for() {
+    async fn with_the_listen_port_free_the_forwarder_and_the_network_go_only_when_asked_for() {
         let container = "/containers/portman-netbridge-setup";
         let cases = [
             (SetupContainer, vec![container]),
-            (SetupContainerAndNetwork, vec![container, NETWORK]),
+            (
+                SetupContainerAndNetwork,
+                vec![container, FORWARDER_BY_ID, NETWORK],
+            ),
         ];
         for (leftovers, gone) in cases {
             let (engine, fake) = engine_with_leftovers(FREE_PORT);
@@ -1901,11 +1912,38 @@ mod tests {
                 .filter_map(|call| call.strip_prefix("DELETE "))
                 .collect();
             assert_eq!(removed, gone, "{leftovers:?}");
-            assert_eq!(
-                calls.iter().any(|call| call.ends_with(NETWORK)),
-                leftovers == SetupContainerAndNetwork,
-                "{calls:?}"
+            for kept_by_a_sweep in [NETWORK, FORWARDER] {
+                assert_eq!(
+                    calls.iter().any(|call| call.ends_with(kept_by_a_sweep)),
+                    leftovers == SetupContainerAndNetwork,
+                    "{calls:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_container_that_has_the_forwarders_name_and_not_its_labels_is_never_removed() {
+        let setup_role = OWN_FORWARDER.replace("dns-forwarder", "netbridge-setup");
+        let unmanaged = OWN_FORWARDER.replace(r#""dev.portman.managed": "1", "#, "");
+        for not_the_forwarder in [
+            setup_role.as_str(),
+            unmanaged.as_str(),
+            r#"{"Id": "dddd2222"}"#,
+        ] {
+            let (engine, fake) = engine_with_leftovers(FREE_PORT);
+            fake.hold(FORWARDER, not_the_forwarder);
+
+            engine
+                .remove_leftovers(Session(1), SetupContainerAndNetwork)
+                .await;
+
+            let calls = fake.calls();
+            assert!(
+                !calls.contains(&format!("DELETE {FORWARDER_BY_ID}")),
+                "{not_the_forwarder}\n{calls:?}"
             );
+            assert!(calls.contains(&format!("DELETE {NETWORK}")), "{calls:?}");
         }
     }
 

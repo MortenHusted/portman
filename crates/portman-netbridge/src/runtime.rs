@@ -15,8 +15,13 @@
 //!   - a 1-second timer task that nudges `Peer::encapsulate` so the
 //!     handshake fires promptly after the VM peer starts.
 //!
+//! On request it also makes the engine run a DNS forwarder container on
+//! the VM host network ([`Runtime::ensure_dns_forwarder`]). A shutdown
+//! leaves that container running.
+//!
 //! It is **only** the v1 host-side bridge; it knows nothing about
-//! portman's DNS/proxy/registry. The daemon keeps those separate.
+//! portman's proxy or registry, and of its DNS only the address that the
+//! forwarder asks. The daemon keeps those separate.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -33,7 +38,10 @@ use bollard::query_parameters::{
     ListContainersOptionsBuilder, ListNetworksOptionsBuilder, LogsOptionsBuilder,
     RemoveContainerOptionsBuilder, StartContainerOptions, StopContainerOptionsBuilder,
 };
-use bollard::secret::{ContainerCreateBody, HostConfig, Ipam, IpamConfig, NetworkCreateRequest};
+use bollard::secret::{
+    ContainerCreateBody, HostConfig, Ipam, IpamConfig, NetworkCreateRequest, RestartPolicy,
+    RestartPolicyNameEnum,
+};
 use bollard::Docker;
 use boringtun::noise::TunnResult;
 use futures_util::TryStreamExt;
@@ -63,6 +71,22 @@ const MANAGED_LABEL: &str = "dev.portman.managed";
 const MANAGED_LABEL_VALUE: &str = "1";
 const ROLE_LABEL: &str = "dev.portman.role";
 const SETUP_ROLE_LABEL_VALUE: &str = "netbridge-setup";
+/// Name of the container that runs the DNS forwarder in the VM.
+pub const DNS_CONTAINER: &str = "portman-netbridge-dns";
+const DNS_ROLE_LABEL_VALUE: &str = "dns-forwarder";
+/// On the forwarder container: the id of the setup image it was created
+/// from, so that a rebuilt image replaces it.
+const DNS_FROM_IMAGE_LABEL: &str = "dev.portman.setup-image";
+/// A setup image carries this label when its entrypoint has the `dns` mode
+/// that [`dns_forwarder_args`] is written for.
+const DNS_IMAGE_LABEL: &str = "dev.portman.dns-forwarder";
+const DNS_IMAGE_LABEL_VALUE: &str = "1";
+/// Stands for the VM's resolver in [`dns_forwarder_args`]. The address is in
+/// the VM, so the entrypoint of the setup image puts it in.
+const VM_RESOLVER: &str = "@vm-resolver@";
+/// Docker and its VMs give this name to the host. It can fall under a
+/// managed TLD, and it has to resolve while portman is down.
+const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 const SETUP_STOP_TIMEOUT_SECS: i32 = 5;
 /// How long to wait for docker to finish removing the setup container before
 /// giving up and saying so.
@@ -233,10 +257,40 @@ impl Runtime {
         &self.setup_container_id
     }
 
+    /// Makes the engine run one DNS forwarder for `managed_tlds`. It creates
+    /// the container when the engine has none, and replaces it only when it
+    /// does not run, runs another command, or comes from another build of
+    /// the setup image. A container of that name without portman's labels is
+    /// an error and stays as it is. The bridge holds the listen port, so no
+    /// other daemon has a bridge up whose forwarder this could replace.
+    pub async fn ensure_dns_forwarder(
+        &self,
+        managed_tlds: &BTreeSet<String>,
+    ) -> Result<DnsForwarder> {
+        let Some(image) = setup_image_with_dns_mode(&self.docker).await? else {
+            return Ok(DnsForwarder::ImageWithoutDnsMode);
+        };
+        ensure_portman_network(&self.docker, &self.listen_port).await?;
+        let cmd = dns_forwarder_args(managed_tlds);
+        let found = dns_forwarder_snapshot(&self.docker).await?;
+        match forwarder_step(found.as_ref(), &image, &cmd) {
+            ForwarderStep::Keep => return Ok(DnsForwarder::InPlace),
+            ForwarderStep::Foreign => anyhow::bail!(
+                "docker container `{DNS_CONTAINER}` already exists but is not managed by portman"
+            ),
+            ForwarderStep::Replace => remove_dns_forwarder(&self.docker, &self.listen_port).await?,
+            ForwarderStep::Create => {}
+        }
+        create_dns_forwarder(&self.docker, &image, cmd).await?;
+        Ok(DnsForwarder::InPlace)
+    }
+
     /// Cleanly tear down the bridge. Aborts the pump tasks and removes
     /// the setup container. The `portman` docker network is left in
     /// place — if user containers are attached, they keep their IPs
     /// and become reachable again as soon as the daemon comes back up.
+    /// The DNS forwarder also stays, so that containers that use it keep
+    /// resolving every name that is not portman's.
     /// `portman bridge disable` (user intent) still wants the network
     /// gone; call [`Runtime::shutdown_and_remove_network`] for that.
     pub async fn shutdown(mut self) {
@@ -244,13 +298,16 @@ impl Runtime {
         info!(utun = %self.utun_name, "netbridge shut down (network retained)");
     }
 
-    /// Shutdown + best-effort remove the docker network. Used when the
-    /// user explicitly disables the bridge (`portman bridge disable`),
-    /// not on daemon restart. Docker refuses the removal only while a
-    /// running container is attached, and that is logged. A stopped
-    /// container that refers to the network fails to start afterwards.
+    /// Shutdown + best-effort remove the DNS forwarder and then the docker
+    /// network, whose gateway address the forwarder listens on. Used when
+    /// the user explicitly disables the bridge (`portman bridge disable`),
+    /// not on daemon restart. Docker refuses the removal of the network
+    /// only while a running container is attached, and that is logged. A
+    /// stopped container that refers to the network fails to start
+    /// afterwards.
     pub async fn shutdown_and_remove_network(mut self) {
         self.stop().await;
+        best_effort_remove_dns_forwarder(&self.docker, &self.listen_port).await;
         remove_portman_network_if_owned(&self.docker, &self.listen_port).await;
         info!(utun = %self.utun_name, "netbridge shut down");
     }
@@ -913,13 +970,193 @@ fn docker_removal_already_underway(err: &DockerError) -> bool {
     }
 }
 
+/// The command of the forwarder container: the `dns` mode of the setup
+/// image, then the arguments of dnsmasq.
+///
+/// dnsmasq listens on the gateway address of the `portman` network only. In
+/// strict order it asks portman first and the VM's resolver second for a
+/// name under a managed TLD, so a name that portman refuses still resolves.
+/// Every other name goes to the resolvers in the VM's `/etc/resolv.conf`,
+/// which dnsmasq reads itself.
+pub fn dns_forwarder_args(managed_tlds: &BTreeSet<String>) -> Vec<String> {
+    let mut args = vec![
+        "dns".to_string(),
+        "--keep-in-foreground".to_string(),
+        "--no-hosts".to_string(),
+        format!("--listen-address={DOCKER_BRIDGE_GATEWAY}"),
+        "--bind-interfaces".to_string(),
+        "--strict-order".to_string(),
+    ];
+    let forwarded = managed_tlds
+        .iter()
+        .filter(|tld| !matches!(tld.as_str(), "localhost" | HOST_DOCKER_INTERNAL));
+    for tld in forwarded {
+        args.push(format!("--server=/{tld}/{HOST_TUNNEL_IP}"));
+        args.push(format!("--server=/{tld}/{VM_RESOLVER}"));
+    }
+    args.push(format!("--server=/{HOST_DOCKER_INTERNAL}/#"));
+    args
+}
+
+/// How [`Runtime::ensure_dns_forwarder`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsForwarder {
+    /// The engine holds the forwarder container with the wanted command,
+    /// from the current setup image. It ran already or was started now.
+    InPlace,
+    /// The engine has no setup image whose entrypoint has the `dns` mode.
+    /// `portman bridge prepare` builds one. Nothing was created or removed.
+    ImageWithoutDnsMode,
+}
+
+/// The id of the setup image, when the engine has one with the `dns` mode.
+/// The answer comes from the image's labels, so no container runs for it.
+async fn setup_image_with_dns_mode(docker: &Docker) -> Result<Option<String>> {
+    let image = match docker.inspect_image(SETUP_IMAGE).await {
+        Ok(image) => image,
+        Err(err) if docker_not_found(&err) => return Ok(None),
+        Err(err) => return Err(err).context("inspecting the netbridge setup image"),
+    };
+    let labels = image.config.and_then(|config| config.labels);
+    if !image_has_dns_mode(labels.as_ref()) {
+        return Ok(None);
+    }
+    let id = image
+        .id
+        .ok_or_else(|| anyhow!("the engine gave no id for the netbridge setup image"))?;
+    Ok(Some(id))
+}
+
+fn image_has_dns_mode(labels: Option<&HashMap<String, String>>) -> bool {
+    labels
+        .and_then(|labels| labels.get(DNS_IMAGE_LABEL))
+        .is_some_and(|value| value == DNS_IMAGE_LABEL_VALUE)
+}
+
+/// The container named [`DNS_CONTAINER`] as the engine holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForwarderSnapshot {
+    id: String,
+    labels: HashMap<String, String>,
+    cmd: Vec<String>,
+    running: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ForwarderStep {
+    Keep,
+    Create,
+    Replace,
+    /// Something else owns the name. It is not portman's to remove.
+    Foreign,
+}
+
+/// `image` is the id of the current setup image and `cmd` the command the
+/// forwarder should run.
+fn forwarder_step(found: Option<&ForwarderSnapshot>, image: &str, cmd: &[String]) -> ForwarderStep {
+    let Some(found) = found else {
+        return ForwarderStep::Create;
+    };
+    if !carries_portman_role(Some(&found.labels), DNS_ROLE_LABEL_VALUE) {
+        return ForwarderStep::Foreign;
+    }
+    let from_this_image = found.labels.get(DNS_FROM_IMAGE_LABEL).map(String::as_str) == Some(image);
+    if found.running && from_this_image && found.cmd == cmd {
+        ForwarderStep::Keep
+    } else {
+        ForwarderStep::Replace
+    }
+}
+
+async fn dns_forwarder_snapshot(docker: &Docker) -> Result<Option<ForwarderSnapshot>> {
+    let info = match docker
+        .inspect_container(DNS_CONTAINER, None::<InspectContainerOptions>)
+        .await
+    {
+        Ok(info) => info,
+        Err(err) if docker_not_found(&err) => return Ok(None),
+        Err(err) => return Err(err).context("inspecting the dns forwarder container"),
+    };
+    let config = info.config.unwrap_or_default();
+    Ok(Some(ForwarderSnapshot {
+        id: info.id.unwrap_or_else(|| DNS_CONTAINER.to_string()),
+        labels: config.labels.unwrap_or_default(),
+        cmd: config.cmd.unwrap_or_default(),
+        running: info.state.and_then(|state| state.running).unwrap_or(false),
+    }))
+}
+
+/// The restart policy is `always`, so that the engine starts the forwarder
+/// again with the VM, with no daemon and no bridge. The container gets no
+/// capability beyond the engine's default set.
+async fn create_dns_forwarder(docker: &Docker, image: &str, cmd: Vec<String>) -> Result<()> {
+    let body = ContainerCreateBody {
+        image: Some(SETUP_IMAGE.to_string()),
+        cmd: Some(cmd),
+        host_config: Some(HostConfig {
+            network_mode: Some("host".to_string()),
+            restart_policy: Some(RestartPolicy {
+                name: Some(RestartPolicyNameEnum::ALWAYS),
+                maximum_retry_count: None,
+            }),
+            ..Default::default()
+        }),
+        labels: Some(HashMap::from([
+            (MANAGED_LABEL.into(), MANAGED_LABEL_VALUE.into()),
+            (ROLE_LABEL.into(), DNS_ROLE_LABEL_VALUE.into()),
+            (DNS_FROM_IMAGE_LABEL.into(), image.into()),
+        ])),
+        ..Default::default()
+    };
+    let opts = CreateContainerOptionsBuilder::default()
+        .name(DNS_CONTAINER)
+        .build();
+    docker
+        .create_container(Some(opts), body)
+        .await
+        .context("creating the dns forwarder container")?;
+    docker
+        .start_container(DNS_CONTAINER, None::<StartContainerOptions>)
+        .await
+        .context("starting the dns forwarder container")
+}
+
+/// Removes the forwarder container when it carries portman's labels, by the
+/// id that carried them. One that is absent is passed over.
+async fn remove_dns_forwarder(docker: &Docker, _held: &ListenPort) -> Result<()> {
+    let Some(found) = dns_forwarder_snapshot(docker).await? else {
+        return Ok(());
+    };
+    if !carries_portman_role(Some(&found.labels), DNS_ROLE_LABEL_VALUE) {
+        anyhow::bail!("docker container `{DNS_CONTAINER}` exists but is not managed by portman");
+    }
+    let opts = RemoveContainerOptionsBuilder::default().force(true).build();
+    match docker.remove_container(&found.id, Some(opts)).await {
+        Ok(()) => Ok(()),
+        Err(err) if docker_not_found(&err) => Ok(()),
+        Err(err) => Err(err).context("removing the dns forwarder container"),
+    }
+}
+
+async fn best_effort_remove_dns_forwarder(docker: &Docker, held: &ListenPort) {
+    if let Err(err) = remove_dns_forwarder(docker, held).await {
+        warn!(
+            container = DNS_CONTAINER,
+            error = %err,
+            "could not remove the dns forwarder container"
+        );
+    }
+}
+
 /// What a bridge can leave in the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Leftovers {
     SetupContainer,
-    /// The engine removes a network that a stopped container refers to, and
-    /// that container then fails to start. Only a user's request to turn
-    /// the bridge off calls for this.
+    /// Also the DNS forwarder, which listens on the network's gateway
+    /// address and goes before the network does. The engine removes a
+    /// network that a stopped container refers to, and that container then
+    /// fails to start. Only a user's request to turn the bridge off calls
+    /// for this.
     SetupContainerAndNetwork,
 }
 
@@ -962,6 +1199,7 @@ pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Left
     let network = match leftovers {
         Leftovers::SetupContainer => None,
         Leftovers::SetupContainerAndNetwork => {
+            best_effort_remove_dns_forwarder(docker, &held).await;
             Some(remove_portman_network_if_owned(docker, &held).await)
         }
     };
@@ -1062,15 +1300,19 @@ fn network_is_portman_managed(labels: Option<&HashMap<String, String>>) -> bool 
 }
 
 fn setup_container_is_portman_managed(labels: Option<&HashMap<String, String>>) -> bool {
+    carries_portman_role(labels, SETUP_ROLE_LABEL_VALUE)
+}
+
+/// Whether a container is portman's and has this role. The role keeps the
+/// setup container and the DNS forwarder from being taken for each other.
+fn carries_portman_role(labels: Option<&HashMap<String, String>>, role: &str) -> bool {
     let Some(labels) = labels else {
         return false;
     };
     labels
         .get(MANAGED_LABEL)
         .is_some_and(|value| value == MANAGED_LABEL_VALUE)
-        && labels
-            .get(ROLE_LABEL)
-            .is_some_and(|value| value == SETUP_ROLE_LABEL_VALUE)
+        && labels.get(ROLE_LABEL).is_some_and(|value| value == role)
 }
 
 fn setup_stop_timeout_secs() -> i32 {
@@ -1780,6 +2022,209 @@ destination: 172.18.0.0
             ExistingRoute::Repair,
             "Portman's dedicated subnet must recover even when its old interface is reused"
         );
+    }
+
+    fn tlds(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    const DNSMASQ_BASE: [&str; 5] = [
+        "--keep-in-foreground",
+        "--no-hosts",
+        "--listen-address=192.168.99.129",
+        "--bind-interfaces",
+        "--strict-order",
+    ];
+    const TO_THE_VM: &str = "--server=/host.docker.internal/#";
+
+    #[test]
+    fn the_forwarder_asks_portman_first_and_the_vm_second_for_each_managed_tld() {
+        let test = [
+            "--server=/test/192.168.99.1",
+            "--server=/test/@vm-resolver@",
+        ];
+        let acme = [
+            "--server=/acme/192.168.99.1",
+            "--server=/acme/@vm-resolver@",
+        ];
+        let internal = [
+            "--server=/internal/192.168.99.1",
+            "--server=/internal/@vm-resolver@",
+        ];
+        // managed TLDs → the server lines, in the order dnsmasq gets them
+        let table = [
+            (vec![], vec![]),
+            (vec!["test"], test.to_vec()),
+            (vec!["test", "acme"], [acme, test].concat()),
+            (vec!["internal"], internal.to_vec()),
+            (vec!["localhost", "test"], test.to_vec()),
+            (vec!["host.docker.internal", "test"], test.to_vec()),
+        ];
+        for (managed, server_lines) in table {
+            let want = [
+                vec!["dns"],
+                DNSMASQ_BASE.to_vec(),
+                server_lines,
+                vec![TO_THE_VM],
+            ]
+            .concat();
+            assert_eq!(dns_forwarder_args(&tlds(&managed)), want, "{managed:?}");
+        }
+    }
+
+    /// Runs the entrypoint of the setup image with a `dnsmasq` that prints
+    /// its arguments, one on each line, and a VM that has `resolv_conf`.
+    fn run_dns_mode(args: &[String], resolv_conf: &str) -> std::process::Output {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("portman-dns-mode-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dnsmasq = dir.join("dnsmasq");
+        std::fs::write(&dnsmasq, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&dnsmasq, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.join("resolv.conf"), resolv_conf).unwrap();
+
+        let output = StdCommand::new("sh")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/setup-image/entrypoint.sh"
+            ))
+            .args(args)
+            .env(
+                "PATH",
+                format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("RESOLV_CONF", dir.join("resolv.conf"))
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        output
+    }
+
+    #[test]
+    fn the_entrypoint_gives_dnsmasq_each_nameserver_of_the_vm_in_place_of_the_token() {
+        let resolv_conf =
+            "# the VM\nsearch demo.test\nnameserver 192.168.5.2\nnameserver 192.168.5.3\n";
+
+        let output = run_dns_mode(&dns_forwarder_args(&tlds(&["test"])), resolv_conf);
+
+        assert!(output.status.success(), "{output:?}");
+        let ran_with: Vec<&str> = std::str::from_utf8(&output.stdout)
+            .unwrap()
+            .lines()
+            .collect();
+        let want = [
+            DNSMASQ_BASE.to_vec(),
+            vec![
+                "--server=/test/192.168.99.1",
+                "--server=/test/192.168.5.2",
+                "--server=/test/192.168.5.3",
+                TO_THE_VM,
+            ],
+        ]
+        .concat();
+        assert_eq!(ran_with, want);
+    }
+
+    #[test]
+    fn the_entrypoint_fails_and_says_why_when_the_vm_names_no_nameserver() {
+        let output = run_dns_mode(&dns_forwarder_args(&tlds(&["test"])), "search demo.test\n");
+
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(output.stdout, b"", "dnsmasq ran");
+        let said = String::from_utf8_lossy(&output.stderr);
+        assert!(said.contains("names no nameserver"), "{said}");
+    }
+
+    fn forwarder(labels: &[(&str, &str)], cmd: &[&str], running: bool) -> ForwarderSnapshot {
+        ForwarderSnapshot {
+            id: "dddd2222".to_string(),
+            labels: labels
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            cmd: cmd.iter().map(|arg| arg.to_string()).collect(),
+            running,
+        }
+    }
+
+    #[test]
+    fn the_forwarder_is_replaced_only_when_it_differs_from_what_it_should_run() {
+        const OURS: [(&str, &str); 3] = [
+            (MANAGED_LABEL, MANAGED_LABEL_VALUE),
+            (ROLE_LABEL, DNS_ROLE_LABEL_VALUE),
+            (DNS_FROM_IMAGE_LABEL, "sha256:aaaa"),
+        ];
+        let from_an_older_image = [OURS[0], OURS[1], (DNS_FROM_IMAGE_LABEL, "sha256:0000")];
+        let setup_container = [OURS[0], (ROLE_LABEL, SETUP_ROLE_LABEL_VALUE), OURS[2]];
+        let wanted = ["dns", "--server=/test/192.168.99.1"];
+        let (up, stopped) = (true, false);
+        use ForwarderStep::{Create, Foreign, Keep, Replace};
+        // the container the engine holds → the step
+        let table = [
+            (None, Create),
+            (Some(forwarder(&OURS, &wanted, up)), Keep),
+            (Some(forwarder(&OURS, &wanted, stopped)), Replace),
+            (Some(forwarder(&OURS, &["dns"], up)), Replace),
+            (Some(forwarder(&from_an_older_image, &wanted, up)), Replace),
+            (Some(forwarder(&OURS[..2], &wanted, up)), Replace),
+            (Some(forwarder(&[], &wanted, up)), Foreign),
+            (Some(forwarder(&OURS[1..], &wanted, up)), Foreign),
+            (Some(forwarder(&setup_container, &wanted, up)), Foreign),
+            (
+                Some(forwarder(&setup_container, &["dns"], stopped)),
+                Foreign,
+            ),
+        ];
+        let wanted: Vec<String> = wanted.iter().map(|arg| arg.to_string()).collect();
+        for (found, want) in table {
+            assert_eq!(
+                forwarder_step(found.as_ref(), "sha256:aaaa", &wanted),
+                want,
+                "{found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_forwarder_and_the_setup_container_are_not_taken_for_each_other() {
+        let with_role = |role: &str| {
+            HashMap::from([
+                (MANAGED_LABEL.to_string(), MANAGED_LABEL_VALUE.to_string()),
+                (ROLE_LABEL.to_string(), role.to_string()),
+            ])
+        };
+        let (setup, dns) = (with_role("netbridge-setup"), with_role("dns-forwarder"));
+
+        assert!(setup_container_is_portman_managed(Some(&setup)));
+        assert!(!setup_container_is_portman_managed(Some(&dns)));
+        assert!(carries_portman_role(Some(&dns), DNS_ROLE_LABEL_VALUE));
+        assert!(!carries_portman_role(Some(&setup), DNS_ROLE_LABEL_VALUE));
+        assert!(!carries_portman_role(None, DNS_ROLE_LABEL_VALUE));
+    }
+
+    #[test]
+    fn only_a_setup_image_with_the_dns_label_can_run_the_forwarder() {
+        let labelled =
+            |value: &str| HashMap::from([(DNS_IMAGE_LABEL.to_string(), value.to_string())]);
+
+        assert!(image_has_dns_mode(Some(&labelled("1"))));
+        assert!(!image_has_dns_mode(Some(&labelled("0"))));
+        assert!(!image_has_dns_mode(Some(&HashMap::new())));
+        assert!(!image_has_dns_mode(None));
+    }
+
+    #[test]
+    fn the_setup_image_carries_the_label_that_says_it_has_the_dns_mode() {
+        let dockerfile = include_str!("../setup-image/Dockerfile");
+        let label = format!("LABEL {DNS_IMAGE_LABEL}=\"{DNS_IMAGE_LABEL_VALUE}\"");
+
+        assert!(dockerfile.lines().any(|line| line == label), "{label}");
     }
 
     #[test]
