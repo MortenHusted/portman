@@ -62,9 +62,14 @@ fn bridge_status_lines(
 
 pub(crate) async fn cmd_doctor() -> Result<()> {
     let daemon = doctor::DaemonSnapshot::from_status(request(Request::Status).await.ok());
-    let (setup_image, docker_routes) = tokio::join!(
+    let routes = match request(Request::ListEntries).await {
+        Ok(Response::Entries { entries }) => entries,
+        _ => Vec::new(),
+    };
+    let (setup_image, docker_routes, dns_forwarder) = tokio::join!(
         doctor::inspect_setup_image(),
-        doctor::collect_docker_routes()
+        doctor::collect_docker_routes(),
+        doctor::inspect_dns_forwarder(daemon.bridge_phase, &routes),
     );
     let report = doctor::DoctorReport {
         daemon,
@@ -72,6 +77,7 @@ pub(crate) async fn cmd_doctor() -> Result<()> {
         legacy_bridge: doctor::detect_legacy_bridge(),
         docker_routes,
         container_facing: doctor::inspect_container_facing(),
+        dns_forwarder,
     };
     print!("{}", doctor::render_report(&report));
     Ok(())

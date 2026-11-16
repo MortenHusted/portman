@@ -1,10 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
 
-use portman_protocol::{BridgePhase, DockerState, DockerStatus, NetbridgeMode, Response};
+use portman_protocol::{
+    BridgePhase, DockerState, DockerStatus, Entry, Mode, NetbridgeMode, Response,
+};
 use serde_json::Value;
 
 pub(crate) const SETUP_IMAGE: &str = "portman-netbridge/setup:local";
@@ -12,6 +15,12 @@ const DOCKER_MAC_NET_CONNECT_PLIST: &str =
     "/Library/LaunchDaemons/homebrew.mxcl.docker-mac-net-connect.plist";
 const LABEL_HOST: &str = "dev.portman.host";
 const CONTAINER_FACING_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 99, 1);
+const DNS_CONTAINER: &str = "portman-netbridge-dns";
+/// The gateway address of the `portman` docker network, where the DNS
+/// forwarder listens.
+const DNS_FORWARDER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 99, 129);
+/// The label of a setup image that has the `dns` mode, and its value.
+const DNS_IMAGE_LABEL: (&str, &str) = ("dev.portman.dns-forwarder", "1");
 const ENDPOINT_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +146,39 @@ pub(crate) struct ContainerFacingStatus {
     pub tls: bool,
 }
 
+/// The DNS forwarder in the VM, as the `docker` CLI shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DnsForwarderStatus {
+    /// The engine has no setup image with the `dns` mode, so the daemon
+    /// starts no forwarder.
+    ImageWithoutDnsMode,
+    /// `state` is docker's word for a container that exists and does not
+    /// run. `None` is no container.
+    NotRunning {
+        state: Option<String>,
+    },
+    Running(ForwarderQuery),
+    DockerUnavailable {
+        message: String,
+    },
+}
+
+/// One lookup of a managed name from a container that has the forwarder as
+/// its only resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ForwarderQuery {
+    NotSent { why: String },
+    Answered { name: String, address: String },
+    Unanswered { name: String, detail: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DnsForwarderReport {
+    pub status: DnsForwarderStatus,
+    /// The hostnames of the registered TCP routes.
+    pub tcp_routes: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DoctorReport {
     pub daemon: DaemonSnapshot,
@@ -144,6 +186,7 @@ pub(crate) struct DoctorReport {
     pub legacy_bridge: LegacyBridgeStatus,
     pub docker_routes: DockerRouteStatus,
     pub container_facing: ContainerFacingStatus,
+    pub dns_forwarder: DnsForwarderReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,6 +317,202 @@ pub(crate) fn inspect_container_facing() -> ContainerFacingStatus {
     }
 }
 
+/// `routes` is the registry as the daemon lists it, and empty for a daemon
+/// that did not answer.
+pub(crate) async fn inspect_dns_forwarder(
+    phase: Option<BridgePhase>,
+    routes: &[Entry],
+) -> DnsForwarderReport {
+    DnsForwarderReport {
+        status: dns_forwarder_status(phase, routes).await,
+        tcp_routes: tcp_route_names(routes),
+    }
+}
+
+async fn dns_forwarder_status(phase: Option<BridgePhase>, routes: &[Entry]) -> DnsForwarderStatus {
+    let (label, _) = DNS_IMAGE_LABEL;
+    let label_of_image = format!("{{{{index .Config.Labels \"{label}\"}}}}");
+    let image = ["image", "inspect", SETUP_IMAGE, "--format", &label_of_image];
+    let state = "{{.State.Status}}";
+    let container = ["container", "inspect", DNS_CONTAINER, "--format", state];
+    let printed = |answer: Result<String, DockerCliError>| answer.map_err(|err| err.to_string());
+    classify_dns_forwarder(
+        printed(docker_stdout(&image).await),
+        async { printed(docker_stdout(&container).await) },
+        async {
+            match forwarder_query_name(phase, routes) {
+                Ok(name) => look_up_through_forwarder(name),
+                Err(why) => ForwarderQuery::NotSent { why },
+            }
+        },
+    )
+    .await
+}
+
+/// `image_label` and `container_state` are what the `docker` CLI printed
+/// for the setup image's label and for the forwarder container's state, or
+/// its error. The container is asked about only for an image that has the
+/// `dns` mode, and `look_up` runs only for a container that runs.
+async fn classify_dns_forwarder(
+    image_label: Result<String, String>,
+    container_state: impl Future<Output = Result<String, String>>,
+    look_up: impl Future<Output = ForwarderQuery>,
+) -> DnsForwarderStatus {
+    let engine_has_no = |what: &str, message: &str| {
+        message.contains(&format!("No such {what}")) || message.contains("No such object")
+    };
+    match image_label {
+        Ok(value) if value.trim() == DNS_IMAGE_LABEL.1 => {}
+        Ok(_) => return DnsForwarderStatus::ImageWithoutDnsMode,
+        Err(message) if engine_has_no("image", &message) => {
+            return DnsForwarderStatus::ImageWithoutDnsMode
+        }
+        Err(message) => return DnsForwarderStatus::DockerUnavailable { message },
+    }
+    match container_state.await {
+        Ok(state) if state.trim() == "running" => DnsForwarderStatus::Running(look_up.await),
+        Ok(state) => DnsForwarderStatus::NotRunning {
+            state: Some(state.trim().to_string()),
+        },
+        Err(message) if engine_has_no("container", &message) => {
+            DnsForwarderStatus::NotRunning { state: None }
+        }
+        Err(message) => DnsForwarderStatus::DockerUnavailable { message },
+    }
+}
+
+/// The managed name that doctor looks up through the forwarder, or why it
+/// looks up none.
+fn forwarder_query_name(phase: Option<BridgePhase>, routes: &[Entry]) -> Result<String, String> {
+    match phase {
+        Some(BridgePhase::Up) => {}
+        Some(phase) => {
+            return Err(format!(
+                "the netbridge is {}, and managed names resolve only while it is up",
+                phase.display_word()
+            ))
+        }
+        None => {
+            return Err(
+                "the daemon is unreachable, and managed names resolve only through it".to_string(),
+            )
+        }
+    }
+    routes
+        .iter()
+        .map(|route| route.host.as_str())
+        .filter(|host| !host.starts_with("*.") && !host.ends_with(".localhost"))
+        .min()
+        .map(String::from)
+        .ok_or_else(|| "no hostname is registered".to_string())
+}
+
+fn tcp_route_names(routes: &[Entry]) -> Vec<String> {
+    let mut names: Vec<String> = routes
+        .iter()
+        .filter(|route| route.mode == Mode::Tcp)
+        .map(|route| route.host.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Looks `name` up from a container on the default bridge network that has
+/// the forwarder as its only resolver, as a container started with `--dns
+/// 192.168.99.129` has. The container is the setup image's `getent`, and
+/// the engine removes it when the lookup ends. The resolver options set
+/// one attempt with a timeout of 2 s, so that a lookup with no answer ends.
+fn look_up_through_forwarder(name: String) -> ForwarderQuery {
+    let forwarder = DNS_FORWARDER_IP.to_string();
+    let ran = StdCommand::new("docker")
+        .args(["run", "--rm", "--dns", &forwarder])
+        .args(["--dns-opt", "timeout:2", "--dns-opt", "attempts:1"])
+        .args(["--entrypoint", "getent", SETUP_IMAGE, "hosts", &name])
+        .output();
+    match ran {
+        Ok(ran) => forwarder_query(
+            name,
+            ran.status.success(),
+            &String::from_utf8_lossy(&ran.stdout),
+            &String::from_utf8_lossy(&ran.stderr),
+        ),
+        Err(err) => ForwarderQuery::Unanswered {
+            name,
+            detail: err.to_string(),
+        },
+    }
+}
+
+/// What the lookup container's exit and output say. `getent` prints nothing
+/// when it finds no address, and `docker` prints why a container did not
+/// run.
+fn forwarder_query(name: String, succeeded: bool, stdout: &str, stderr: &str) -> ForwarderQuery {
+    match getent_address(stdout).filter(|_| succeeded) {
+        Some(address) => ForwarderQuery::Answered { name, address },
+        None => ForwarderQuery::Unanswered {
+            name,
+            detail: stderr
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("getent found no address")
+                .to_string(),
+        },
+    }
+}
+
+/// The first address in the output of `getent hosts <name>`.
+fn getent_address(stdout: &str) -> Option<String> {
+    let first = stdout.split_whitespace().next()?;
+    first.parse::<IpAddr>().ok().map(|_| first.to_string())
+}
+
+fn check_dns_forwarder(report: &DnsForwarderReport) -> CheckOutcome {
+    let at = format!("dns forwarder: running at {DNS_FORWARDER_IP}");
+    let (state, line) = match &report.status {
+        DnsForwarderStatus::Running(ForwarderQuery::Answered { name, address }) => (
+            CheckState::Ok,
+            format!("{at}, {name} resolves to {address}"),
+        ),
+        DnsForwarderStatus::Running(ForwarderQuery::Unanswered { name, detail }) => (
+            CheckState::Warn,
+            format!("{at}, {name} does not resolve through it ({detail})"),
+        ),
+        DnsForwarderStatus::Running(ForwarderQuery::NotSent { why }) => {
+            (CheckState::Ok, format!("{at}, not queried ({why})"))
+        }
+        DnsForwarderStatus::NotRunning { state: None } => (
+            CheckState::Warn,
+            "dns forwarder: absent; the netbridge starts it when it comes up, and a failed start is in the daemon log as `dns forwarder`".to_string(),
+        ),
+        DnsForwarderStatus::NotRunning { state: Some(state) } => (
+            CheckState::Warn,
+            format!("dns forwarder: {state}, not running; `docker logs {DNS_CONTAINER}` shows why"),
+        ),
+        DnsForwarderStatus::ImageWithoutDnsMode => (
+            CheckState::Warn,
+            "dns forwarder: unavailable, the setup image has no dns mode (run `portman bridge prepare`; a bridge that is up then gets the forwarder within a minute)".to_string(),
+        ),
+        DnsForwarderStatus::DockerUnavailable { message } => (
+            CheckState::Warn,
+            format!("dns forwarder: unavailable ({message})"),
+        ),
+    };
+    let mut lines = vec![line];
+    let running = matches!(report.status, DnsForwarderStatus::Running(_));
+    if running && !report.tcp_routes.is_empty() {
+        lines.push(format!(
+            "  tcp routes ({}): a container resolves them through the forwarder and connects only when it also joins the `portman` network",
+            report.tcp_routes.join(", ")
+        ));
+    }
+    CheckOutcome {
+        state,
+        lines,
+        gates_ready: false,
+    }
+}
+
 /// Every doctor check reduces to this one shape: a classification, the
 /// rendered lines, and whether the check gates "replacement: ready".
 /// Classification and rendering come from the same function per check, so
@@ -335,6 +574,7 @@ pub(crate) fn render_report(report: &DoctorReport) -> String {
         check_setup_image(&report.setup_image),
         legacy,
         check_container_facing(&report.container_facing),
+        check_dns_forwarder(&report.dns_forwarder),
         check_docker_routes(&report.docker_routes),
     ]);
     let ready = replacement_ready(&outcomes);
@@ -830,6 +1070,7 @@ mod tests {
             legacy_bridge: LegacyBridgeStatus::NotDetected,
             docker_routes: DockerRouteStatus::NoLabelledContainers,
             container_facing: open_container_facing(),
+            dns_forwarder: forwarder(running(answered())),
         }
     }
 
@@ -1150,6 +1391,297 @@ mod tests {
         }
     }
 
+    fn forwarder(status: DnsForwarderStatus) -> DnsForwarderReport {
+        DnsForwarderReport {
+            status,
+            tcp_routes: Vec::new(),
+        }
+    }
+
+    fn running(query: ForwarderQuery) -> DnsForwarderStatus {
+        DnsForwarderStatus::Running(query)
+    }
+
+    fn answered() -> ForwarderQuery {
+        ForwarderQuery::Answered {
+            name: "web.demo.test".to_string(),
+            address: "192.168.99.1".to_string(),
+        }
+    }
+
+    fn with_forwarder(dns_forwarder: DnsForwarderReport) -> DoctorReport {
+        DoctorReport {
+            dns_forwarder,
+            ..ready_but_for_the_bridge(BridgePhase::Up)
+        }
+    }
+
+    fn route(host: &str, mode: Mode) -> Entry {
+        Entry {
+            host: host.to_string(),
+            target: "192.168.99.130:5432".to_string(),
+            source: portman_protocol::Source::Static,
+            mode,
+            container_id: None,
+            project: None,
+            egress: None,
+        }
+    }
+
+    #[test]
+    fn doctor_prints_one_line_for_each_state_of_the_dns_forwarder() {
+        let not_sent = ForwarderQuery::NotSent {
+            why: "no hostname is registered".to_string(),
+        };
+        let unanswered = ForwarderQuery::Unanswered {
+            name: "web.demo.test".to_string(),
+            detail: "getent found no address".to_string(),
+        };
+        let absent = DnsForwarderStatus::NotRunning { state: None };
+        let restarting = DnsForwarderStatus::NotRunning {
+            state: Some("restarting".to_string()),
+        };
+        let no_engine = DnsForwarderStatus::DockerUnavailable {
+            message: "Cannot connect to the Docker daemon".to_string(),
+        };
+        // status → the line
+        let table = [
+            (
+                running(answered()),
+                "dns forwarder: running at 192.168.99.129, web.demo.test resolves to 192.168.99.1",
+            ),
+            (
+                running(unanswered),
+                "dns forwarder: running at 192.168.99.129, web.demo.test does not resolve through it (getent found no address)",
+            ),
+            (
+                running(not_sent),
+                "dns forwarder: running at 192.168.99.129, not queried (no hostname is registered)",
+            ),
+            (
+                absent,
+                "dns forwarder: absent; the netbridge starts it when it comes up, and a failed start is in the daemon log as `dns forwarder`",
+            ),
+            (
+                restarting,
+                "dns forwarder: restarting, not running; `docker logs portman-netbridge-dns` shows why",
+            ),
+            (
+                DnsForwarderStatus::ImageWithoutDnsMode,
+                "dns forwarder: unavailable, the setup image has no dns mode (run `portman bridge prepare`; a bridge that is up then gets the forwarder within a minute)",
+            ),
+            (
+                no_engine,
+                "dns forwarder: unavailable (Cannot connect to the Docker daemon)",
+            ),
+        ];
+        for (status, line) in table {
+            let rendered = render_report(&with_forwarder(forwarder(status.clone())));
+            let printed: Vec<&str> = rendered
+                .lines()
+                .filter(|line| line.contains("dns forwarder"))
+                .collect();
+            assert_eq!(printed, [line], "{status:?}");
+            assert!(!rendered.contains("portman` network"), "{rendered}");
+            assert!(
+                rendered.contains("replacement: ready"),
+                "the forwarder line changed the verdict\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_names_the_portman_network_when_a_tcp_route_exists() {
+        let note = "  tcp routes (db.demo.test, mq.demo.test): a container resolves them through the forwarder and connects only when it also joins the `portman` network";
+        let with_tcp_routes = |status| DnsForwarderReport {
+            status,
+            tcp_routes: vec!["db.demo.test".to_string(), "mq.demo.test".to_string()],
+        };
+
+        let rendered = render_report(&with_forwarder(with_tcp_routes(running(answered()))));
+        let lines: Vec<&str> = rendered.lines().collect();
+        let forwarder_line = lines
+            .iter()
+            .position(|line| line.starts_with("dns forwarder: running"))
+            .expect("the forwarder line");
+        assert_eq!(lines[forwarder_line + 1], note, "{rendered}");
+
+        let unavailable = with_tcp_routes(DnsForwarderStatus::ImageWithoutDnsMode);
+        let rendered = render_report(&with_forwarder(unavailable));
+        assert!(!rendered.contains("tcp routes"), "{rendered}");
+    }
+
+    #[test]
+    fn doctor_looks_up_the_first_registered_name_only_while_the_bridge_is_up() {
+        let routes = [
+            route("*.demo.test", Mode::Http),
+            route("web.demo.test", Mode::Http),
+            route("portman.localhost", Mode::Http),
+            route("db.demo.test", Mode::Tcp),
+        ];
+        let up = Some(BridgePhase::Up);
+        let name = |name: &str| Ok(name.to_string());
+        let why = |why: &str| Err(why.to_string());
+        // (bridge phase, routes) → the name, or why none
+        let table = [
+            (up, &routes[..], name("db.demo.test")),
+            (up, &routes[..3], name("web.demo.test")),
+            (up, &routes[..1], why("no hostname is registered")),
+            (up, &routes[2..3], why("no hostname is registered")),
+            (up, &[][..], why("no hostname is registered")),
+            (
+                Some(BridgePhase::Disabled),
+                &routes[..],
+                why("the netbridge is disabled, and managed names resolve only while it is up"),
+            ),
+            (
+                Some(BridgePhase::Starting),
+                &routes[..],
+                why("the netbridge is starting, and managed names resolve only while it is up"),
+            ),
+            (
+                None,
+                &routes[..],
+                why("the daemon is unreachable, and managed names resolve only through it"),
+            ),
+        ];
+        for (phase, routes, want) in table {
+            assert_eq!(forwarder_query_name(phase, routes), want, "phase={phase:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_forwarder_is_looked_at_in_order_and_asked_only_when_it_runs() {
+        let ok = |printed: &str| Ok(printed.to_string());
+        let err = |message: &str| Err(message.to_string());
+        let no_image = "Error response from daemon: No such image: portman-netbridge/setup:local";
+        let no_container = "Error response from daemon: No such container: portman-netbridge-dns";
+        let no_object = "Error: No such object: portman-netbridge-dns";
+        let no_engine = "Cannot connect to the Docker daemon";
+        let no_cli = "No such file or directory (os error 2)";
+        let unavailable = |message: &str| DnsForwarderStatus::DockerUnavailable {
+            message: message.to_string(),
+        };
+        let not_running = |state: Option<&str>| DnsForwarderStatus::NotRunning {
+            state: state.map(String::from),
+        };
+        use DnsForwarderStatus::ImageWithoutDnsMode;
+        // (the image's label, the container's state) → status
+        let table = [
+            (ok("1\n"), Some(ok("running\n")), running(answered())),
+            (ok("1\n"), Some(ok("exited\n")), not_running(Some("exited"))),
+            (
+                ok("1\n"),
+                Some(ok("restarting\n")),
+                not_running(Some("restarting")),
+            ),
+            (ok("1\n"), Some(err(no_container)), not_running(None)),
+            (ok("1\n"), Some(err(no_object)), not_running(None)),
+            (ok("1\n"), Some(err(no_image)), unavailable(no_image)),
+            (ok("1\n"), Some(err(no_engine)), unavailable(no_engine)),
+            (ok("\n"), None, ImageWithoutDnsMode),
+            (ok("2\n"), None, ImageWithoutDnsMode),
+            (err(no_image), None, ImageWithoutDnsMode),
+            (err(no_object), None, ImageWithoutDnsMode),
+            (err(no_container), None, unavailable(no_container)),
+            (err(no_engine), None, unavailable(no_engine)),
+            (err(no_cli), None, unavailable(no_cli)),
+        ];
+        for (image_label, container_state, want) in table {
+            let case = format!("{image_label:?} {container_state:?}");
+            let looked_up = std::cell::Cell::new(false);
+            let status = classify_dns_forwarder(
+                image_label,
+                async { container_state.expect("the container was asked about") },
+                async {
+                    looked_up.set(true);
+                    answered()
+                },
+            )
+            .await;
+            assert_eq!(looked_up.get(), want == running(answered()), "{case}");
+            assert_eq!(status, want, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_lookup_is_answered_only_by_a_run_that_succeeds_and_prints_an_address() {
+        let name = || "web.demo.test".to_string();
+        let unanswered = |detail: &str| ForwarderQuery::Unanswered {
+            name: name(),
+            detail: detail.to_string(),
+        };
+        let found = "192.168.99.1  web.demo.test\n";
+        // (the run succeeded, stdout, stderr) → the query
+        let table = [
+            (true, found, "", answered()),
+            (false, found, "", unanswered("getent found no address")),
+            (false, "", "", unanswered("getent found no address")),
+            (true, "", "", unanswered("getent found no address")),
+            (
+                false,
+                "",
+                "\ndocker: Error response from daemon: no such image.\nSee 'docker run --help'.\n",
+                unanswered("docker: Error response from daemon: no such image."),
+            ),
+        ];
+        for (succeeded, stdout, stderr, want) in table {
+            assert_eq!(
+                forwarder_query(name(), succeeded, stdout, stderr),
+                want,
+                "succeeded={succeeded} stdout={stdout:?} stderr={stderr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tcp_routes_are_the_registered_names_in_tcp_mode() {
+        let routes = [
+            route("web.demo.test", Mode::Http),
+            route("mq.demo.test", Mode::Tcp),
+            route("db.demo.test", Mode::Tcp),
+            route("api.acme.test", Mode::Egress),
+        ];
+
+        assert_eq!(tcp_route_names(&routes), ["db.demo.test", "mq.demo.test"]);
+        assert_eq!(tcp_route_names(&routes[..1]), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn the_answer_is_the_first_address_that_getent_prints() {
+        // stdout of `getent hosts <name>` → the address
+        let table = [
+            (
+                "192.168.99.1     web.demo.test  web.demo.test\n",
+                Some("192.168.99.1"),
+            ),
+            (
+                "192.168.99.130  db.demo.test\n192.168.99.131  db.demo.test\n",
+                Some("192.168.99.130"),
+            ),
+            ("fd00::1  web.demo.test\n", Some("fd00::1")),
+            ("", None),
+            ("\n", None),
+            ("web.demo.test\n", None),
+        ];
+        for (stdout, address) in table {
+            assert_eq!(
+                getent_address(stdout),
+                address.map(String::from),
+                "{stdout:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_embedded_setup_image_carries_the_label_that_doctor_reads() {
+        let dockerfile = include_str!("../../portman-netbridge/setup-image/Dockerfile");
+        let (key, value) = DNS_IMAGE_LABEL;
+        let label = format!("LABEL {key}=\"{value}\"");
+
+        assert!(dockerfile.lines().any(|line| line == label), "{label}");
+    }
+
     #[test]
     fn doctor_report_marks_docker_mode_ready_when_routes_are_owned() {
         let report = DoctorReport {
@@ -1169,6 +1701,7 @@ mod tests {
                 route_iface: Some("utun10".to_string()),
             }]),
             container_facing: open_container_facing(),
+            dns_forwarder: forwarder(running(answered())),
         };
 
         let rendered = render_report(&report);
@@ -1206,6 +1739,7 @@ mod tests {
                 route_iface: Some("utun8".to_string()),
             }]),
             container_facing: open_container_facing(),
+            dns_forwarder: forwarder(running(answered())),
         };
 
         let rendered = render_report(&report);
