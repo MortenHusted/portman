@@ -61,6 +61,35 @@ From the macOS host, with the B.1d `tunnel_encrypt` example running
 trigger a handshake that completes inside WireGuard's ~100 ms budget,
 at which point subsequent pings get echo replies through the tunnel.
 
+## DNS forwarder mode
+
+The same image runs the split DNS forwarder. With `dns` as the first
+argument, the entrypoint skips the WireGuard setup and runs `dnsmasq` in
+the foreground with the arguments that follow:
+
+```sh
+docker run -d --name portman-netbridge-dns \
+  --network host \
+  --restart always \
+  portman-netbridge/setup:local \
+  dns --keep-in-foreground --no-hosts \
+  --listen-address=192.168.99.129 --bind-interfaces --strict-order \
+  --server=/test/192.168.99.1 --server=/test/@vm-resolver@ \
+  --server=/host.docker.internal/#
+```
+
+The daemon starts this container. The command above shows what it runs.
+
+- `192.168.99.129` is the gateway address of the `portman` Docker network,
+  so the network must exist before the forwarder starts.
+- The entrypoint writes each argument that ends in `@vm-resolver@` once for
+  each `nameserver` in the container's `/etc/resolv.conf`. On the host
+  network that file is the VM's own.
+- The entrypoint exits with status 2 and a message when `/etc/resolv.conf`
+  names no nameserver or when no argument follows `dns`.
+- The image label `dev.portman.dns-forwarder=1` marks an image that has this
+  mode. The daemon starts the forwarder only from an image with the label.
+
 ## Why `--network host`?
 
 The setup image runs in the VM's root network namespace on purpose.

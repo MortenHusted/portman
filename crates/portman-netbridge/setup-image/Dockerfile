@@ -33,13 +33,22 @@
 # The image stays tiny on purpose: no shell beyond what alpine ships,
 # no extra tools. If anything goes wrong, exit non-zero with a clear
 # message — the caller parses our stderr to surface it.
+#
+# The same image runs the split DNS forwarder: `entrypoint.sh dns <dnsmasq
+# arguments>` runs dnsmasq in the foreground. The daemon starts that
+# container on the host network with no added capability. The label below
+# tells the daemon that the image has the mode, so that it never starts the
+# forwarder from an image without it.
 
 FROM alpine:3.21
+
+LABEL dev.portman.dns-forwarder="1"
 
 RUN apk add --no-cache \
     wireguard-tools \
     iproute2 \
-    iptables
+    iptables \
+    dnsmasq
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
