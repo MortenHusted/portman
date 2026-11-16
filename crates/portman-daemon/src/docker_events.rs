@@ -29,12 +29,6 @@ const RELIST_DELAYS: [Duration; 5] = [
     Duration::from_secs(4),
 ];
 
-/// Timed lists that a network event owes. On Docker 29.5.2 a list sent when
-/// the event arrived lacked the change in 9 of 10 attaches and had it 300 ms
-/// later. Three steps put lists 250 ms, 750 ms, and 1.75 s after the event,
-/// so two of them come after the one delay that was measured.
-const NETWORK_EVENT_RELISTS: usize = 3;
-
 /// How long the loop keeps reading events after a trigger before it lists.
 /// A burst, such as the event buffer the engine replays at subscription, then
 /// costs one list, not one for each socket read. The list also comes after
@@ -42,6 +36,11 @@ const NETWORK_EVENT_RELISTS: usize = 3;
 /// 29.5.2 a list sent when the event was read lacked the change in 15 of 40
 /// attaches and detaches, and a list sent 25 to 35 ms later had it in all 40.
 const QUIET: Duration = Duration::from_millis(50);
+
+/// Timed lists that a network event owes after its first list. The first list
+/// already comes after the lag measured on an idle engine, see [`QUIET`].
+/// These two are a margin for a loaded engine, which nobody has measured.
+const NETWORK_EVENT_RELISTS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Trigger {
@@ -372,7 +371,7 @@ mod tests {
                 (6, event(NETWORK, "disconnect")),
             ],
         ] {
-            assert_eq!(list_times(timed_stream(burst)).await, [50, 300, 800, 1800]);
+            assert_eq!(list_times(timed_stream(burst)).await, [50, 300, 800]);
         }
     }
 
@@ -403,7 +402,7 @@ mod tests {
             owed.push(delay);
             network = network.after_delay();
         }
-        assert_eq!(owed, [250, 500, 1000].map(Duration::from_millis));
+        assert_eq!(owed, [250, 500].map(Duration::from_millis));
 
         let network = idle.after_trigger(Trigger::Network);
 
