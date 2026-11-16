@@ -212,6 +212,30 @@ impl Attempts {
             retry_after: None,
         }
     }
+
+    /// Records how one attempt ended. A failure schedules the retry. A
+    /// success ends the sequence, so that the next start has a new key and
+    /// the first delay.
+    fn settle<T>(&mut self, started: Result<T>) -> Option<T> {
+        match started {
+            Ok(bridge) => {
+                *self = Self::new();
+                Some(bridge)
+            }
+            Err(err) => {
+                self.failures += 1;
+                let retry_after = backoff(self.failures);
+                warn!(
+                    %err,
+                    attempt = self.failures,
+                    retry_in_secs = retry_after.as_secs(),
+                    "netbridge start failed"
+                );
+                self.retry_after = Some(retry_after);
+                None
+            }
+        }
+    }
 }
 
 fn backoff(failures: u32) -> Duration {
@@ -391,33 +415,19 @@ impl BridgeStarter for Docker {
     }
 }
 
-/// One start attempt. A failure schedules the retry on `attempts`.
+/// One start attempt, recorded on `attempts`.
 async fn try_start(
     engine: &impl BridgeStarter,
     mode: NetbridgeMode,
     attempts: &mut Attempts,
 ) -> Option<Runtime> {
-    match engine.start_bridge(mode, &attempts.host_kp).await {
-        Ok(rt) => {
-            info!(
-                mode = mode.as_str(),
-                "netbridge up: docker network `portman`, container pool 192.168.99.130–.253"
-            );
-            Some(rt)
-        }
-        Err(err) => {
-            attempts.failures += 1;
-            let retry_after = backoff(attempts.failures);
-            warn!(
-                %err,
-                attempt = attempts.failures,
-                retry_in_secs = retry_after.as_secs(),
-                "netbridge start failed"
-            );
-            attempts.retry_after = Some(retry_after);
-            None
-        }
-    }
+    let started = engine.start_bridge(mode, &attempts.host_kp).await;
+    let runtime = attempts.settle(started)?;
+    info!(
+        mode = mode.as_str(),
+        "netbridge up: docker network `portman`, container pool 192.168.99.130–.253"
+    );
+    Some(runtime)
 }
 
 fn persist(path: &Path, intent: &NetbridgeState) {
@@ -569,6 +579,23 @@ mod tests {
         assert_eq!(backoff(4), Duration::from_secs(40));
         assert_eq!(backoff(5), Duration::from_secs(60));
         assert_eq!(backoff(u32::MAX), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_start_that_succeeds_ends_its_sequence() {
+        let failed = || Err::<(), _>(anyhow::anyhow!("no container engine"));
+        let mut attempts = Attempts::new();
+        let first_key = attempts.host_kp.public_base64();
+        attempts.settle(failed());
+        attempts.settle(failed());
+        assert_eq!(attempts.retry_after, Some(Duration::from_secs(10)));
+        assert_eq!(attempts.host_kp.public_base64(), first_key);
+
+        assert_eq!(attempts.settle(Ok(())), Some(()));
+
+        assert_ne!(attempts.host_kp.public_base64(), first_key);
+        attempts.settle(failed());
+        assert_eq!(attempts.retry_after, Some(RETRY_BASE));
     }
 
     /// One start attempt, as the engine saw it.
