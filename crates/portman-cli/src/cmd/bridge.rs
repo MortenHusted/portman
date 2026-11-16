@@ -36,7 +36,7 @@ pub(crate) async fn cmd_bridge_status() -> Result<()> {
 
 pub(crate) async fn cmd_doctor() -> Result<()> {
     let report = doctor::DoctorReport {
-        daemon: daemon_snapshot().await,
+        daemon: doctor::DaemonSnapshot::from_status(request(Request::Status).await.ok()),
         setup_image: doctor::inspect_setup_image(),
         legacy_bridge: doctor::detect_legacy_bridge(),
         docker_routes: doctor::collect_docker_routes(),
@@ -44,31 +44,6 @@ pub(crate) async fn cmd_doctor() -> Result<()> {
     };
     print!("{}", doctor::render_report(&report));
     Ok(())
-}
-
-pub(crate) async fn daemon_snapshot() -> doctor::DaemonSnapshot {
-    match request(Request::Status).await {
-        Ok(Response::Status {
-            version,
-            bridge_assessment,
-            bridge_enabled,
-            bridge_mode,
-            ..
-        }) => doctor::DaemonSnapshot {
-            reachable: true,
-            version: Some(version),
-            bridge_assessment: Some(bridge_assessment),
-            bridge_enabled: Some(bridge_enabled),
-            bridge_mode: Some(bridge_mode),
-        },
-        _ => doctor::DaemonSnapshot {
-            reachable: false,
-            version: None,
-            bridge_assessment: None,
-            bridge_enabled: None,
-            bridge_mode: None,
-        },
-    }
 }
 
 pub(crate) async fn cmd_bridge(req: Request, desired_enabled: bool, verb: &str) -> Result<()> {

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::time::Duration;
 
-use portman_protocol::NetbridgeMode;
+use portman_protocol::{BridgePhase, NetbridgeMode, Response};
 use serde_json::Value;
 
 pub(crate) const SETUP_IMAGE: &str = "portman-netbridge/setup:local";
@@ -19,8 +19,37 @@ pub(crate) struct DaemonSnapshot {
     pub reachable: bool,
     pub version: Option<String>,
     pub bridge_assessment: Option<portman_protocol::BridgeAssessment>,
-    pub bridge_enabled: Option<bool>,
+    pub bridge_phase: Option<BridgePhase>,
     pub bridge_mode: Option<NetbridgeMode>,
+}
+
+impl DaemonSnapshot {
+    /// `None` is a daemon that did not answer.
+    pub(crate) fn from_status(status: Option<Response>) -> Self {
+        match status {
+            Some(Response::Status {
+                version,
+                bridge_assessment,
+                bridge_enabled,
+                bridge_phase,
+                bridge_mode,
+                ..
+            }) => Self {
+                reachable: true,
+                version: Some(version),
+                bridge_assessment: Some(bridge_assessment),
+                bridge_phase: Some(bridge_phase.or_from_enabled(bridge_enabled)),
+                bridge_mode: Some(bridge_mode),
+            },
+            _ => Self {
+                reachable: false,
+                version: None,
+                bridge_assessment: None,
+                bridge_phase: None,
+                bridge_mode: None,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,9 +313,10 @@ pub(crate) fn render_report(report: &DoctorReport) -> String {
     if legacy_running || !ready {
         lines.push("guidance:".to_string());
         if !ready {
-            lines.push(
-                "  use `portman bridge mode docker` and `portman bridge enable` for labelled Docker bridge replacement"
-                    .to_string(),
+            lines.extend(
+                bridge_guidance(report.daemon.bridge_phase)
+                    .iter()
+                    .map(|line| format!("  {line}")),
             );
         }
         if legacy_running {
@@ -300,6 +330,28 @@ pub(crate) fn render_report(report: &DoctorReport) -> String {
     }
 
     lines.join("\n") + "\n"
+}
+
+/// `portman bridge enable` helps only a bridge that is off. For a bridge
+/// that is enabled and not up, it restarts the retry delay and waits.
+fn bridge_guidance(phase: Option<BridgePhase>) -> &'static [&'static str] {
+    match phase {
+        Some(BridgePhase::Starting) => &[
+            "netbridge is enabled and has not come up; the daemon keeps retrying",
+            "the reason is in the daemon log: look for `netbridge start failed` (~/Library/Logs/portman/daemon.log when installed)",
+            "check the setup image line above and that Docker is running; `portman bridge disable` stops the retries",
+        ],
+        Some(BridgePhase::WaitingForDocker) => &[
+            "netbridge is enabled and waits for Docker; start your container runtime",
+            "`portman bridge disable` turns the bridge off",
+        ],
+        Some(BridgePhase::Stopping) => {
+            &["netbridge is stopping; run `portman doctor` again when it has stopped"]
+        }
+        _ => &[
+            "use `portman bridge mode docker` and `portman bridge enable` for labelled Docker bridge replacement",
+        ],
+    }
 }
 
 fn check_docker_routes(status: &DockerRouteStatus) -> CheckOutcome {
@@ -431,8 +483,8 @@ fn check_daemon(daemon: &DaemonSnapshot) -> CheckOutcome {
     if !daemon.reachable {
         return CheckOutcome::gating(CheckState::Fail, "daemon: unreachable".to_string());
     }
-    // Ready needs the replacement actually routing: bridge enabled, docker mode.
-    let state = if daemon.bridge_enabled == Some(true)
+    // Ready needs the replacement actually routing: bridge up, docker mode.
+    let state = if daemon.bridge_phase == Some(BridgePhase::Up)
         && daemon.bridge_mode == Some(NetbridgeMode::Docker)
     {
         CheckState::Ok
@@ -447,11 +499,7 @@ fn check_daemon(daemon: &DaemonSnapshot) -> CheckOutcome {
             .map(|version| format!(" v{version}"))
             .unwrap_or_default(),
         daemon.bridge_assessment.unwrap_or_default().as_str(),
-        if daemon.bridge_enabled.unwrap_or(false) {
-            "enabled"
-        } else {
-            "disabled"
-        },
+        daemon.bridge_phase.unwrap_or_default().display_word(),
         daemon
             .bridge_mode
             .map(NetbridgeMode::display_word)
@@ -633,9 +681,85 @@ mod tests {
             reachable: true,
             version: Some("0.0.1".to_string()),
             bridge_assessment: Some(portman_protocol::BridgeAssessment::Healthy),
-            bridge_enabled: Some(true),
+            bridge_phase: Some(BridgePhase::Up),
             bridge_mode: Some(NetbridgeMode::Docker),
         }
+    }
+
+    fn ready_but_for_the_bridge(phase: BridgePhase) -> DoctorReport {
+        DoctorReport {
+            daemon: DaemonSnapshot {
+                bridge_phase: Some(phase),
+                ..docker_daemon()
+            },
+            setup_image: SetupImageStatus::Present {
+                id: "sha256:a3884c".to_string(),
+                created: "2026-04-24T07:48:00Z".to_string(),
+            },
+            legacy_bridge: LegacyBridgeStatus::NotDetected,
+            docker_routes: DockerRouteStatus::NoLabelledContainers,
+            container_facing: open_container_facing(),
+        }
+    }
+
+    #[test]
+    fn doctor_prints_the_phase_and_is_ready_only_for_a_bridge_that_is_up() {
+        // phase → (word on the daemon line, ready)
+        let table = [
+            (BridgePhase::Disabled, "netbridge: disabled mode", false),
+            (
+                BridgePhase::WaitingForDocker,
+                "netbridge: waiting for docker mode",
+                false,
+            ),
+            (BridgePhase::Starting, "netbridge: starting mode", false),
+            (BridgePhase::Up, "netbridge: up mode", true),
+            (BridgePhase::Stopping, "netbridge: stopping mode", false),
+        ];
+        for (phase, word, ready) in table {
+            let rendered = render_report(&ready_but_for_the_bridge(phase));
+            assert!(rendered.contains(word), "phase={phase:?}\n{rendered}");
+            assert_eq!(
+                rendered.contains("replacement: ready"),
+                ready,
+                "phase={phase:?}\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_advises_enable_only_for_a_bridge_that_is_off() {
+        // phase → (advises `portman bridge enable`, the advice names)
+        let table = [
+            (BridgePhase::Disabled, true, "portman bridge mode docker"),
+            (BridgePhase::Starting, false, "daemon log"),
+            (BridgePhase::Starting, false, "portman bridge disable"),
+            (BridgePhase::WaitingForDocker, false, "container runtime"),
+            (BridgePhase::Stopping, false, "stopping"),
+        ];
+        for (phase, advises_enable, names) in table {
+            let rendered = render_report(&ready_but_for_the_bridge(phase));
+            let guidance = rendered.split("guidance:").nth(1).unwrap_or_default();
+            assert_eq!(
+                guidance.contains("portman bridge enable"),
+                advises_enable,
+                "phase={phase:?}\n{rendered}"
+            );
+            assert!(guidance.contains(names), "phase={phase:?}\n{rendered}");
+        }
+    }
+
+    #[test]
+    fn doctor_reads_the_phase_of_an_older_daemon_from_bridge_enabled() {
+        let status = |bridge_enabled: bool| {
+            let json = format!(
+                r#"{{"kind":"status","version":"0.1.5","running_since":"5s","dns_port":5335,"bridge_enabled":{bridge_enabled}}}"#
+            );
+            DaemonSnapshot::from_status(Some(serde_json::from_str(&json).unwrap()))
+        };
+
+        assert_eq!(status(true).bridge_phase, Some(BridgePhase::Up));
+        assert_eq!(status(false).bridge_phase, Some(BridgePhase::Disabled));
     }
 
     fn open_container_facing() -> ContainerFacingStatus {
