@@ -221,7 +221,7 @@ fn backoff(failures: u32) -> Duration {
 /// mirrors the shape of the other daemon subsystems so `select!`
 /// handles panics uniformly.
 pub(crate) async fn run(
-    docker: Docker,
+    engine: impl BridgeStarter,
     handle: Handle,
     mut rx: mpsc::Receiver<Control>,
     phase_tx: watch::Sender<BridgePhase>,
@@ -257,7 +257,7 @@ pub(crate) async fn run(
             match plan(&intent, session, built, attempts.retry_after.is_none()) {
                 Step::Keep => break,
                 Step::Start(session) => {
-                    if let Some(runtime) = try_start(&docker, intent.mode, &mut attempts).await {
+                    if let Some(runtime) = try_start(&engine, intent.mode, &mut attempts).await {
                         epoch += 1;
                         running = Some(Running {
                             runtime,
@@ -345,14 +345,25 @@ fn publish_ifindex(slot: &crate::upstream::BridgeIfIndex, runtime: Option<&Runti
     *slot.write().expect("bridge ifindex lock poisoned") = resolved;
 }
 
+/// Builds a bridge. The control loop starts one only through this, so that
+/// a test can run the loop with no container engine.
+pub(crate) trait BridgeStarter {
+    async fn start_bridge(&self, mode: NetbridgeMode, host_kp: &Keypair) -> Result<Runtime>;
+}
+
+impl BridgeStarter for Docker {
+    async fn start_bridge(&self, mode: NetbridgeMode, host_kp: &Keypair) -> Result<Runtime> {
+        Runtime::start_with_keypair(self.clone(), RuntimeOptions { mode }, host_kp).await
+    }
+}
+
 /// One start attempt. A failure schedules the retry on `attempts`.
 async fn try_start(
-    docker: &Docker,
+    engine: &impl BridgeStarter,
     mode: NetbridgeMode,
     attempts: &mut Attempts,
 ) -> Option<Runtime> {
-    let options = RuntimeOptions { mode };
-    match Runtime::start_with_keypair(docker.clone(), options, &attempts.host_kp).await {
+    match engine.start_bridge(mode, &attempts.host_kp).await {
         Ok(rt) => {
             info!(
                 mode = mode.as_str(),
@@ -395,7 +406,7 @@ fn env_forces_enabled() -> bool {
 mod tests {
     use super::*;
     use tempfile::{tempdir, TempDir};
-    use tokio::task::JoinHandle;
+    use tokio::time::Instant;
     use NetbridgeMode::{Docker as DockerMode, OptIn};
 
     const S1: Option<Session> = Some(Session(1));
@@ -526,69 +537,143 @@ mod tests {
         assert_eq!(backoff(u32::MAX), Duration::from_secs(60));
     }
 
-    /// Runs the task against a Docker socket that refuses every connection,
-    /// so a start fails at its first Docker call and touches nothing on the
-    /// host.
-    fn run_without_engine(dir: &TempDir) -> (Handle, PathBuf, JoinHandle<Result<()>>) {
-        let sock = dir.path().join("docker.sock");
-        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
-        let docker =
-            Docker::connect_with_socket(sock.to_str().unwrap(), 5, bollard::API_DEFAULT_VERSION)
-                .unwrap();
-        let state_path = dir.path().join("netbridge.json");
-        let (handle, rx, phase_tx) = handle_pair();
-        let task = tokio::spawn(run(
-            docker,
-            handle.clone(),
-            rx,
-            phase_tx,
-            state_path.clone(),
-        ));
-        (handle, state_path, task)
+    /// One start attempt, as the engine saw it.
+    struct Attempt {
+        at: Instant,
+        host_key: String,
+        /// What `netbridge.json` held while the attempt was in flight.
+        saved: NetbridgeState,
     }
 
-    #[tokio::test]
-    async fn enable_with_no_reachable_engine_persists_the_intent() {
-        let dir = tempdir().unwrap();
-        let (handle, state_path, task) = run_without_engine(&dir);
+    /// An engine on which no start succeeds. It does no I/O, so the paused
+    /// clock moves only when the control loop waits.
+    struct NoEngine {
+        state_path: PathBuf,
+        seen: mpsc::UnboundedSender<Attempt>,
+    }
 
-        handle.tx.send(Control::Enable).await.unwrap();
-        // The task takes the mode change only after the start that the
-        // enable asked for has failed.
-        handle.tx.send(Control::SetMode(DockerMode)).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while *handle.mode.read().await != DockerMode {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+    impl BridgeStarter for NoEngine {
+        async fn start_bridge(&self, _mode: NetbridgeMode, host_kp: &Keypair) -> Result<Runtime> {
+            let _ = self.seen.send(Attempt {
+                at: Instant::now(),
+                host_key: host_kp.public_base64(),
+                saved: netbridge_state::load(&self.state_path),
+            });
+            anyhow::bail!("no container engine")
+        }
+    }
+
+    struct Rig {
+        handle: Handle,
+        state_path: PathBuf,
+        attempts: mpsc::UnboundedReceiver<Attempt>,
+        _dir: TempDir,
+    }
+
+    const LONGEST_WAIT: Duration = Duration::from_secs(3600);
+
+    impl Rig {
+        fn start() -> Self {
+            let dir = tempdir().unwrap();
+            let state_path = dir.path().join("netbridge.json");
+            let (seen, attempts) = mpsc::unbounded_channel();
+            let engine = NoEngine {
+                state_path: state_path.clone(),
+                seen,
+            };
+            let (handle, rx, phase_tx) = handle_pair();
+            tokio::spawn(run(
+                engine,
+                handle.clone(),
+                rx,
+                phase_tx,
+                state_path.clone(),
+            ));
+            Rig {
+                handle,
+                state_path,
+                attempts,
+                _dir: dir,
             }
-        })
-        .await
-        .expect("the mode change is published");
+        }
 
-        let saved = netbridge_state::load(&state_path);
-        assert!(saved.enabled);
-        assert_eq!(saved.mode, DockerMode);
-        assert_eq!(*handle.phase.borrow(), BridgePhase::Starting);
-        task.abort();
+        async fn send(&self, msg: Control) {
+            self.handle.tx.send(msg).await.unwrap();
+        }
+
+        async fn next_attempt(&mut self) -> Attempt {
+            tokio::time::timeout(LONGEST_WAIT, self.attempts.recv())
+                .await
+                .expect("a start attempt")
+                .unwrap()
+        }
+
+        async fn no_attempt_follows(&mut self) {
+            let next = tokio::time::timeout(LONGEST_WAIT, self.attempts.recv()).await;
+            assert!(next.is_err(), "a start attempt after the bridge was off");
+        }
+
+        async fn reaches(&self, want: BridgePhase) {
+            let mut phase = self.handle.phase.clone();
+            tokio::time::timeout(LONGEST_WAIT, phase.wait_for(|p| *p == want))
+                .await
+                .unwrap_or_else(|_| panic!("the bridge never reported {want:?}"))
+                .unwrap();
+        }
     }
 
-    #[tokio::test]
-    async fn disable_while_a_start_is_retrying_takes_effect() {
-        let dir = tempdir().unwrap();
-        let (handle, state_path, task) = run_without_engine(&dir);
-        let mut phase = handle.phase.clone();
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_start_is_tried_again_after_a_delay_that_grows_to_a_minute() {
+        let mut rig = Rig::start();
+        rig.send(Control::Enable).await;
 
-        handle.tx.send(Control::Enable).await.unwrap();
-        phase
-            .wait_for(|p| *p == BridgePhase::Starting)
-            .await
-            .unwrap();
-        handle.tx.send(Control::Disable).await.unwrap();
-        tokio::time::timeout(RETRY_BASE, phase.wait_for(|p| *p == BridgePhase::Disabled))
-            .await
-            .expect("the disable lands before the first retry is due")
-            .unwrap();
+        let mut attempts = Vec::new();
+        for _ in 0..7 {
+            attempts.push(rig.next_attempt().await);
+        }
 
-        assert!(!netbridge_state::load(&state_path).enabled);
-        task.abort();
+        let gaps: Vec<Duration> = attempts.windows(2).map(|w| w[1].at - w[0].at).collect();
+        assert_eq!(gaps, [5, 10, 20, 40, 60, 60].map(Duration::from_secs));
+        assert!(
+            attempts.iter().all(|a| a.host_key == attempts[0].host_key),
+            "a retry used a new host key"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_intent_is_saved_before_the_first_start_and_outlives_a_failed_one() {
+        let mut rig = Rig::start();
+        rig.send(Control::Enable).await;
+
+        let first = rig.next_attempt().await;
+        assert!(first.saved.enabled, "saved before the first start");
+        let retry = rig.next_attempt().await;
+        assert!(retry.saved.enabled, "still saved after a failed start");
+        assert_eq!(*rig.handle.phase.borrow(), BridgePhase::Starting);
+
+        rig.send(Control::SetMode(DockerMode)).await;
+        let in_new_mode = rig.next_attempt().await;
+        assert!(in_new_mode.saved.enabled);
+        assert_eq!(in_new_mode.saved.mode, DockerMode);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_lands_while_a_failed_start_waits_for_its_retry() {
+        let mut rig = Rig::start();
+        rig.send(Control::Enable).await;
+        rig.next_attempt().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let sent = Instant::now();
+        rig.send(Control::Disable).await;
+        rig.reaches(BridgePhase::Disabled).await;
+
+        assert_eq!(
+            sent.elapsed(),
+            Duration::ZERO,
+            "the disable waited for the retry timer"
+        );
+        assert!(!netbridge_state::load(&rig.state_path).enabled);
+        rig.no_attempt_follows().await;
     }
 }
