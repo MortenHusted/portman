@@ -69,7 +69,7 @@ pub(crate) fn observe(summary: ContainerSummary) -> Option<Container> {
 pub(crate) struct Plan {
     /// At most one entry per host.
     pub entries: Vec<Entry>,
-    /// Short ids of containers that get a host once they have an address.
+    /// Short ids of containers that wait for an address.
     pub waiting: Vec<String>,
     pub skipped: Vec<Skipped>,
 }

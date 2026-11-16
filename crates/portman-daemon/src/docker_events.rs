@@ -20,7 +20,8 @@ use crate::DaemonState;
 
 /// Delays between lists that no wake caused. The loop takes these steps while
 /// a labelled container has no address, after a list that failed, and for the
-/// lists a network event owes.
+/// lists a network event owes. Each delay runs from the end of the list before
+/// it, and a wake starts the steps over.
 const RELIST_DELAYS: [Duration; 5] = [
     Duration::from_millis(250),
     Duration::from_millis(500),
@@ -150,7 +151,6 @@ async fn wait<E: Display>(
     }
 }
 
-/// Lists the labelled running containers once and passes them to [`apply`].
 async fn reconcile(
     docker: &Docker,
     state: &DaemonState,
@@ -172,8 +172,9 @@ async fn reconcile(
 }
 
 /// Makes the registry's container entries match `containers` and warns once
-/// for each container that gets no route, for as long as its reason lasts.
-/// Returns whether a container still waits for an address.
+/// for each container it skips, for as long as its reason lasts. A container
+/// that waits for an address is not skipped and gets no warning. Returns
+/// whether a container still waits for an address.
 fn apply(state: &DaemonState, containers: &[Container], reported: &mut Vec<Skipped>) -> bool {
     let plan = discovery::plan(containers, |host| state.host_is_routable(host));
 
