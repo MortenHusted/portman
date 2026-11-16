@@ -168,13 +168,19 @@ enum ModePoll {
     Reached,
     Pending,
     SetByAnother(NetbridgeMode),
+    TurnedOff,
 }
 
 /// What one status read tells a wait for a mode change. `previous` is the
 /// mode of the read before it, and the first one is from before the request.
 /// The daemon reports the old mode until the bridge built for it is gone, so
 /// a mode that is neither the last one seen nor the wanted one comes from
-/// another command. With `wait_for_up` the bridge was up before the request.
+/// another command.
+///
+/// With `wait_for_up` the bridge was up before the request. A daemon that
+/// sends the phase sends `disabled` only for a bridge that nobody wants, so
+/// that `disabled` is final. A daemon that sends no phase reads as disabled
+/// while it replaces the bridge, so that wait goes on.
 fn mode_poll(
     wanted: NetbridgeMode,
     wait_for_up: bool,
@@ -190,6 +196,8 @@ fn mode_poll(
     }
     if !wait_for_up || now.phase() == BridgePhase::Up {
         ModePoll::Reached
+    } else if now.sent_phase == BridgePhase::Disabled {
+        ModePoll::TurnedOff
     } else {
         ModePoll::Pending
     }
@@ -225,6 +233,12 @@ where
                 "another command set the netbridge mode to {}",
                 NetbridgeMode::display_word(mode)
             ),
+            ModePoll::TurnedOff => {
+                return Err(anyhow!(
+                    "netbridge was disabled while this command waited for it"
+                ))
+                .with_context(not_up)
+            }
             ModePoll::Pending => previous = now.mode,
         }
         if !pauses.pause().await {
@@ -414,14 +428,14 @@ mod tests {
                 for_up,
                 OptIn,
                 sent(Docker, Disabled),
-                ModePoll::Pending,
+                ModePoll::TurnedOff,
             ),
             (
                 Docker,
                 for_up,
                 Docker,
                 sent(Docker, Disabled),
-                ModePoll::Pending,
+                ModePoll::TurnedOff,
             ),
             (
                 Docker,
@@ -600,6 +614,18 @@ mod tests {
                 format!("another command set the netbridge mode to {mode}")
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_mode_change_ends_at_once_when_the_bridge_is_disabled_under_it() {
+        let mut script = Script::new(&[sent(OptIn, Stopping), sent(Docker, Disabled)]);
+
+        let failed = wait_for_mode(|| script.read(), Docker, sent(OptIn, Up))
+            .await
+            .unwrap_err();
+
+        assert_eq!(script.read_at.len(), 2);
+        assert!(format!("{failed:#}").contains("was disabled"), "{failed:#}");
     }
 
     #[tokio::test(start_paused = true)]
