@@ -1655,11 +1655,14 @@ function renderStatus(status) {
   const pill = el('bridge-pill');
   const assessment = status.bridge_assessment || 'unknown';
   pill.hidden = false;
-  el('bridge-label').textContent = `bridge ${assessment.replace('_', ' ')}`;
+  const phase = String(status.bridge_phase).replace(/_/g, ' ');
+  const wantedNotUp = phase !== 'up' && phase !== 'disabled';
+  el('bridge-label').textContent = `bridge ${assessment.replace('_', ' ')}`
+    + (wantedNotUp ? ` · netbridge ${phase}` : '');
   if (assessment !== 'healthy' && assessment !== 'unknown') {
     pushAlert(
       `Bridge ${assessment.replace('_', ' ')}`,
-      `<div class="alert-body">mode=${esc(status.bridge_mode)} · netbridge=${esc(String(status.bridge_phase).replace(/_/g, ' '))}</div>`,
+      `<div class="alert-body">mode=${esc(status.bridge_mode)} · netbridge=${esc(phase)}</div>`,
       assessment === 'tunnel_dead'
     );
   }
