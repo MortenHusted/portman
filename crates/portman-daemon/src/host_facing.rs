@@ -1,6 +1,7 @@
 //! Container-facing listeners on `192.168.99.1` (the host's utun
 //! tunnel IP). Runs only while the v1 netbridge is up — the address
-//! doesn't exist otherwise.
+//! doesn't exist otherwise — and binds again for every new bridge,
+//! because the address moves to a new utun.
 //!
 //! Today: DNS/HTTP/TLS listeners on `192.168.99.1` that answer the
 //! same way the host-facing DNS/proxy surfaces do, except DNS rewrites
@@ -53,21 +54,42 @@ fn container_facing_addrs(http_port: u16, tls_port: u16) -> ContainerFacingAddrs
 }
 
 struct RunningServices {
+    epoch: u64,
     dns: JoinHandle<()>,
     http: JoinHandle<()>,
     tls: JoinHandle<()>,
 }
 
 impl RunningServices {
-    fn abort(self) {
-        self.dns.abort();
-        self.http.abort();
-        self.tls.abort();
+    /// Returns once the listener tasks are gone, so that the next bind does
+    /// not race the old sockets for the address.
+    async fn stop(self) {
+        for task in [self.dns, self.http, self.tls] {
+            task.abort();
+            let _ = task.await;
+        }
+        info!("container-facing services stopped");
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Rebind {
+    Keep,
+    Drop,
+    Bind(u64),
+}
+
+/// `bound` is the epoch of the bridge the running listeners were bound for.
+fn rebind(bound: Option<u64>, phase: BridgePhase) -> Rebind {
+    match phase.epoch() {
+        wanted if wanted == bound => Rebind::Keep,
+        Some(epoch) => Rebind::Bind(epoch),
+        None => Rebind::Drop,
     }
 }
 
 /// Long-running task. Subscribes to `phase_rx`; spawns the
-/// container-facing listeners when the bridge comes up and aborts
+/// container-facing listeners for each bridge that comes up and stops
 /// them when it goes down.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
@@ -84,32 +106,30 @@ pub(crate) async fn run(
     let addrs = container_facing_addrs(http_port, tls_port);
 
     loop {
-        let want_up = phase_rx.borrow_and_update().epoch().is_some();
+        let phase = *phase_rx.borrow_and_update();
+        let decision = rebind(services.as_ref().map(|running| running.epoch), phase);
 
-        match (&services, want_up) {
-            (None, true) => {
-                services = Some(spawn_services(
-                    registry.clone(),
-                    addrs,
-                    cert_manager.clone(),
-                    tls_store.clone(),
-                    bridge.clone(),
-                    starter.clone(),
-                ));
+        if decision != Rebind::Keep {
+            if let Some(running) = services.take() {
+                running.stop().await;
             }
-            (Some(_), false) => {
-                if let Some(running) = services.take() {
-                    running.abort();
-                }
-                info!("container-facing services stopped");
-            }
-            _ => {}
+        }
+        if let Rebind::Bind(epoch) = decision {
+            services = Some(spawn_services(
+                epoch,
+                registry.clone(),
+                addrs,
+                cert_manager.clone(),
+                tls_store.clone(),
+                bridge.clone(),
+                starter.clone(),
+            ));
         }
 
         if phase_rx.changed().await.is_err() {
             // Sender dropped → daemon is exiting.
             if let Some(running) = services.take() {
-                running.abort();
+                running.stop().await;
             }
             return Ok(());
         }
@@ -117,6 +137,7 @@ pub(crate) async fn run(
 }
 
 fn spawn_services(
+    epoch: u64,
     registry: Registry,
     addrs: ContainerFacingAddrs,
     cert_manager: CertManager,
@@ -125,6 +146,7 @@ fn spawn_services(
     starter: Arc<dyn Starter>,
 ) -> RunningServices {
     RunningServices {
+        epoch,
         dns: spawn_dns(registry.clone(), addrs.dns),
         http: spawn_http(registry.clone(), addrs.http, bridge.clone(), starter),
         tls: spawn_tls(registry, addrs.tls, cert_manager, tls_store, bridge),
@@ -236,6 +258,30 @@ mod tests {
         assert_eq!(retry_delay(4), Duration::from_secs(2));
         assert_eq!(retry_delay(5), Duration::from_secs(10));
         assert_eq!(retry_delay(u64::MAX), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn listeners_follow_the_bridge_epoch() {
+        let up = |epoch| BridgePhase::Up { epoch };
+        // (epoch the listeners are bound for, phase) → decision
+        let table = [
+            (None, BridgePhase::Disabled, Rebind::Keep),
+            (None, BridgePhase::WaitingForDocker, Rebind::Keep),
+            (None, BridgePhase::Starting, Rebind::Keep),
+            (None, up(1), Rebind::Bind(1)),
+            (Some(1), up(1), Rebind::Keep),
+            (Some(1), up(2), Rebind::Bind(2)),
+            (Some(1), BridgePhase::Starting, Rebind::Drop),
+            (Some(1), BridgePhase::WaitingForDocker, Rebind::Drop),
+            (Some(1), BridgePhase::Disabled, Rebind::Drop),
+        ];
+        for (bound, phase, want) in table {
+            assert_eq!(
+                rebind(bound, phase),
+                want,
+                "bound={bound:?} phase={phase:?}"
+            );
+        }
     }
 
     #[test]
