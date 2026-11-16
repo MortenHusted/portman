@@ -223,9 +223,9 @@ fn lose(publisher: &watch::Sender<Link>, state: &DaemonState, reason: Absent) {
 }
 
 /// Delays between lists that no wake caused. The loop takes these steps while
-/// a labelled container has no address, and for the lists a network event
-/// owes. Each delay runs from the end of the list before it, and a wake
-/// starts the steps over.
+/// a labelled container has no address, after a list that failed, and for the
+/// lists a network event owes. Each delay runs from the end of the list before
+/// it, and a wake starts the steps over.
 const RELIST_DELAYS: [Duration; 5] = [
     Duration::from_millis(250),
     Duration::from_millis(500),
@@ -290,8 +290,8 @@ impl Relist {
         }
     }
 
-    /// `retry` says that the last list left a container waiting for an
-    /// address. `None` means wait for a wake.
+    /// `retry` says that the last list failed or left a container waiting for
+    /// an address. `None` means wait for a wake.
     fn delay(self, retry: bool) -> Option<Duration> {
         RELIST_DELAYS
             .get(self.attempt)
@@ -310,7 +310,9 @@ pub(crate) fn registry_with_resync() -> (Registry, Arc<Notify>) {
     (registry, resync)
 }
 
-/// One session. It returns when the event stream ends or a list fails.
+/// One session. It returns when the event stream ends. A list that fails
+/// says nothing about the stream, so it is retried here and the session, and
+/// what the daemon built on it, stays.
 async fn serve(docker: &Docker, state: &DaemonState) {
     // bollard sends the request on the first poll, so the subscription cannot
     // be open before the first list. `since` makes the engine replay its event
@@ -324,14 +326,14 @@ async fn serve(docker: &Docker, state: &DaemonState) {
     let mut reported = Vec::new();
     let mut relist = Relist::default();
     loop {
-        let waiting = match reconcile(docker, state, &mut reported).await {
+        let retry = match reconcile(docker, state, &mut reported).await {
             Ok(waiting) => waiting,
             Err(err) => {
                 warn!(error = format!("{err:#}"), "container reconcile failed");
-                return;
+                true
             }
         };
-        let Some(next) = wait(&mut events, &state.container_resync, relist, waiting).await else {
+        let Some(next) = wait(&mut events, &state.container_resync, relist, retry).await else {
             warn!("docker events stream ended");
             return;
         };
@@ -1400,30 +1402,45 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_failed_list_ends_the_session_and_sessions_that_end_at_once_come_at_a_growing_delay()
-    {
-        let (mut rig, engine) = Rig::connected().await;
-        tokio::time::sleep(SETTLED).await;
+    async fn a_list_that_fails_on_a_live_stream_is_retried_in_its_session() {
+        let (rig, engine) = Rig::connected().await;
 
         engine.fail_lists();
         let failed_at = engine.now_ms();
         rig.state.container_resync.notify_one();
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        tokio::time::sleep(HOUR).await;
 
-        let connects: Vec<u128> = engine
-            .times(Asked::Version)
+        let retries: Vec<u128> = engine
+            .lists()
             .into_iter()
             .filter_map(|at| at.checked_sub(failed_at))
             .collect();
-        assert_eq!(connects, [0, 250, 750, 1750, 3750, 5750]);
-        assert_eq!(rig.state.engine.session(), Some(Session(7)));
+        assert_eq!(retries, [0, 250, 750, 1750, 3750, 7750]);
+        assert_eq!(rig.state.engine.session(), Some(Session(1)));
+        assert_eq!(engine.times(Asked::Version).len(), 1);
         assert_eq!(rig.target(WEB).as_deref(), Some("172.17.0.2:80"));
 
         engine.list(&[running(API, "172.17.0.3")]);
-        rig.session(8).await;
+        rig.state.container_resync.notify_one();
+        tokio::time::sleep(Duration::from_millis(1)).await;
 
         assert_eq!(rig.target(API).as_deref(), Some("172.17.0.3:80"));
         assert_eq!(rig.target(WEB), None);
+        assert_eq!(rig.state.engine.session(), Some(Session(1)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sessions_that_end_at_once_come_at_a_growing_delay() {
+        let engine = FakeEngine::new(0, vec![], false, Socket::Serving);
+        let rig = Rig::boot(vec![(SOCKET, engine.clone())]);
+
+        tokio::time::sleep(Duration::from_secs(6)).await;
+
+        assert_eq!(
+            engine.times(Asked::Version),
+            [0, 250, 750, 1750, 3750, 5750]
+        );
+        assert_eq!(rig.state.engine.session(), Some(Session(6)));
     }
 
     #[tokio::test(start_paused = true)]
