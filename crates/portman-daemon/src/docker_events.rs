@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use bollard::models::{EventMessage, EventMessageTypeEnum};
 use bollard::query_parameters::{EventsOptionsBuilder, ListContainersOptionsBuilder};
 use bollard::Docker;
-use futures_util::{FutureExt, Stream, StreamExt};
+use futures_util::{Stream, StreamExt};
 use portman_core::{Mode, Registry};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
@@ -34,6 +34,14 @@ const RELIST_DELAYS: [Duration; 5] = [
 /// later. Three steps put lists 250 ms, 750 ms, and 1.75 s after the event,
 /// so two of them come after the one delay that was measured.
 const NETWORK_EVENT_RELISTS: usize = 3;
+
+/// How long the loop keeps reading events after a trigger before it lists.
+/// A burst, such as the event buffer the engine replays at subscription, then
+/// costs one list, not one for each socket read. The list also comes after
+/// the lag between a network event and the engine's container list. On Docker
+/// 29.5.2 a list sent when the event was read lacked the change in 15 of 40
+/// attaches and detaches, and a list sent 25 to 35 ms later had it in all 40.
+const QUIET: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Trigger {
@@ -123,7 +131,8 @@ pub(crate) async fn run(docker: Docker, state: DaemonState) -> Result<()> {
 }
 
 /// Waits for the next reason to list and returns the schedule that follows
-/// it. `None` when the stream has ended.
+/// it. `None` when the stream has ended. Never drop it early, because a drop
+/// during the quiet time loses the trigger.
 async fn wait<E: Display>(
     events: &mut (impl Stream<Item = Result<EventMessage, E>> + Unpin),
     resync: &Notify,
@@ -132,7 +141,9 @@ async fn wait<E: Display>(
 ) -> Option<Relist> {
     let delay = relist.delay(retry);
     tokio::select! {
-        trigger = next_trigger(events) => Some(relist.after_trigger(trigger?)),
+        trigger = next_trigger(events) => {
+            Some(relist.after_trigger(settle(events, trigger?).await))
+        }
         _ = resync.notified() => Some(relist.after_resync()),
         _ = tokio::time::sleep(delay.unwrap_or_default()), if delay.is_some() => {
             Some(relist.after_delay())
@@ -210,28 +221,41 @@ fn apply(state: &DaemonState, containers: &[Container], reported: &mut Vec<Skipp
     !plan.waiting.is_empty()
 }
 
-/// Waits for an event that can change the container routes, then drains the
-/// events the stream already holds, so the events buffered behind it share its
-/// list. A burst that holds a network event is a network trigger. `None` when
-/// the stream has ended.
+/// Waits for an event that can change the container routes. `None` when the
+/// stream has ended. It holds nothing across an await, so `select!` can drop
+/// it without losing a trigger.
 async fn next_trigger<E: Display>(
     events: &mut (impl Stream<Item = Result<EventMessage, E>> + Unpin),
 ) -> Option<Trigger> {
-    let mut burst = None;
     loop {
-        let next = if burst.is_some() {
-            match events.next().now_or_never() {
-                Some(Some(next)) => next,
-                _ => return burst,
+        match events.next().await? {
+            Ok(event) => {
+                if let Some(trigger) = trigger(&event) {
+                    return Some(trigger);
+                }
             }
-        } else {
-            events.next().await?
-        };
-        match next {
-            Ok(event) => burst = burst.max(trigger(&event)),
             Err(err) => warn!(error = %err, "docker events stream error"),
         }
     }
+}
+
+/// Reads events for [`QUIET`] after `first`, so the whole burst shares one
+/// list. A burst that holds a network event is a network trigger. It reads
+/// for the whole time because the stream hands over one socket read at a
+/// time, so a single drain at the end would not see the reads behind it.
+async fn settle<E: Display>(
+    events: &mut (impl Stream<Item = Result<EventMessage, E>> + Unpin),
+    first: Trigger,
+) -> Trigger {
+    let quiet_until = tokio::time::Instant::now() + QUIET;
+    let mut burst = first;
+    while let Ok(Some(next)) = tokio::time::timeout_at(quiet_until, events.next()).await {
+        match next {
+            Ok(event) => burst = burst.max(trigger(&event).unwrap_or(burst)),
+            Err(err) => warn!(error = %err, "docker events stream error"),
+        }
+    }
+    burst
 }
 
 fn trigger(event: &EventMessage) -> Option<Trigger> {
@@ -247,7 +271,7 @@ fn trigger(event: &EventMessage) -> Option<Trigger> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::stream;
+    use futures_util::{stream, FutureExt};
 
     fn event(typ: EventMessageTypeEnum, action: &str) -> EventMessage {
         EventMessage {
@@ -285,26 +309,84 @@ mod tests {
         assert_eq!(trigger(&EventMessage::default()), None);
     }
 
-    #[tokio::test]
-    async fn a_burst_of_events_is_one_trigger() {
-        use EventMessageTypeEnum::{CONTAINER, NETWORK};
-        let mut events = open_stream(vec![
-            event(CONTAINER, "create"),
-            event(CONTAINER, "start"),
-            event(NETWORK, "connect"),
-            event(CONTAINER, "start"),
-        ]);
-
-        assert_eq!(next_trigger(&mut events).await, Some(Trigger::Network));
-        assert!(next_trigger(&mut events).now_or_never().is_none());
+    /// A stream that gives each event the stated number of milliseconds
+    /// after the one before it, and then stays open.
+    fn timed_stream(
+        events: Vec<(u64, EventMessage)>,
+    ) -> impl Stream<Item = Result<EventMessage, String>> + Unpin {
+        let timed = stream::iter(events).then(|(after_ms, event)| async move {
+            tokio::time::sleep(Duration::from_millis(after_ms)).await;
+            Ok(event)
+        });
+        Box::pin(timed.chain(stream::pending())).fuse()
     }
 
-    #[tokio::test]
-    async fn a_burst_without_a_network_event_is_a_container_trigger() {
-        use EventMessageTypeEnum::CONTAINER;
-        let mut events = open_stream(vec![event(CONTAINER, "start"), event(CONTAINER, "die")]);
+    /// The times, in milliseconds from now, at which the loop lists because
+    /// of `events`, when each list takes no time and asks for no retry.
+    async fn list_times(
+        mut events: impl Stream<Item = Result<EventMessage, String>> + Unpin,
+    ) -> Vec<u128> {
+        let resync = Notify::new();
+        let start = tokio::time::Instant::now();
+        let mut relist = Relist::default();
+        let mut lists = Vec::new();
+        while let Ok(Some(next)) = tokio::time::timeout(
+            Duration::from_secs(60),
+            wait(&mut events, &resync, relist, false),
+        )
+        .await
+        {
+            lists.push(start.elapsed().as_millis());
+            relist = next;
+        }
+        lists
+    }
 
-        assert_eq!(next_trigger(&mut events).await, Some(Trigger::Container));
+    #[tokio::test(start_paused = true)]
+    async fn the_events_of_each_quiet_time_cost_one_list() {
+        let cases = [
+            (vec![(0, "start"), (10, "die"), (10, "start")], vec![50]),
+            (vec![(0, "start"), (60, "die")], vec![50, 110]),
+        ];
+        for (actions, lists) in cases {
+            let events = actions
+                .iter()
+                .map(|&(after_ms, action)| {
+                    (after_ms, event(EventMessageTypeEnum::CONTAINER, action))
+                })
+                .collect();
+            assert_eq!(list_times(timed_stream(events)).await, lists, "{actions:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_network_event_anywhere_in_a_burst_owes_its_timed_lists() {
+        use EventMessageTypeEnum::{CONTAINER, NETWORK};
+        for burst in [
+            vec![
+                (0, event(NETWORK, "connect")),
+                (6, event(CONTAINER, "start")),
+            ],
+            vec![
+                (0, event(CONTAINER, "die")),
+                (6, event(NETWORK, "disconnect")),
+            ],
+        ] {
+            assert_eq!(list_times(timed_stream(burst)).await, [50, 300, 800, 1800]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resync_wake_lists_without_the_quiet_time() {
+        let resync = Notify::new();
+        resync.notify_one();
+        let mut events = timed_stream(vec![]);
+        let start = tokio::time::Instant::now();
+
+        let woken = wait(&mut events, &resync, Relist::default(), false).await;
+
+        assert_eq!(woken, Some(Relist::default()));
+        assert_eq!(start.elapsed(), Duration::ZERO);
     }
 
     #[test]
@@ -491,17 +573,16 @@ mod tests {
         assert_eq!(warnings_about(&logs, SHORT_ID), 1, "{}", logs.text());
     }
 
-    #[tokio::test]
-    async fn a_stream_error_behind_a_trigger_is_logged() {
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_fails_behind_a_trigger_costs_one_list_and_logs_the_error() {
         let (logs, _guard) = Logs::capture();
-        let mut events = stream::iter(vec![
+        let events = stream::iter(vec![
             Ok(event(EventMessageTypeEnum::CONTAINER, "die")),
             Err("connection reset".to_string()),
         ])
         .fuse();
 
-        assert_eq!(next_trigger(&mut events).await, Some(Trigger::Container));
-        assert_eq!(next_trigger(&mut events).await, None);
+        assert_eq!(list_times(events).await.len(), 1);
         assert!(logs.text().contains("connection reset"), "{}", logs.text());
     }
 }
