@@ -32,7 +32,9 @@ pub(crate) struct Container {
     pub addresses: Vec<(String, Ipv4Addr)>,
     /// The network mode, when it is one that never gives the container an
     /// address of its own: `host`, `none`, or `container:<id>`. A `none`
-    /// container can still get an address from `docker network connect`.
+    /// container still gets an address when it leaves `none` and joins
+    /// another network, with `docker network disconnect none` and then
+    /// `docker network connect`.
     pub unaddressable: Option<String>,
 }
 

@@ -32,15 +32,18 @@ const RELIST_DELAYS: [Duration; 5] = [
 
 /// How long the loop keeps reading events after a trigger before it lists.
 /// A burst, such as the event buffer the engine replays at subscription, then
-/// costs one list, not one for each socket read. The list also comes after
-/// the lag between a network event and the engine's container list. On Docker
-/// 29.5.2 a list sent when the event was read lacked the change in 15 of 40
-/// attaches and detaches, and a list sent 25 to 35 ms later had it in all 40.
+/// costs one list, not one for each socket read. When a network event opens
+/// the quiet time, the list also comes after the lag between that event and
+/// the engine's container list. On Docker 29.5.2 on an idle 2-CPU VM, a list
+/// sent when the event was read lacked the change in 15 of 40 attaches and
+/// detaches, and a list sent 25 to 40 ms after the read had it in all 40.
 const QUIET: Duration = Duration::from_millis(50);
 
 /// Timed lists that a network event owes after its first list. The first list
-/// already comes after the lag measured on an idle engine, see [`QUIET`].
-/// These two are a margin for a loaded engine, which nobody has measured.
+/// is past the lag measured for [`QUIET`] only when the network event opens
+/// the quiet time. The timed lists cover a network event that is read late in
+/// a quiet time, whose first list comes a few milliseconds later, and an
+/// engine slower than the one measured.
 const NETWORK_EVENT_RELISTS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -131,8 +134,10 @@ pub(crate) async fn run(docker: Docker, state: DaemonState) -> Result<()> {
 }
 
 /// Waits for the next reason to list and returns the schedule that follows
-/// it. `None` when the stream has ended. Never drop it early, because a drop
-/// during the quiet time loses the trigger.
+/// it. `None` once the stream has ended. A stream that ends during the quiet
+/// time first returns the schedule for the burst it cut short, and the next
+/// call returns `None`. Never drop it early, because a drop during the quiet
+/// time loses the trigger.
 async fn wait<E: Display>(
     events: &mut (impl Stream<Item = Result<EventMessage, E>> + Unpin),
     resync: &Notify,
