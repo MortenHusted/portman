@@ -61,8 +61,8 @@ pub(crate) enum BridgePhase {
     WaitingForDocker,
     /// A start is in flight or waiting for its retry.
     Starting,
-    /// `epoch` increments for every new `Runtime`, so that a reader can tell
-    /// a new bridge from the one it last saw up.
+    /// `epoch` increments for every new bridge, so that a reader can tell a
+    /// new bridge from the one it last saw up.
     Up {
         epoch: u64,
     },
@@ -188,10 +188,11 @@ fn plan(
     }
 }
 
-/// `Up` only for a bridge that [`plan`] keeps, so that nothing binds to a
-/// utun the next step removes. A bridge that `plan` removes is `Stopping`,
-/// so that a reader waiting for the bridge to be off or to be up again does
-/// not take the removal for done.
+/// `Up` only for a bridge that [`plan`] keeps. A bridge that `plan` removes
+/// is `Stopping`, so that a reader waiting for the bridge to be off or to be
+/// up again does not take the removal for done. `Stopping` also tells the
+/// container-facing listeners to let go of the utun. The loop does not wait
+/// for them before it removes the bridge.
 fn phase(intent: &NetbridgeState, session: Option<Session>, running: Option<Built>) -> BridgePhase {
     match (running, session) {
         (Some(built), Some(session))
@@ -217,9 +218,9 @@ fn reported_mode(intent: &NetbridgeState, running: Option<Built>) -> NetbridgeMo
 }
 
 /// One start sequence: a first attempt and its retries. They share one host
-/// identity. A retry with a new key would leave a tunnel from the failed
-/// attempt peered to a key the VM has forgotten, with the same name as the
-/// live tunnel and no traffic through it.
+/// key because `Runtime::start_with_keypair` takes the key of the sequence.
+/// No failed attempt leaves a tunnel behind, so nothing breaks today if a
+/// retry has a new key.
 struct Attempts {
     host_kp: Keypair,
     failures: u32,
@@ -414,8 +415,8 @@ async fn next_wake(rx: &mut mpsc::Receiver<Control>, retry_after: Option<Duratio
 /// The one place that tells the rest of the daemon what the bridge is
 /// doing. The ifindex goes first, so that a reader woken by `Up` finds it
 /// set. The mode goes last, so that a reader that takes the mode first and
-/// the phase second never pairs a new mode with the phase of the bridge
-/// built for the old mode.
+/// the phase second never gets a new mode with a phase that is older than
+/// it.
 async fn publish(
     handle: &Handle,
     phase_tx: &watch::Sender<BridgePhase>,

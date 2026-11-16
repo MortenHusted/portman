@@ -464,8 +464,8 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
         .read()
         .map(|g| *g)
         .unwrap_or(portman_protocol::BridgeAssessment::Unknown);
-    // Mode first, phase second: `netbridge::publish` writes them in the
-    // opposite order, and the pair is consistent only when read this way.
+    // Mode first, phase second. `netbridge::publish` writes the phase first,
+    // so the phase read here is never older than the mode. It can be newer.
     let bridge_mode = *state.netbridge.mode.read().await;
     let published_phase = *state.netbridge.phase.borrow();
     Response::Status {
