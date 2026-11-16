@@ -140,22 +140,17 @@ pub enum BridgePhase {
 }
 
 impl BridgePhase {
-    pub fn as_str(self) -> &'static str {
+    /// The words that the CLI, the TUI and doctor print for the phase. The
+    /// type has no other way to text, so that no surface prints the wire
+    /// name by accident.
+    pub fn display_word(self) -> &'static str {
         match self {
             BridgePhase::Disabled => "disabled",
-            BridgePhase::WaitingForDocker => "waiting_for_docker",
+            BridgePhase::WaitingForDocker => "waiting for docker",
             BridgePhase::Starting => "starting",
             BridgePhase::Up => "up",
             BridgePhase::Stopping => "stopping",
             BridgePhase::Unknown => "unknown",
-        }
-    }
-
-    /// Human-facing words used by the CLI and the TUI alike.
-    pub fn display_word(self) -> &'static str {
-        match self {
-            BridgePhase::WaitingForDocker => "waiting for docker",
-            other => other.as_str(),
         }
     }
 
@@ -184,12 +179,6 @@ impl std::fmt::Display for ServiceState {
 }
 
 impl std::fmt::Display for BridgeAssessment {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::fmt::Display for BridgePhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
