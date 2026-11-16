@@ -63,7 +63,7 @@ impl Display for Absent {
             Absent::Idle => f.write_str("no connect attempt has ended"),
             Absent::NoSocket => f.write_str(
                 "no docker socket found; start a runtime (e.g. `colima start`) \
-                 or set PORTMAN_DOCKER_SOCKET",
+                 or point PORTMAN_DOCKER_SOCKET at its socket",
             ),
             Absent::Unreachable { socket, error } => {
                 write!(f, "no answer on {}: {error}", socket.display())
