@@ -1,7 +1,7 @@
 //! Which container routes the registry should hold, computed from one list
 //! of running containers.
 
-use std::collections::btree_map::{BTreeMap, Entry as Slot};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::Ipv4Addr;
 
@@ -30,6 +30,9 @@ pub(crate) struct Container {
     /// One `(network name, address)` per network that gave the container an
     /// IPv4 address. `host` and `none` never appear.
     pub addresses: Vec<(String, Ipv4Addr)>,
+    /// The network mode, when it is one that never gives the container an
+    /// address of its own: `host`, `none`, or `container:<id>`.
+    pub unaddressable: Option<String>,
 }
 
 /// `None` for a container without a `dev.portman.host` label.
@@ -45,6 +48,10 @@ pub(crate) fn observe(summary: ContainerSummary) -> Option<Container> {
         .filter(|(network, _)| network != "host" && network != "none")
         .filter_map(|(network, endpoint)| Some((network, endpoint.ip_address?.parse().ok()?)))
         .collect();
+    let unaddressable = summary
+        .host_config
+        .and_then(|config| config.network_mode)
+        .filter(|mode| mode == "host" || mode == "none" || mode.starts_with("container:"));
     Some(Container {
         id: summary.id?,
         created: summary.created.unwrap_or_default(),
@@ -53,6 +60,7 @@ pub(crate) fn observe(summary: ContainerSummary) -> Option<Container> {
         mode: Mode::parse_label(label(LABEL_MODE).as_deref()),
         project: label(LABEL_PROJECT),
         addresses,
+        unaddressable,
     })
 }
 
@@ -60,7 +68,7 @@ pub(crate) fn observe(summary: ContainerSummary) -> Option<Container> {
 pub(crate) struct Plan {
     /// At most one entry per host.
     pub entries: Vec<Entry>,
-    /// Short ids of containers that hold a host and have no address yet.
+    /// Short ids of containers that get a host once they have an address.
     pub waiting: Vec<String>,
     pub skipped: Vec<Skipped>,
 }
@@ -79,6 +87,8 @@ pub(crate) enum Skip {
     UnmanagedTld,
     TcpOnLocalhost,
     TcpWithoutPort,
+    /// The network mode, which never gives the container an address.
+    NoAddress(String),
     /// A newer container, named by its short id, holds the same host.
     HostTakenBy(String),
 }
@@ -95,50 +105,60 @@ impl fmt::Display for Skip {
                 ".localhost is HTTP-only because the operating system fixes it to loopback",
             ),
             Skip::TcpWithoutPort => f.write_str("dev.portman.mode=tcp requires dev.portman.port"),
+            Skip::NoAddress(mode) => write!(
+                f,
+                "network mode `{mode}` gives the container no address of its own"
+            ),
             Skip::HostTakenBy(id) => write!(f, "container {id} is newer and holds the hostname"),
         }
     }
 }
 
-/// The container routes for `containers`. When two containers claim one host,
-/// the newest `created` holds it, and on a tie the lower id.
+/// The container routes for `containers`. When several containers claim one
+/// host, the newest `created` that has an address holds it, and on a tie the
+/// lower id. A claimant newer than the holder waits for its address, and an
+/// older one is skipped.
 pub(crate) fn plan(containers: &[Container], host_is_routable: impl Fn(&str) -> bool) -> Plan {
     let mut newest_first: Vec<&Container> = containers.iter().collect();
     newest_first.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.id.cmp(&b.id)));
 
     let mut plan = Plan::default();
-    let mut holders: BTreeMap<String, (&Container, String)> = BTreeMap::new();
+    let mut claims: BTreeMap<String, Vec<(&Container, String)>> = BTreeMap::new();
     for container in newest_first {
-        let reason = match claim(container, &host_is_routable) {
-            Ok((host, port)) => match holders.entry(host) {
-                Slot::Vacant(slot) => {
-                    slot.insert((container, port));
-                    continue;
-                }
-                Slot::Occupied(slot) => Skip::HostTakenBy(short(&slot.get().0.id).to_string()),
-            },
-            Err(reason) => reason,
-        };
-        plan.skipped.push(Skipped {
-            id: short(&container.id).to_string(),
-            host: container.host.clone(),
-            reason,
-        });
+        match claim(container, &host_is_routable) {
+            Ok((host, port)) => claims.entry(host).or_default().push((container, port)),
+            Err(reason) => plan.skipped.push(Skipped {
+                id: short(&container.id).to_string(),
+                host: container.host.clone(),
+                reason,
+            }),
+        }
     }
 
-    for (host, (container, port)) in holders {
-        let id = short(&container.id).to_string();
-        match pick_address(&container.addresses) {
-            Some(ip) => plan.entries.push(Entry {
-                host,
-                target: format!("{ip}:{port}"),
-                source: Source::Container,
-                mode: container.mode,
-                container_id: Some(id),
-                project: container.project.clone(),
-                egress: None,
-            }),
-            None => plan.waiting.push(id),
+    for (host, claimants) in claims {
+        let mut holder: Option<String> = None;
+        for (container, port) in claimants {
+            let id = short(&container.id).to_string();
+            match (&holder, pick_address(&container.addresses)) {
+                (Some(holder), _) => plan.skipped.push(Skipped {
+                    id,
+                    host: container.host.clone(),
+                    reason: Skip::HostTakenBy(holder.clone()),
+                }),
+                (None, Some(ip)) => {
+                    plan.entries.push(Entry {
+                        host: host.clone(),
+                        target: format!("{ip}:{port}"),
+                        source: Source::Container,
+                        mode: container.mode,
+                        container_id: Some(id.clone()),
+                        project: container.project.clone(),
+                        egress: None,
+                    });
+                    holder = Some(id);
+                }
+                (None, None) => plan.waiting.push(id),
+            }
         }
     }
     plan
@@ -165,6 +185,9 @@ fn claim(
         (None, Mode::Tcp) => return Err(Skip::TcpWithoutPort),
         (None, Mode::Http | Mode::Egress | Mode::Unknown) => "80".to_string(),
     };
+    if let Some(mode) = &container.unaddressable {
+        return Err(Skip::NoAddress(mode.clone()));
+    }
     Ok((host, port))
 }
 
@@ -184,7 +207,9 @@ pub(crate) fn pick_address(addresses: &[(String, Ipv4Addr)]) -> Option<Ipv4Addr>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bollard::models::{ContainerSummaryNetworkSettings, EndpointSettings};
+    use bollard::models::{
+        ContainerSummaryHostConfig, ContainerSummaryNetworkSettings, EndpointSettings,
+    };
     use std::collections::HashMap;
 
     const ID_A: &str = "aaaaaaaaaaaa1111";
@@ -203,6 +228,7 @@ mod tests {
             mode: Mode::Http,
             project: None,
             addresses: vec![on("bridge", [172, 17, 0, 2])],
+            unaddressable: None,
         }
     }
 
@@ -486,8 +512,109 @@ mod tests {
                     on("bridge", [172, 17, 0, 2]),
                     on("portman", [192, 168, 99, 130])
                 ],
+                unaddressable: None,
             }
         );
+    }
+
+    #[test]
+    fn observe_marks_a_network_mode_that_never_gives_an_address() {
+        let cases = [
+            (Some("host"), Some("host")),
+            (Some("none"), Some("none")),
+            (
+                Some("container:cccccccccccc3333"),
+                Some("container:cccccccccccc3333"),
+            ),
+            (Some("bridge"), None),
+            (Some("default"), None),
+            (Some("demo_default"), None),
+            (None, None),
+        ];
+        for (mode, expected) in cases {
+            let mut listed = summary(&[("dev.portman.host", "web.demo.test")], &[]);
+            listed.host_config = mode.map(|mode| ContainerSummaryHostConfig {
+                network_mode: Some(mode.into()),
+                ..Default::default()
+            });
+
+            let observed = observe(listed).expect("labelled container");
+
+            assert_eq!(observed.unaddressable.as_deref(), expected, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn plan_skips_a_container_that_can_never_get_an_address() {
+        let host_network = Container {
+            created: 200,
+            addresses: vec![],
+            unaddressable: Some("host".into()),
+            ..container(ID_A, "web.demo.test")
+        };
+        let addressed = container(ID_B, "web.demo.test");
+
+        let plan = plan(&[host_network, addressed], managed);
+
+        assert!(plan.waiting.is_empty());
+        assert_eq!(
+            plan.skipped,
+            vec![Skipped {
+                id: "aaaaaaaaaaaa".into(),
+                host: "web.demo.test".into(),
+                reason: Skip::NoAddress("host".into()),
+            }]
+        );
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(
+            plan.entries[0].container_id.as_deref(),
+            Some("bbbbbbbbbbbb")
+        );
+    }
+
+    #[test]
+    fn plan_keeps_a_host_with_the_addressed_container_while_a_newer_one_waits() {
+        let addressed = Container {
+            created: 100,
+            ..container(ID_B, "web.demo.test")
+        };
+        let starting = Container {
+            created: 200,
+            addresses: vec![],
+            ..container(ID_A, "web.demo.test")
+        };
+
+        for containers in [[addressed.clone(), starting.clone()], [starting, addressed]] {
+            let plan = plan(&containers, managed);
+            assert_eq!(plan.entries.len(), 1);
+            assert_eq!(plan.entries[0].target, "172.17.0.2:80");
+            assert_eq!(
+                plan.entries[0].container_id.as_deref(),
+                Some("bbbbbbbbbbbb")
+            );
+            assert_eq!(plan.waiting, vec!["aaaaaaaaaaaa"]);
+            assert!(plan.skipped.is_empty());
+        }
+    }
+
+    #[test]
+    fn plan_waits_for_every_claimant_while_none_has_an_address() {
+        let older = Container {
+            created: 100,
+            addresses: vec![],
+            ..container(ID_B, "web.demo.test")
+        };
+        let newer = Container {
+            created: 200,
+            addresses: vec![],
+            ..container(ID_A, "web.demo.test")
+        };
+
+        let plan = plan(&[older, newer], managed);
+
+        assert!(plan.entries.is_empty());
+        assert_eq!(plan.waiting, vec!["aaaaaaaaaaaa", "bbbbbbbbbbbb"]);
+        assert!(plan.skipped.is_empty());
     }
 
     #[test]
