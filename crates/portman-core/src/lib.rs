@@ -21,7 +21,7 @@ pub mod tls_store;
 pub use loopback_alloc::LoopbackAllocator;
 pub use platform::{Platform, PlatformApi};
 pub use portman_protocol::{Entry, Mode, NetbridgeMode, Request, Response, Source};
-pub use registry::{target_collisions, Registry};
+pub use registry::{target_collisions, ContainerDiff, Registry};
 pub use static_store::StaticStore;
 pub use tls_store::{TlsMode, TlsStore};
 

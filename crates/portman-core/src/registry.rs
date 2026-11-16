@@ -7,7 +7,7 @@
 //! Thread-safety: wrapped in an `Arc<RwLock<...>>` under the hood. Readers
 //! take a shared lock, writers an exclusive one. Keyed by hostname.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use portman_protocol::Entry;
@@ -15,6 +15,16 @@ use portman_protocol::Entry;
 /// Stable browser route for portman's own dashboard. `.localhost` is
 /// resolved by the operating system, so this route needs no managed TLD.
 pub const DASHBOARD_HOST: &str = "portman.localhost";
+
+/// What [`Registry::replace_container_entries`] changed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ContainerDiff {
+    /// Entries written, either to a host that had no entry or over a container
+    /// entry that differed.
+    pub added: Vec<Entry>,
+    /// Container entries dropped because their host is no longer desired.
+    pub removed: Vec<Entry>,
+}
 
 /// Cloneable handle to the shared registry — all clones point at the same data.
 #[derive(Debug, Clone, Default)]
@@ -68,6 +78,37 @@ impl Registry {
             .into_iter()
             .filter_map(|k| guard.remove(&k))
             .collect()
+    }
+
+    /// Make the set of container-sourced entries equal `desired`, under one
+    /// write lock. A host that a static, service, or builtin entry holds keeps
+    /// that entry, because an explicit route outranks a container label. A
+    /// second call with the same `desired` returns an empty diff.
+    pub fn replace_container_entries(&self, mut desired: Vec<Entry>) -> ContainerDiff {
+        for entry in &mut desired {
+            entry.host = entry.host.to_ascii_lowercase();
+        }
+        let wanted: HashSet<&str> = desired.iter().map(|e| e.host.as_str()).collect();
+        let mut diff = ContainerDiff::default();
+        let mut guard = self.inner.write().expect("registry lock poisoned");
+        guard.retain(|host, entry| {
+            let stale = entry.source == portman_protocol::Source::Container
+                && !wanted.contains(host.as_str());
+            if stale {
+                diff.removed.push(entry.clone());
+            }
+            !stale
+        });
+        for entry in desired {
+            let keep = guard.get(&entry.host).is_some_and(|existing| {
+                existing.source != portman_protocol::Source::Container || *existing == entry
+            });
+            if !keep {
+                guard.insert(entry.host.clone(), entry.clone());
+                diff.added.push(entry);
+            }
+        }
+        diff
     }
 
     /// Snapshot of all entries as a `Vec`. The order is not stable across calls.
@@ -229,6 +270,118 @@ mod tests {
         assert_eq!(removed.len(), 2);
         assert_eq!(r.len(), 1);
         assert!(r.get("b.test").is_some());
+    }
+
+    fn service(host: &str) -> Entry {
+        Entry {
+            source: Source::Service,
+            ..at(host, "127.0.0.1:8123")
+        }
+    }
+
+    fn hosts(entries: &[Entry]) -> Vec<&str> {
+        let mut hosts: Vec<&str> = entries.iter().map(|e| e.host.as_str()).collect();
+        hosts.sort_unstable();
+        hosts
+    }
+
+    #[test]
+    fn replace_container_entries_is_idempotent() {
+        let r = Registry::new();
+        let desired = vec![container("a.test", "aaa"), container("B.Test", "bbb")];
+
+        let first = r.replace_container_entries(desired.clone());
+        assert_eq!(hosts(&first.added), vec!["a.test", "b.test"]);
+        assert!(first.removed.is_empty());
+
+        assert_eq!(
+            r.replace_container_entries(desired),
+            ContainerDiff::default()
+        );
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn replace_container_entries_removes_stale_container_entries() {
+        let r = Registry::new();
+        r.replace_container_entries(vec![container("a.test", "aaa"), container("b.test", "bbb")]);
+
+        let diff = r.replace_container_entries(vec![container("b.test", "bbb")]);
+
+        assert!(diff.added.is_empty());
+        assert_eq!(hosts(&diff.removed), vec!["a.test"]);
+        assert!(r.get("a.test").is_none());
+        assert!(r.get("b.test").is_some());
+
+        let emptied = r.replace_container_entries(Vec::new());
+        assert_eq!(hosts(&emptied.removed), vec!["b.test"]);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn replace_container_entries_writes_a_changed_target() {
+        let r = Registry::new();
+        r.replace_container_entries(vec![container("a.test", "aaa")]);
+        let moved = Entry {
+            target: "192.168.99.130:80".into(),
+            ..container("a.test", "aaa")
+        };
+
+        let diff = r.replace_container_entries(vec![moved.clone()]);
+
+        assert_eq!(diff.added, vec![moved.clone()]);
+        assert!(diff.removed.is_empty());
+        assert_eq!(r.get("a.test"), Some(moved));
+    }
+
+    #[test]
+    fn replace_container_entries_never_touches_other_sources() {
+        let r = Registry::new();
+        r.upsert(at("static.test", "127.0.0.1:3070"));
+        r.upsert(service("service.test"));
+        r.upsert(builtin(DASHBOARD_HOST));
+        let explicit = [
+            r.get("static.test").unwrap(),
+            r.get("service.test").unwrap(),
+            r.get(DASHBOARD_HOST).unwrap(),
+        ];
+
+        let contested = r.replace_container_entries(vec![
+            container("static.test", "aaa"),
+            container("service.test", "bbb"),
+            container(DASHBOARD_HOST, "ccc"),
+            container("free.test", "ddd"),
+        ]);
+        assert_eq!(hosts(&contested.added), vec!["free.test"]);
+        assert!(contested.removed.is_empty());
+
+        let emptied = r.replace_container_entries(Vec::new());
+        assert_eq!(hosts(&emptied.removed), vec!["free.test"]);
+
+        for entry in explicit {
+            assert_eq!(r.get(&entry.host), Some(entry));
+        }
+        assert_eq!(r.len(), 3);
+    }
+
+    #[test]
+    fn container_entry_returns_after_its_static_rule_is_removed() {
+        let r = Registry::new();
+        let desired = vec![container("api.test", "aaa")];
+        r.replace_container_entries(desired.clone());
+
+        r.upsert(at("api.test", "127.0.0.1:3070"));
+        assert_eq!(
+            r.replace_container_entries(desired.clone()),
+            ContainerDiff::default()
+        );
+        assert_eq!(r.get("api.test").unwrap().source, Source::Static);
+
+        r.remove("api.test");
+        let diff = r.replace_container_entries(desired.clone());
+
+        assert_eq!(diff.added, desired);
+        assert_eq!(r.get("api.test").unwrap().source, Source::Container);
     }
 
     #[test]
