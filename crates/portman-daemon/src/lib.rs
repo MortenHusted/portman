@@ -48,7 +48,6 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use bollard::Docker;
 use clap::Parser;
 use portman_core::paths::{cert_dir, static_rules_path, tls_settings_path, user_home};
 use portman_core::tld::{host_is_routable, scan_managed_tlds};
@@ -140,7 +139,9 @@ struct Args {
 /// `Status` response). Cheap to clone.
 #[derive(Clone)]
 pub(crate) struct DaemonState {
-    pub docker: Docker,
+    /// The link to the container engine. A caller borrows the Docker
+    /// handle for one call.
+    pub engine: engine::Engine,
     pub registry: Registry,
     pub static_store: Arc<StaticStore>,
     pub tls_store: Arc<TlsStore>,
@@ -291,15 +292,7 @@ pub async fn daemon_main() -> Result<()> {
         .context("initializing supervisor")?;
 
     supervisor.configure_managed_broker(args.managed_broker)?;
-    let docker = connect_docker(&args).context("connecting to docker")?;
-    if !args.managed_broker {
-        let version = docker.version().await.context("docker ping/version")?;
-        info!(
-            api_version = version.api_version.as_deref().unwrap_or("?"),
-            server_version = version.version.as_deref().unwrap_or("?"),
-            "connected to docker"
-        );
-    }
+    let (engine, engine_publisher) = engine::channel();
 
     if args.managed_broker {
         anyhow::ensure!(
@@ -313,7 +306,7 @@ pub async fn daemon_main() -> Result<()> {
     }
 
     let runner = runner::Runner::new(
-        docker.clone(),
+        engine.clone(),
         static_store.clone(),
         registry.clone(),
         supervisor.clone(),
@@ -330,7 +323,7 @@ pub async fn daemon_main() -> Result<()> {
     };
 
     let state = DaemonState {
-        docker: docker.clone(),
+        engine: engine.clone(),
         registry: registry.clone(),
         static_store: static_store.clone(),
         runner,
@@ -390,7 +383,7 @@ pub async fn daemon_main() -> Result<()> {
     let ipc = tokio::spawn(ipc_server::run(state.clone()));
     let dashboard = tokio::spawn(dashboard::run(state.clone(), args.dashboard_port));
     let bridge_health_task = bridge_health::run(
-        docker.clone(),
+        engine.clone(),
         bridge_health_shared,
         netbridge_handle.ifindex.clone(),
     );
@@ -408,7 +401,7 @@ pub async fn daemon_main() -> Result<()> {
     let netbridge_state_path = portman_core::paths::netbridge_state_path()?;
     let host_facing_rx = netbridge_handle.phase.clone();
     let netbridge_task = netbridge::run(
-        docker.clone(),
+        engine,
         netbridge_handle,
         netbridge_rx,
         netbridge_phase_tx,
@@ -420,12 +413,21 @@ pub async fn daemon_main() -> Result<()> {
         }
         netbridge_task.await
     });
-    let events = engine::run(docker, state.clone());
-    let events = tokio::spawn(async move {
+    let socket_candidates = match args.docker_socket {
+        Some(path) => vec![path.into()],
+        None => portman_core::paths::docker_socket_candidates(),
+    };
+    let engine_task = engine::run(
+        engine_publisher,
+        socket_candidates,
+        engine::open_socket,
+        state.clone(),
+    );
+    let engine_task = tokio::spawn(async move {
         if managed_broker {
             std::future::pending::<()>().await;
         }
-        events.await
+        engine_task.await
     });
     let dns = tokio::spawn(dns::run(
         state.registry.clone(),
@@ -511,7 +513,10 @@ pub async fn daemon_main() -> Result<()> {
         .context("installing SIGTERM handler")?;
 
     let outcome = tokio::select! {
-        result = events => result.context("docker events task panicked").and_then(|r| r),
+        result = engine_task => match result {
+            Ok(never) => match never {},
+            Err(panic) => Err(panic).context("docker engine task panicked"),
+        },
         result = ipc => result.context("ipc server task panicked").and_then(|r| r),
         result = dashboard => result.context("dashboard task panicked").and_then(|r| r),
         result = dns => result.context("dns task panicked").and_then(|r| r),
@@ -606,51 +611,6 @@ fn raise_fd_limit() {
             "cannot raise RLIMIT_NOFILE; keeping the inherited limit"
         ),
     }
-}
-
-fn connect_docker(args: &Args) -> Result<Docker> {
-    if args.managed_broker {
-        // Keep the shared state shape, with no capability to reach an engine.
-        return Ok(Docker::connect_with_socket(
-            "/dev/null",
-            1,
-            bollard::API_DEFAULT_VERSION,
-        )?);
-    }
-    if let Some(path) = args.docker_socket.as_deref() {
-        info!(socket = path, "using configured docker socket");
-        return Ok(Docker::connect_with_socket(
-            path,
-            120,
-            bollard::API_DEFAULT_VERSION,
-        )?);
-    }
-
-    // Auto-detect: honor DOCKER_HOST first, then try common macOS runtime
-    // socket locations relative to the invoking user's home (SUDO_USER-aware
-    // so this works under `sudo -E` where $HOME is rewritten to /var/root).
-    // Candidate list is defined in portman_core so the netbridge crate and
-    // any future auxiliary binaries use exactly the same resolution order.
-    for path in portman_core::paths::docker_socket_candidates() {
-        if path.exists() {
-            info!(socket = %path.display(), "auto-detected docker socket");
-            let Some(s) = path.to_str() else {
-                continue;
-            };
-            return Ok(Docker::connect_with_socket(
-                s,
-                120,
-                bollard::API_DEFAULT_VERSION,
-            )?);
-        }
-    }
-
-    anyhow::bail!(
-        "no docker socket found. Tried DOCKER_HOST, ~/.colima/default/docker.sock, \
-         ~/.config/colima/default/docker.sock, ~/.orbstack/run/docker.sock, \
-         ~/.docker/run/docker.sock, /var/run/docker.sock. \
-         Set PORTMAN_DOCKER_SOCKET or start a runtime (e.g. `colima start`)."
-    )
 }
 
 /// The daemon runs as root under launchd/systemd, but the data dir must be

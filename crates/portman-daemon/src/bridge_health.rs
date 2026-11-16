@@ -2,8 +2,8 @@
 //!
 //! Every 5 seconds:
 //!   1. Ask Docker for the set of networks that currently have Portman-labelled
-//!      containers on them (via `bollard`, reusing the socket the daemon already
-//!      opened for the container-events watcher).
+//!      containers on them. With no engine connected the assessment is
+//!      `offline` and nothing is asked.
 //!   2. For each such network, read its subnet(s) and ask the macOS
 //!      routing table whether that subnet is routed via the active bridge
 //!      interface (or a live legacy `utun` when the native bridge is disabled).
@@ -26,6 +26,8 @@ use std::time::Duration;
 use bollard::query_parameters::{ListContainersOptionsBuilder, ListNetworksOptionsBuilder};
 use bollard::Docker;
 use tracing::{debug, warn};
+
+use crate::engine::Engine;
 
 /// How often to re-assess. 5s matches the menubar's own refresh cadence;
 /// a bridge flap surfaces in the UI within the next poll cycle.
@@ -50,7 +52,7 @@ pub(crate) fn new_shared() -> Shared {
 /// `main` awaits — the loop itself is infinite so the function never
 /// actually returns `Ok`.
 pub(crate) async fn run(
-    docker: Docker,
+    engine: Engine,
     shared: Shared,
     bridge_ifindex: crate::upstream::BridgeIfIndex,
 ) -> anyhow::Result<()> {
@@ -60,7 +62,7 @@ pub(crate) async fn run(
     // "unknown" for 5s.
     loop {
         ticker.tick().await;
-        let assessment = assess(&docker, &bridge_ifindex).await;
+        let assessment = assess(&engine, &bridge_ifindex).await;
         debug!(
             assessment = assessment.as_str(),
             "bridge health assessment updated"
@@ -72,13 +74,16 @@ pub(crate) async fn run(
 }
 
 async fn assess(
-    docker: &Docker,
+    engine: &Engine,
     bridge_ifindex: &crate::upstream::BridgeIfIndex,
 ) -> BridgeAssessment {
+    let Ok(docker) = engine.docker() else {
+        return BridgeAssessment::Offline;
+    };
     // Find docker networks that currently have at least one Portman-labelled
     // container on them. Unrelated compose/default networks are not Portman
     // health inputs.
-    let subnets = match subnets_with_portman_containers(docker).await {
+    let subnets = match subnets_with_portman_containers(&docker).await {
         Ok(s) => s,
         Err(err) => {
             warn!(error = %err, "bridge health: docker unreachable");
@@ -265,6 +270,14 @@ mod tests {
             RouteState::Missing,
             "a live VPN interface does not prove Portman's route is healthy"
         );
+    }
+
+    #[tokio::test]
+    async fn with_no_engine_the_bridge_is_offline() {
+        let (engine, _) = crate::engine::channel();
+        let ifindex = crate::upstream::new_bridge_ifindex();
+
+        assert_eq!(assess(&engine, &ifindex).await, BridgeAssessment::Offline);
     }
 
     #[test]

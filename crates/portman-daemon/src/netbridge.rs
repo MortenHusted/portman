@@ -27,7 +27,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use bollard::Docker;
 use portman_core::netbridge_state::{self, NetbridgeState};
 use portman_core::NetbridgeMode;
 use portman_netbridge::runtime::{Runtime, RuntimeOptions};
@@ -463,11 +462,11 @@ pub(crate) trait Bridge {
     async fn shutdown_and_remove_network(self);
 }
 
-impl BridgeStarter for Docker {
+impl BridgeStarter for crate::engine::Engine {
     type Bridge = Runtime;
 
     async fn start_bridge(&self, mode: NetbridgeMode, host_kp: &Keypair) -> Result<Runtime> {
-        Runtime::start_with_keypair(self.clone(), RuntimeOptions { mode }, host_kp).await
+        Runtime::start_with_keypair(self.docker()?, RuntimeOptions { mode }, host_kp).await
     }
 }
 

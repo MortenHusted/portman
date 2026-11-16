@@ -8,6 +8,7 @@ use bollard::models::{
     ContainerStatsResponse, ContainerSummary,
 };
 use bollard::query_parameters::{ListContainersOptionsBuilder, StatsOptionsBuilder};
+use bollard::Docker;
 use futures_util::StreamExt;
 use portman_protocol::{
     ContainerResourceUsage, HistoryPoint, ResourceSeries, ResourceUsageSnapshot,
@@ -217,8 +218,8 @@ pub(crate) async fn collect(state: &DaemonState) -> Result<ResourceUsageSnapshot
         .all(true)
         .filters(&filters)
         .build();
-    let summaries = state
-        .docker
+    let docker = &state.engine.docker()?;
+    let summaries = docker
         .list_containers(Some(options))
         .await
         .context("listing running containers")?;
@@ -240,7 +241,7 @@ pub(crate) async fn collect(state: &DaemonState) -> Result<ResourceUsageSnapshot
             (
                 id.to_string(),
                 previous,
-                collect_container(state, summary, previous, hosts).await,
+                collect_container(docker, summary, previous, hosts).await,
             )
         })
     }))
@@ -303,14 +304,14 @@ pub(crate) async fn collect(state: &DaemonState) -> Result<ResourceUsageSnapshot
 }
 
 async fn collect_container(
-    state: &DaemonState,
+    docker: &Docker,
     summary: &ContainerSummary,
     previous: Option<ResourceSample>,
     portman_hosts: Vec<String>,
 ) -> (ContainerResourceUsage, Option<ResourceSample>) {
     let id = summary.id.clone().unwrap_or_default();
     let base = ContainerBase::from_summary(summary, portman_hosts);
-    let mut stream = state.docker.stats(
+    let mut stream = docker.stats(
         &id,
         Some(
             StatsOptionsBuilder::default()

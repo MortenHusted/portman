@@ -1,8 +1,12 @@
-//! Container route reconcile. A Docker event only says when to look. One list
-//! of the running containers says which container routes the registry holds.
+//! The daemon's link to the container engine. One task owns the Docker
+//! connection and publishes it as a [`Link`]. While a session lasts, a
+//! Docker event only says when to look, and one list of the running
+//! containers says which container routes the registry holds.
 
 use std::collections::HashMap;
-use std::fmt::Display;
+use std::convert::Infallible;
+use std::fmt::{self, Display};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,16 +16,209 @@ use bollard::query_parameters::{EventsOptionsBuilder, ListContainersOptionsBuild
 use bollard::Docker;
 use futures_util::{Stream, StreamExt};
 use portman_core::{Mode, Registry};
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 use tracing::{debug, info, warn};
 
 use crate::discovery::{self, Container, Skip, Skipped};
 use crate::DaemonState;
 
+/// One unbroken connection to an engine. What is built on an engine records
+/// its session, and is stale once the link holds another one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Session(pub(crate) u64);
+
+/// What the daemon knows about the container engine. [`run`] is the only
+/// writer.
+#[derive(Clone)]
+pub(crate) enum Link {
+    Absent(Absent),
+    Connected { session: Session, docker: Docker },
+}
+
+impl Link {
+    pub(crate) fn session(&self) -> Option<Session> {
+        match self {
+            Link::Absent(_) => None,
+            Link::Connected { session, .. } => Some(*session),
+        }
+    }
+}
+
+/// Why no engine is connected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Absent {
+    /// No connect attempt has ended. The link stays so in managed-broker
+    /// mode, which never polls [`run`].
+    Idle,
+    /// None of the candidate socket paths exists.
+    NoSocket,
+    /// A socket exists and no engine answered on it.
+    Unreachable { socket: PathBuf, error: String },
+}
+
+impl Display for Absent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("docker is not connected: ")?;
+        match self {
+            Absent::Idle => f.write_str("no connect attempt has ended"),
+            Absent::NoSocket => f.write_str(
+                "no docker socket found; start a runtime (e.g. `colima start`) \
+                 or set PORTMAN_DOCKER_SOCKET",
+            ),
+            Absent::Unreachable { socket, error } => {
+                write!(f, "no answer on {}: {error}", socket.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for Absent {}
+
+/// The daemon's handle on the [`Link`]. Cheap to clone.
+#[derive(Clone)]
+pub(crate) struct Engine {
+    link: watch::Receiver<Link>,
+}
+
+/// The handle the daemon shares, and the end that only [`run`] holds.
+pub(crate) fn channel() -> (Engine, watch::Sender<Link>) {
+    let (publisher, link) = watch::channel(Link::Absent(Absent::Idle));
+    (Engine { link }, publisher)
+}
+
+impl Engine {
+    /// The Docker handle for one call. A caller that keeps it talks to an
+    /// engine that may be gone.
+    pub(crate) fn docker(&self) -> Result<Docker, Absent> {
+        match &*self.link.borrow() {
+            Link::Absent(reason) => Err(reason.clone()),
+            Link::Connected { docker, .. } => Ok(docker.clone()),
+        }
+    }
+
+    pub(crate) fn session(&self) -> Option<Session> {
+        self.link.borrow().session()
+    }
+}
+
+/// How long one candidate socket has to answer a connect attempt.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The wait before each connect attempt. The first attempt comes at once,
+/// and the last delay repeats.
+const RECONNECT_DELAYS: [Duration; 5] = [
+    Duration::ZERO,
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
+
+/// A connect attempt that lasts this long, the session it opens included,
+/// starts the delays over. A shorter one moves to the next delay, so an
+/// engine whose sessions end at once is not asked in a tight loop.
+const SETTLED: Duration = Duration::from_secs(10);
+
+/// A handle on the socket at `path`. `None` when bollard refuses the path,
+/// as it does when no file is there.
+pub(crate) fn open_socket(path: &Path) -> Option<Docker> {
+    Docker::connect_with_socket(path.to_str()?, 120, bollard::API_DEFAULT_VERSION).ok()
+}
+
+/// Owns the link for as long as the daemon polls it. Every connect attempt
+/// goes through `candidates` in order until one answers, so a socket that
+/// appears, goes stale or moves to another runtime needs no daemon restart.
+/// The container routes are cleared when an attempt finds no engine. They
+/// stay while a session that ended is replaced by the next one, and the
+/// first list of that session corrects them.
+pub(crate) async fn run(
+    publisher: watch::Sender<Link>,
+    candidates: Vec<PathBuf>,
+    open: impl Fn(&Path) -> Option<Docker>,
+    state: DaemonState,
+) -> Infallible {
+    let mut sessions = 0;
+    let mut attempt = 0;
+    loop {
+        tokio::time::sleep(RECONNECT_DELAYS[attempt.min(RECONNECT_DELAYS.len() - 1)]).await;
+        let began = tokio::time::Instant::now();
+        match connect(&candidates, &open).await {
+            Ok(docker) => {
+                sessions += 1;
+                let session = Session(sessions);
+                info!(session = session.0, "docker session opened");
+                publisher.send_replace(Link::Connected {
+                    session,
+                    docker: docker.clone(),
+                });
+                serve(&docker, &state).await;
+            }
+            Err(reason) => lose(&publisher, &state, reason),
+        }
+        attempt = if began.elapsed() >= SETTLED {
+            0
+        } else {
+            attempt + 1
+        };
+    }
+}
+
+/// The first candidate that answers. When none does, the reason names the
+/// first socket that exists.
+async fn connect(
+    candidates: &[PathBuf],
+    open: &impl Fn(&Path) -> Option<Docker>,
+) -> Result<Docker, Absent> {
+    let mut reason = Absent::NoSocket;
+    for socket in candidates {
+        let Some(docker) = open(socket) else {
+            continue;
+        };
+        let error = match tokio::time::timeout(PROBE_TIMEOUT, docker.version()).await {
+            Ok(Ok(version)) => {
+                info!(
+                    socket = %socket.display(),
+                    api_version = version.api_version.as_deref().unwrap_or("?"),
+                    server_version = version.version.as_deref().unwrap_or("?"),
+                    "connected to docker"
+                );
+                return Ok(docker);
+            }
+            Ok(Err(err)) => err.to_string(),
+            Err(_) => format!("no answer in {} s", PROBE_TIMEOUT.as_secs()),
+        };
+        if reason == Absent::NoSocket {
+            reason = Absent::Unreachable {
+                socket: socket.clone(),
+                error,
+            };
+        }
+    }
+    Err(reason)
+}
+
+/// Publishes that no engine is connected and clears the container routes,
+/// which would point at the containers of an engine that is gone.
+fn lose(publisher: &watch::Sender<Link>, state: &DaemonState, reason: Absent) {
+    let changed = publisher.send_if_modified(|link| {
+        let known = matches!(link, Link::Absent(was) if *was == reason);
+        if !known {
+            *link = Link::Absent(reason.clone());
+        }
+        !known
+    });
+    if changed {
+        warn!(%reason, "no container engine");
+    }
+    for entry in state.registry.replace_container_entries(Vec::new()).removed {
+        info!(host = %entry.host, id = entry.container_id, "unregistered");
+    }
+}
+
 /// Delays between lists that no wake caused. The loop takes these steps while
-/// a labelled container has no address, after a list that failed, and for the
-/// lists a network event owes. Each delay runs from the end of the list before
-/// it, and a wake starts the steps over.
+/// a labelled container has no address, and for the lists a network event
+/// owes. Each delay runs from the end of the list before it, and a wake
+/// starts the steps over.
 const RELIST_DELAYS: [Duration; 5] = [
     Duration::from_millis(250),
     Duration::from_millis(500),
@@ -86,8 +283,8 @@ impl Relist {
         }
     }
 
-    /// `retry` says that the last list failed or left a container waiting for
-    /// an address. `None` means wait for a wake.
+    /// `retry` says that the last list left a container waiting for an
+    /// address. `None` means wait for a wake.
     fn delay(self, retry: bool) -> Option<Duration> {
         RELIST_DELAYS
             .get(self.attempt)
@@ -96,8 +293,9 @@ impl Relist {
     }
 }
 
-/// The daemon's registry and the handle that wakes [`run`]. The registry
-/// wakes it for every hostname it releases.
+/// The daemon's registry and the handle that wakes the reconcile of the
+/// session that is open. The registry wakes it for every hostname it
+/// releases.
 pub(crate) fn registry_with_resync() -> (Registry, Arc<Notify>) {
     let resync = Arc::new(Notify::new());
     let wake = resync.clone();
@@ -105,7 +303,8 @@ pub(crate) fn registry_with_resync() -> (Registry, Arc<Notify>) {
     (registry, resync)
 }
 
-pub(crate) async fn run(docker: Docker, state: DaemonState) -> Result<()> {
+/// One session. It returns when the event stream ends or a list fails.
+async fn serve(docker: &Docker, state: &DaemonState) {
     // bollard sends the request on the first poll, so the subscription cannot
     // be open before the first list. `since` makes the engine replay its event
     // buffer in the same step as the subscription, so an event from that gap
@@ -118,16 +317,16 @@ pub(crate) async fn run(docker: Docker, state: DaemonState) -> Result<()> {
     let mut reported = Vec::new();
     let mut relist = Relist::default();
     loop {
-        let retry = match reconcile(&docker, &state, &mut reported).await {
+        let waiting = match reconcile(docker, state, &mut reported).await {
             Ok(waiting) => waiting,
             Err(err) => {
                 warn!(error = format!("{err:#}"), "container reconcile failed");
-                true
+                return;
             }
         };
-        let Some(next) = wait(&mut events, &state.container_resync, relist, retry).await else {
+        let Some(next) = wait(&mut events, &state.container_resync, relist, waiting).await else {
             warn!("docker events stream ended");
-            return Ok(());
+            return;
         };
         relist = next;
     }
@@ -274,10 +473,14 @@ fn trigger(event: &EventMessage) -> Option<Trigger> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    use bollard::models::{ContainerSummary, ContainerSummaryNetworkSettings, EndpointSettings};
     use futures_util::{stream, FutureExt};
     use hyper_util::rt::TokioIo;
+    use portman_core::Source;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn event(typ: EventMessageTypeEnum, action: &str) -> EventMessage {
@@ -465,49 +668,121 @@ mod tests {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Asked {
+        Version,
         List,
         Events,
     }
 
+    /// What is at the fake engine's socket path.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Socket {
+        Missing,
+        /// A socket file that no engine listens on.
+        Stale,
+        /// An engine that takes a request and never answers it.
+        Silent,
+        Serving,
+    }
+
     /// A Docker engine inside the test. bollard reaches it over in-memory
     /// pipes, because the paused clock runs ahead of a real socket. A list
-    /// takes `list_ms` and holds no containers. The events response follows
-    /// `replay`: each step waits its milliseconds and then sends its events
-    /// as one read. The response ends after the last step.
-    struct Engine {
+    /// takes `list_ms`. The events response follows `replay`: each step
+    /// waits its milliseconds and then sends its events as one read. After
+    /// the last step the response ends, or with `holds_streams` it stays
+    /// open until the test ends it.
+    struct FakeEngine {
         started: tokio::time::Instant,
         list_ms: u64,
         replay: Vec<(u64, Vec<EventMessage>)>,
-        asked: std::sync::Mutex<Vec<(u128, Asked)>>,
+        holds_streams: bool,
+        socket: Mutex<Socket>,
+        /// The body of a list response. `None` fails the list.
+        listed: Mutex<Option<String>>,
+        stream_ends: watch::Sender<u64>,
+        probed: Mutex<Vec<u128>>,
+        asked: Mutex<Vec<(u128, Asked)>>,
+        /// Runs when a request arrives, before the engine answers it.
+        on_request: Mutex<Option<Box<dyn Fn() + Send>>>,
     }
 
-    impl Engine {
+    impl FakeEngine {
+        /// An engine that serves, lists no containers, and ends each events
+        /// response after `replay`.
         fn start(list_ms: u64, replay: Vec<(u64, Vec<EventMessage>)>) -> (Docker, Arc<Self>) {
-            let engine = Arc::new(Self {
+            let engine = Self::new(list_ms, replay, false, Socket::Serving);
+            (engine.open().unwrap(), engine)
+        }
+
+        /// An engine whose events responses stay open, for a test that
+        /// moves it between socket states.
+        fn at(socket: Socket) -> Arc<Self> {
+            Self::new(0, vec![], true, socket)
+        }
+
+        fn new(
+            list_ms: u64,
+            replay: Vec<(u64, Vec<EventMessage>)>,
+            holds_streams: bool,
+            socket: Socket,
+        ) -> Arc<Self> {
+            Arc::new(Self {
                 started: tokio::time::Instant::now(),
                 list_ms,
                 replay,
+                holds_streams,
+                socket: Mutex::new(socket),
+                listed: Mutex::new(Some("[]".into())),
+                stream_ends: watch::Sender::new(0),
+                probed: Default::default(),
                 asked: Default::default(),
-            });
-            let serving = engine.clone();
-            let docker = Docker::connect_with_custom_transport(
-                move |request: bollard::BollardRequest| {
-                    let engine = serving.clone();
-                    async move {
-                        let (client, server) = tokio::io::duplex(64 * 1024);
-                        tokio::spawn(engine.serve(server));
-                        let (mut sender, connection) =
-                            hyper::client::conn::http1::handshake(TokioIo::new(client)).await?;
-                        tokio::spawn(connection);
-                        Ok(sender.send_request(request).await?)
+                on_request: Default::default(),
+            })
+        }
+
+        fn now_ms(&self) -> u128 {
+            self.started.elapsed().as_millis()
+        }
+
+        fn socket(&self) -> Socket {
+            *self.socket.lock().unwrap()
+        }
+
+        /// Stands in for [`open_socket`] at this engine's socket path.
+        fn open(self: &Arc<Self>) -> Option<Docker> {
+            self.probed.lock().unwrap().push(self.now_ms());
+            if self.socket() == Socket::Missing {
+                return None;
+            }
+            let engine = self.clone();
+            let transport = move |request: bollard::BollardRequest| {
+                let engine = engine.clone();
+                async move {
+                    if let Some(on_request) = &*engine.on_request.lock().unwrap() {
+                        on_request();
                     }
-                },
+                    match engine.socket() {
+                        Socket::Missing | Socket::Stale => {
+                            let refused = std::io::ErrorKind::ConnectionRefused;
+                            return Err(std::io::Error::from(refused).into());
+                        }
+                        Socket::Silent => std::future::pending().await,
+                        Socket::Serving => {}
+                    }
+                    let (client, server) = tokio::io::duplex(64 * 1024);
+                    tokio::spawn(engine.serve(server));
+                    let (mut sender, connection) =
+                        hyper::client::conn::http1::handshake(TokioIo::new(client)).await?;
+                    tokio::spawn(connection);
+                    Ok(sender.send_request(request).await?)
+                }
+            };
+            let docker = Docker::connect_with_custom_transport(
+                transport,
                 Some("http://engine.test"),
                 5,
                 bollard::API_DEFAULT_VERSION,
-            )
-            .unwrap();
-            (docker, engine)
+            );
+            Some(docker.unwrap())
         }
 
         async fn serve(self: Arc<Self>, mut pipe: tokio::io::DuplexStream) {
@@ -517,14 +792,25 @@ mod tests {
             }
             let head = String::from_utf8(head).unwrap();
             let request_line = head.lines().next().unwrap();
-            let at = self.started.elapsed().as_millis();
-            if request_line.contains("/containers/json?") {
-                self.asked.lock().unwrap().push((at, Asked::List));
+            let asked = |asked| self.asked.lock().unwrap().push((self.now_ms(), asked));
+            if request_line.contains("/version") {
+                asked(Asked::Version);
+                let version = r#"{"Version":"29.2.1","ApiVersion":"1.49"}"#;
+                respond(&mut pipe, "200 OK", version).await;
+            } else if request_line.contains("/containers/json?") {
+                asked(Asked::List);
                 tokio::time::sleep(Duration::from_millis(self.list_ms)).await;
-                let listed = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n[]";
-                pipe.write_all(listed).await.unwrap();
+                let listed = self.listed.lock().unwrap().clone();
+                match listed {
+                    Some(containers) => respond(&mut pipe, "200 OK", &containers).await,
+                    None => {
+                        let failed = r#"{"message":"the engine is shutting down"}"#;
+                        respond(&mut pipe, "500 Internal Server Error", failed).await;
+                    }
+                }
             } else if request_line.contains("/events?") {
-                self.asked.lock().unwrap().push((at, Asked::Events));
+                asked(Asked::Events);
+                let mut stream_ends = self.stream_ends.subscribe();
                 let streaming = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n";
                 pipe.write_all(streaming).await.unwrap();
                 for (after_ms, events) in &self.replay {
@@ -538,58 +824,128 @@ mod tests {
                         pipe.write_all(read.as_bytes()).await.unwrap();
                     }
                 }
+                if self.holds_streams {
+                    stream_ends.changed().await.unwrap();
+                    if self.socket() != Socket::Serving {
+                        return;
+                    }
+                }
                 pipe.write_all(b"0\r\n\r\n").await.unwrap();
             } else {
-                panic!("the loop asked for {request_line}");
+                panic!("the daemon asked for {request_line}");
             }
+        }
+
+        fn set_socket(&self, socket: Socket) {
+            *self.socket.lock().unwrap() = socket;
+        }
+
+        fn list(&self, containers: &[ContainerSummary]) {
+            *self.listed.lock().unwrap() = Some(serde_json::to_string(containers).unwrap());
+        }
+
+        fn fail_lists(&self) {
+            *self.listed.lock().unwrap() = None;
+        }
+
+        /// Ends the events responses that are open. An engine that serves
+        /// ends them as a response ends. Any other cuts them off.
+        fn end_streams(&self) {
+            self.stream_ends.send_modify(|ended| *ended += 1);
+        }
+
+        /// The engine goes away and takes its socket with it.
+        fn vanish(&self) {
+            self.set_socket(Socket::Missing);
+            self.end_streams();
+        }
+
+        fn on_request(&self, observe: impl Fn() + Send + 'static) {
+            *self.on_request.lock().unwrap() = Some(Box::new(observe));
+        }
+
+        fn probes(&self) -> Vec<u128> {
+            self.probed.lock().unwrap().clone()
         }
 
         fn asked(&self) -> Vec<(u128, Asked)> {
             self.asked.lock().unwrap().clone()
         }
 
-        fn lists(&self) -> Vec<u128> {
+        fn times(&self, wanted: Asked) -> Vec<u128> {
             self.asked()
                 .into_iter()
-                .filter_map(|(at, asked)| (asked == Asked::List).then_some(at))
+                .filter_map(|(at, asked)| (asked == wanted).then_some(at))
                 .collect()
+        }
+
+        fn lists(&self) -> Vec<u128> {
+            self.times(Asked::List)
         }
     }
 
-    /// Runs the loop against an engine until the events response ends, and
-    /// returns that engine. `release_at_ms` frees a hostname that many
-    /// milliseconds in, which wakes the loop. The test fails when the loop
-    /// has not ended one hour later, which takes no real time on the paused
-    /// clock.
+    async fn respond(pipe: &mut tokio::io::DuplexStream, status: &str, json: &str) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{json}",
+            json.len()
+        );
+        pipe.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    /// Runs one session against an engine until the events response ends,
+    /// and returns that engine. `release_at_ms` frees a hostname that many
+    /// milliseconds in, which wakes the reconcile. The test fails when the
+    /// session has not ended one hour later, which takes no real time on
+    /// the paused clock.
     async fn run_to_the_end(
         list_ms: u64,
         replay: Vec<(u64, Vec<EventMessage>)>,
         release_at_ms: Option<u64>,
-    ) -> Arc<Engine> {
-        let (docker, engine) = Engine::start(list_ms, replay);
+    ) -> Arc<FakeEngine> {
+        let (docker, engine) = FakeEngine::start(list_ms, replay);
         let dir = tempfile::tempdir().unwrap();
         let state = crate::handlers::tests::test_state(&dir);
-        let running = tokio::spawn(run(docker, state.clone()));
+        let session = {
+            let state = state.clone();
+            tokio::spawn(async move { serve(&docker, &state).await })
+        };
 
         if let Some(release_at_ms) = release_at_ms {
-            state.registry.upsert(portman_core::Entry {
-                host: "api.acme.test".into(),
-                target: "127.0.0.1:3070".into(),
-                source: portman_core::Source::Static,
-                mode: Mode::Http,
-                container_id: None,
-                project: None,
-                egress: None,
-            });
+            state.registry.upsert(static_route("api.acme.test"));
             tokio::time::sleep(Duration::from_millis(release_at_ms)).await;
             state.registry.remove("api.acme.test");
         }
-        tokio::time::timeout(Duration::from_secs(3600), running)
+        tokio::time::timeout(HOUR, session)
             .await
-            .expect("the loop ends when the event stream ends")
-            .unwrap()
+            .expect("the session ends when the event stream ends")
             .unwrap();
         engine
+    }
+
+    /// A handle whose link is in its first session, with an engine that
+    /// serves.
+    pub(crate) fn connected() -> Engine {
+        let (engine, publisher) = channel();
+        let (docker, _) = FakeEngine::start(0, vec![]);
+        publisher.send_replace(Link::Connected {
+            session: Session(1),
+            docker,
+        });
+        engine
+    }
+
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    fn static_route(host: &str) -> portman_core::Entry {
+        portman_core::Entry {
+            host: host.into(),
+            target: "127.0.0.1:3070".into(),
+            source: Source::Static,
+            mode: Mode::Http,
+            container_id: None,
+            project: None,
+            egress: None,
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -626,14 +982,15 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_loop_ends_when_the_event_stream_ends() {
+    async fn the_session_ends_when_the_event_stream_ends() {
         let engine = run_to_the_end(0, vec![(30, vec![])], None).await;
 
         assert_eq!(engine.lists(), [0]);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_stream_that_ends_in_the_quiet_time_gets_the_list_for_its_burst_and_ends_the_loop() {
+    async fn a_stream_that_ends_in_the_quiet_time_gets_the_list_for_its_burst_and_ends_the_session()
+    {
         let die = vec![event(EventMessageTypeEnum::CONTAINER, "die")];
 
         let engine = run_to_the_end(0, vec![(0, die), (20, vec![])], None).await;
@@ -785,5 +1142,281 @@ mod tests {
 
         assert_eq!(list_times(events).await.len(), 1);
         assert!(logs.text().contains("connection reset"), "{}", logs.text());
+    }
+
+    const SOCKET: &str = "/run/demo/docker.sock";
+    const OTHER_SOCKET: &str = "/run/acme/docker.sock";
+    const WEB: &str = "web.demo.test";
+    const API: &str = "api.demo.test";
+
+    fn running(host: &str, address: &str) -> ContainerSummary {
+        let endpoint = EndpointSettings {
+            ip_address: Some(address.into()),
+            ..Default::default()
+        };
+        ContainerSummary {
+            id: Some(ID.into()),
+            labels: Some(HashMap::from([(
+                discovery::LABEL_HOST.to_string(),
+                host.to_string(),
+            )])),
+            network_settings: Some(ContainerSummaryNetworkSettings {
+                networks: Some(HashMap::from([("bridge".to_string(), endpoint)])),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The engine task over fake engines, each at its socket path.
+    struct Rig {
+        state: DaemonState,
+        link: watch::Receiver<Link>,
+        task: tokio::task::JoinHandle<Infallible>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Rig {
+        /// `engines` are the socket candidates, in the order the task
+        /// tries them.
+        fn boot(engines: Vec<(&'static str, Arc<FakeEngine>)>) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let (engine, publisher) = channel();
+            let state = DaemonState {
+                engine,
+                ..crate::handlers::tests::test_state(&dir)
+            };
+            state.known_tlds.write().unwrap().insert("test".into());
+            let link = publisher.subscribe();
+            let candidates = engines.iter().map(|(path, _)| path.into()).collect();
+            let open = move |path: &Path| {
+                let (_, engine) = engines.iter().find(|(at, _)| Path::new(at) == path)?;
+                engine.open()
+            };
+            let task = tokio::spawn(run(publisher, candidates, open, state.clone()));
+            Self {
+                state,
+                link,
+                task,
+                _dir: dir,
+            }
+        }
+
+        /// A rig in its first session, with [`WEB`] routed to a container
+        /// of the engine at [`SOCKET`].
+        async fn connected() -> (Self, Arc<FakeEngine>) {
+            let engine = FakeEngine::at(Socket::Serving);
+            engine.list(&[running(WEB, "172.17.0.2")]);
+            let mut rig = Self::boot(vec![(SOCKET, engine.clone())]);
+            rig.session(1).await;
+            assert_eq!(rig.target(WEB).as_deref(), Some("172.17.0.2:80"));
+            (rig, engine)
+        }
+
+        /// Waits for the session with this number and for its first list.
+        async fn session(&mut self, number: u64) {
+            let wanted = Some(Session(number));
+            tokio::time::timeout(HOUR, self.link.wait_for(|link| link.session() == wanted))
+                .await
+                .unwrap_or_else(|_| panic!("the link never reached session {number}"))
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        /// Waits until a connect attempt has found no engine.
+        async fn absent(&mut self) -> Absent {
+            let found_none =
+                |link: &Link| matches!(link, Link::Absent(why) if *why != Absent::Idle);
+            let link = tokio::time::timeout(HOUR, self.link.wait_for(found_none))
+                .await
+                .expect("the link never reported an absent engine")
+                .unwrap();
+            match &*link {
+                Link::Absent(reason) => reason.clone(),
+                Link::Connected { .. } => unreachable!(),
+            }
+        }
+
+        /// The target of the container route for `host`.
+        fn target(&self, host: &str) -> Option<String> {
+            let entry = self.state.registry.get(host)?;
+            (entry.source == Source::Container).then_some(entry.target)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_no_socket_the_link_is_absent_and_the_task_keeps_running() {
+        let mut rig = Rig::boot(vec![(SOCKET, FakeEngine::at(Socket::Missing))]);
+
+        assert_eq!(rig.absent().await, Absent::NoSocket);
+        assert_eq!(rig.state.engine.docker().err(), Some(Absent::NoSocket));
+        assert_eq!(rig.state.engine.session(), None);
+
+        tokio::time::sleep(HOUR).await;
+        assert!(!rig.task.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_absent_engine_is_tried_again_after_a_delay_that_grows_to_two_seconds() {
+        let engine = FakeEngine::at(Socket::Missing);
+        let _rig = Rig::boot(vec![(SOCKET, engine.clone())]);
+
+        tokio::time::sleep(Duration::from_secs(6)).await;
+
+        assert_eq!(engine.probes(), [0, 250, 750, 1750, 3750, 5750]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_engine_that_appears_is_connected_and_its_labelled_container_is_routed() {
+        let engine = FakeEngine::at(Socket::Missing);
+        engine.list(&[running(WEB, "172.17.0.2")]);
+        let mut rig = Rig::boot(vec![(SOCKET, engine.clone())]);
+        rig.absent().await;
+        assert_eq!(rig.target(WEB), None);
+
+        engine.set_socket(Socket::Serving);
+        rig.session(1).await;
+
+        assert_eq!(rig.target(WEB).as_deref(), Some("172.17.0.2:80"));
+        assert!(rig.state.engine.docker().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_engine_clears_container_routes_and_keeps_a_static_route() {
+        let (mut rig, engine) = Rig::connected().await;
+        rig.state.registry.upsert(static_route("api.acme.test"));
+
+        engine.vanish();
+
+        assert_eq!(rig.absent().await, Absent::NoSocket);
+        assert_eq!(rig.target(WEB), None);
+        assert_eq!(
+            rig.state.registry.get("api.acme.test"),
+            Some(static_route("api.acme.test"))
+        );
+        assert_eq!(rig.state.engine.docker().err(), Some(Absent::NoSocket));
+        tokio::time::sleep(HOUR).await;
+        assert!(!rig.task.is_finished(), "the task ended with the engine");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_returning_engine_gets_a_new_session_and_its_routes_return() {
+        let (mut rig, engine) = Rig::connected().await;
+        engine.vanish();
+        rig.absent().await;
+
+        engine.list(&[running(WEB, "172.17.0.9")]);
+        engine.set_socket(Socket::Serving);
+        rig.session(2).await;
+
+        assert_eq!(rig.target(WEB).as_deref(), Some("172.17.0.9:80"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_ends_while_the_engine_answers_gets_a_new_session_and_no_route_is_gone() {
+        // (how long the first session lasted, the wait before the reconnect)
+        let cases = [
+            (SETTLED, Duration::ZERO),
+            (Duration::from_secs(1), RECONNECT_DELAYS[1]),
+        ];
+        for (lasted, reconnect_after) in cases {
+            let (mut rig, engine) = Rig::connected().await;
+            let routed_at_each_request = Arc::new(Mutex::new(Vec::new()));
+            engine.on_request({
+                let (state, seen) = (rig.state.clone(), routed_at_each_request.clone());
+                move || {
+                    let routed = state.registry.get(WEB).is_some();
+                    let connected = state.engine.session().is_some();
+                    seen.lock().unwrap().push(routed && connected);
+                }
+            });
+            tokio::time::sleep(lasted).await;
+
+            let ended_at = engine.now_ms();
+            engine.end_streams();
+            rig.session(2).await;
+
+            assert_eq!(
+                engine.times(Asked::Version).last(),
+                Some(&(ended_at + reconnect_after.as_millis())),
+                "{lasted:?}"
+            );
+            assert_eq!(*routed_at_each_request.lock().unwrap(), [true; 3]);
+            assert_eq!(rig.target(WEB).as_deref(), Some("172.17.0.2:80"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_list_ends_the_session_and_sessions_that_end_at_once_come_at_a_growing_delay()
+    {
+        let (mut rig, engine) = Rig::connected().await;
+        tokio::time::sleep(SETTLED).await;
+
+        engine.fail_lists();
+        let failed_at = engine.now_ms();
+        rig.state.container_resync.notify_one();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+
+        let connects: Vec<u128> = engine
+            .times(Asked::Version)
+            .into_iter()
+            .filter_map(|at| at.checked_sub(failed_at))
+            .collect();
+        assert_eq!(connects, [0, 250, 750, 1750, 3750, 5750]);
+        assert_eq!(rig.state.engine.session(), Some(Session(7)));
+        assert_eq!(rig.target(WEB).as_deref(), Some("172.17.0.2:80"));
+
+        engine.list(&[running(API, "172.17.0.3")]);
+        rig.session(8).await;
+
+        assert_eq!(rig.target(API).as_deref(), Some("172.17.0.3:80"));
+        assert_eq!(rig.target(WEB), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_socket_is_skipped_for_a_candidate_that_answers() {
+        let stale = FakeEngine::at(Socket::Stale);
+        let live = FakeEngine::at(Socket::Serving);
+        live.list(&[running(WEB, "172.17.0.2")]);
+        let mut rig = Rig::boot(vec![(OTHER_SOCKET, stale), (SOCKET, live)]);
+
+        rig.session(1).await;
+
+        assert_eq!(rig.target(WEB).as_deref(), Some("172.17.0.2:80"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sockets_that_no_engine_answers_on_are_reported_with_the_first_of_them() {
+        let started = tokio::time::Instant::now();
+        let mut rig = Rig::boot(vec![
+            ("/run/missing/docker.sock", FakeEngine::at(Socket::Missing)),
+            (SOCKET, FakeEngine::at(Socket::Silent)),
+            (OTHER_SOCKET, FakeEngine::at(Socket::Stale)),
+        ]);
+
+        let reason = rig.absent().await;
+
+        assert!(
+            matches!(&reason, Absent::Unreachable { socket, .. } if socket == Path::new(SOCKET)),
+            "{reason:?}"
+        );
+        assert_eq!(started.elapsed(), PROBE_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn when_one_runtime_stops_and_another_starts_the_link_moves_to_it() {
+        let first = FakeEngine::at(Socket::Serving);
+        first.list(&[running(WEB, "172.17.0.2")]);
+        let second = FakeEngine::at(Socket::Missing);
+        second.list(&[running(API, "172.18.0.2")]);
+        let engines = vec![(SOCKET, first.clone()), (OTHER_SOCKET, second.clone())];
+        let mut rig = Rig::boot(engines);
+        rig.session(1).await;
+
+        second.set_socket(Socket::Serving);
+        first.vanish();
+        rig.session(2).await;
+
+        assert_eq!(rig.target(API).as_deref(), Some("172.18.0.2:80"));
+        assert_eq!(rig.target(WEB), None);
     }
 }

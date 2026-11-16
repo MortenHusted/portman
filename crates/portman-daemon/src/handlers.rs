@@ -789,23 +789,9 @@ pub(crate) mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    /// A DaemonState over temp stores and a lazy (never-connected) Docker
-    /// handle — enough to exercise dispatch arms that don't touch Docker.
+    /// A DaemonState over temp stores, with no container engine.
     pub(crate) fn test_state(dir: &TempDir) -> DaemonState {
-        let docker = {
-            // bollard checks the socket path exists at construction; give it
-            // a real (never-accepting) socket.
-            let sock = dir.path().join("docker.sock");
-            let _listener = Box::leak(Box::new(
-                std::os::unix::net::UnixListener::bind(&sock).unwrap(),
-            ));
-            bollard::Docker::connect_with_socket(
-                sock.to_str().unwrap(),
-                5,
-                bollard::API_DEFAULT_VERSION,
-            )
-            .expect("lazy docker handle")
-        };
+        let (engine, _) = crate::engine::channel();
         let (registry, container_resync) = crate::engine::registry_with_resync();
         let static_store =
             Arc::new(portman_core::StaticStore::load(dir.path().join("static.json")).unwrap());
@@ -831,14 +817,14 @@ pub(crate) mod tests {
             Arc::new(crate::supervisor::NoRoutes),
         );
         let runner = crate::runner::Runner::new(
-            docker.clone(),
+            engine.clone(),
             static_store.clone(),
             registry.clone(),
             supervisor.clone(),
         );
         let (netbridge_handle, _rx, _phase_tx) = crate::netbridge::handle_pair();
         DaemonState {
-            docker,
+            engine,
             registry,
             static_store,
             tls_store,

@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use bollard::Docker;
 use portman_core::NetbridgeMode;
 use tokio::sync::{mpsc, watch, RwLock};
 
@@ -66,7 +65,7 @@ pub(crate) fn handle_pair() -> (Handle, mpsc::Receiver<Control>, watch::Sender<B
 }
 
 pub(crate) async fn run(
-    _docker: Docker,
+    _engine: crate::engine::Engine,
     handle: Handle,
     mut rx: mpsc::Receiver<Control>,
     _phase_tx: watch::Sender<BridgePhase>,
