@@ -371,10 +371,8 @@ async fn converge<E: BridgeEngine>(
             attempts = Attempts::new();
             owed = Some(Leftovers::SetupContainer);
             if let (Some(session), Some(running)) = (session, running.as_mut()) {
-                if engine
-                    .runs_setup_container_of(session, &running.bridge)
-                    .await
-                {
+                let setup_container = running.bridge.setup_container_id();
+                if engine.runs_container(session, setup_container).await {
                     info!(
                         session = session.0,
                         "netbridge kept for a new docker session"
@@ -535,10 +533,10 @@ pub(crate) trait BridgeEngine {
         host_kp: &Keypair,
     ) -> Result<Self::Bridge>;
 
-    /// Whether the engine of `session` runs the setup container that
-    /// `bridge` started. False when the engine does not say, and when
-    /// another session exists at the call.
-    async fn runs_setup_container_of(&self, session: Session, bridge: &Self::Bridge) -> bool;
+    /// Whether the engine of `session` runs the container with this id.
+    /// False when the engine does not say, and when another session exists
+    /// at the call.
+    async fn runs_container(&self, session: Session, id: &str) -> bool;
 
     /// Removes `leftovers` that carry portman's label from the engine of
     /// `session`. Does nothing when another session exists at the call, or
@@ -550,6 +548,8 @@ pub(crate) trait BridgeEngine {
 /// that a test can hold one without root.
 pub(crate) trait Bridge {
     fn utun_name(&self) -> &str;
+    /// The engine's id of the setup container that the bridge started.
+    fn setup_container_id(&self) -> &str;
     /// Stops the bridge and keeps the docker network.
     async fn shutdown(self);
     async fn shutdown_and_remove_network(self);
@@ -585,11 +585,15 @@ impl BridgeEngine for LinkedEngine {
         Runtime::start_with_keypair(docker, RuntimeOptions { mode }, host_kp).await
     }
 
-    async fn runs_setup_container_of(&self, session: Session, bridge: &Runtime) -> bool {
-        match docker_of(&self.link, session) {
-            Ok(docker) => runs_container(&docker, bridge.setup_container_id()).await,
-            Err(_) => false,
-        }
+    async fn runs_container(&self, session: Session, id: &str) -> bool {
+        let Ok(docker) = docker_of(&self.link, session) else {
+            return false;
+        };
+        let inspected = docker
+            .inspect_container(id, None::<InspectContainerOptions>)
+            .await;
+        inspected
+            .is_ok_and(|container| container.state.and_then(|state| state.running) == Some(true))
     }
 
     async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) {
@@ -598,13 +602,6 @@ impl BridgeEngine for LinkedEngine {
                 .await;
         }
     }
-}
-
-async fn runs_container(docker: &Docker, id: &str) -> bool {
-    let inspected = docker
-        .inspect_container(id, None::<InspectContainerOptions>)
-        .await;
-    inspected.is_ok_and(|container| container.state.and_then(|state| state.running) == Some(true))
 }
 
 fn docker_of(link: &watch::Receiver<Link>, wanted: Session) -> Result<Docker> {
@@ -617,6 +614,10 @@ fn docker_of(link: &watch::Receiver<Link>, wanted: Session) -> Result<Docker> {
 impl Bridge for Runtime {
     fn utun_name(&self) -> &str {
         Runtime::utun_name(self)
+    }
+
+    fn setup_container_id(&self) -> &str {
+        Runtime::setup_container_id(self)
     }
 
     async fn shutdown(self) {
@@ -950,15 +951,13 @@ mod tests {
             }
         }
 
-        async fn runs_setup_container_of(&self, session: Session, bridge: &TestBridge) -> bool {
-            let probe = &bridge.probe;
-            let published = *probe.phase.borrow();
-            probe
-                .container_asks
-                .lock()
-                .unwrap()
-                .push((session, published));
-            probe.setup_container.lock().unwrap().as_ref() == Some(&bridge.setup_container)
+        async fn runs_container(&self, session: Session, id: &str) -> bool {
+            let Some(probe) = &self.probe else {
+                return false;
+            };
+            let asked = (session, *probe.phase.borrow());
+            probe.container_asks.lock().unwrap().push(asked);
+            probe.setup_container.lock().unwrap().as_deref() == Some(id)
         }
 
         async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) {
@@ -986,6 +985,10 @@ mod tests {
             let published = *self.probe.phase.borrow();
             self.probe.phase_at_utun_ask.lock().unwrap().push(published);
             TEST_UTUN
+        }
+
+        fn setup_container_id(&self) -> &str {
+            &self.setup_container
         }
 
         async fn shutdown(self) {
@@ -1538,18 +1541,33 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_engine_runs_a_container_only_when_an_inspect_by_its_id_says_so() {
-        let (engine, fake) = crate::engine::tests::connected();
-        let docker = engine.docker().unwrap();
+        let (engine, fake, _port_holder) = engine_with_leftovers();
         let id = "aaaaaaaaaaaa1111";
         let inspect = format!("/containers/{id}/json");
 
-        assert!(!runs_container(&docker, id).await, "no such container");
+        assert!(!engine.runs_container(Session(1), id).await, "no such id");
 
         fake.hold(&inspect, r#"{"State": {"Running": false}}"#);
-        assert!(!runs_container(&docker, id).await, "a stopped container");
+        assert!(!engine.runs_container(Session(1), id).await, "stopped");
 
         fake.hold(&inspect, r#"{"State": {"Running": true}}"#);
-        assert!(runs_container(&docker, id).await);
+        assert!(engine.runs_container(Session(1), id).await);
+        assert!(
+            !engine.runs_container(Session(2), id).await,
+            "asked on a session that is not the open one"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_that_was_planned_on_another_session_asks_the_engine_nothing() {
+        let (engine, fake, port_holder) = engine_with_leftovers();
+        drop(port_holder);
+
+        engine
+            .remove_leftovers(Session(2), SetupContainerAndNetwork)
+            .await;
+
+        assert_eq!(fake.calls(), [] as [&str; 0]);
     }
 
     #[tokio::test(start_paused = true)]
