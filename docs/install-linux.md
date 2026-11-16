@@ -39,7 +39,7 @@ systemctl is-active portman-daemon   # active
 portman status                       # daemon version, ports, socket
 ```
 
-The daemon needs Docker reachable at startup if you plan to use container routing; without Docker it exits, so install Docker first or check `journalctl -u portman-daemon` if the unit flaps.
+The daemon starts without Docker and connects when a Docker socket appears. Container routes exist only while Docker is connected.
 
 ## 3. Register a TLD
 
