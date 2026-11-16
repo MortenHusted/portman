@@ -1504,13 +1504,11 @@ destination: 172.18.0.0
         let port = first.0.local_addr().unwrap().port();
 
         let second = ListenPort::claim(port).await;
+
         assert_eq!(
             second.err().map(|err| err.kind()),
             Some(std::io::ErrorKind::AddrInUse)
         );
-
-        drop(first);
-        assert!(ListenPort::claim(port).await.is_ok());
     }
 
     #[test]

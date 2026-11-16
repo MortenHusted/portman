@@ -1519,28 +1519,29 @@ mod tests {
     const NETWORK: &str = "/networks/portman";
     const OWN_NETWORK: &str = r#"{"Labels": {"dev.portman.managed": "1"}}"#;
 
+    /// A listen port that nobody holds: a bind to port 0 gets a port that
+    /// the system picks. A port that a test binds and frees is not safe,
+    /// because the system can hand it to another socket at once.
+    const FREE_PORT: u16 = 0;
+
     /// The engine as the daemon reaches it, with a bridge's leftovers in
-    /// it, and a UDP socket that holds the listen port as another daemon's
-    /// bridge does.
-    fn engine_with_leftovers() -> (
-        LinkedEngine,
-        Arc<crate::engine::tests::FakeEngine>,
-        std::net::UdpSocket,
-    ) {
+    /// it.
+    fn engine_with_leftovers(
+        listen_port: u16,
+    ) -> (LinkedEngine, Arc<crate::engine::tests::FakeEngine>) {
         let (engine, fake) = crate::engine::tests::connected();
         fake.hold(SETUP_CONTAINER, OWN_SETUP_CONTAINER);
         fake.hold(NETWORK, OWN_NETWORK);
-        let port_holder = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let engine = LinkedEngine {
             link: engine.watch(),
-            listen_port: port_holder.local_addr().unwrap().port(),
+            listen_port,
         };
-        (engine, fake, port_holder)
+        (engine, fake)
     }
 
     #[tokio::test(start_paused = true)]
     async fn the_engine_runs_a_container_only_when_an_inspect_by_its_id_says_so() {
-        let (engine, fake, _port_holder) = engine_with_leftovers();
+        let (engine, fake) = engine_with_leftovers(FREE_PORT);
         let id = "aaaaaaaaaaaa1111";
         let inspect = format!("/containers/{id}/json");
 
@@ -1559,8 +1560,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_removal_that_was_planned_on_another_session_asks_the_engine_nothing() {
-        let (engine, fake, port_holder) = engine_with_leftovers();
-        drop(port_holder);
+        let (engine, fake) = engine_with_leftovers(FREE_PORT);
 
         engine
             .remove_leftovers(Session(2), SetupContainerAndNetwork)
@@ -1571,7 +1571,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn nothing_is_removed_from_the_engine_while_another_daemon_holds_the_listen_port() {
-        let (engine, fake, _another_daemons_bridge) = engine_with_leftovers();
+        let another_daemons_bridge = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let taken = another_daemons_bridge.local_addr().unwrap().port();
+        let (engine, fake) = engine_with_leftovers(taken);
 
         engine
             .remove_leftovers(Session(1), SetupContainerAndNetwork)
@@ -1588,8 +1590,7 @@ mod tests {
             (SetupContainerAndNetwork, vec![container, NETWORK]),
         ];
         for (leftovers, gone) in cases {
-            let (engine, fake, port_holder) = engine_with_leftovers();
-            drop(port_holder);
+            let (engine, fake) = engine_with_leftovers(FREE_PORT);
 
             engine.remove_leftovers(Session(1), leftovers).await;
 
