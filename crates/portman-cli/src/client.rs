@@ -83,19 +83,21 @@ fn timed_out(desired_enabled: bool, last: BridgePhase) -> String {
 /// Poll until the bridge is up, or until it is off and gone. The daemon
 /// applies bridge changes asynchronously; 120 × 500ms = 60s bound.
 pub(crate) async fn wait_for_bridge_state(desired_enabled: bool) -> Result<()> {
-    let mut last = None;
-    for attempt in 0..120 {
+    let mut previous = None;
+    let mut polls_left = 120;
+    loop {
         let phase = bridge_phase().await?;
-        match poll(desired_enabled, last, phase) {
+        match poll(desired_enabled, previous, phase) {
             Poll::Reached => return Ok(()),
             Poll::TurnedOff => anyhow::bail!("netbridge was disabled before it came up"),
-            Poll::Pending => last = Some(phase),
+            Poll::Pending => previous = Some(phase),
         }
-        if attempt < 119 {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        polls_left -= 1;
+        if polls_left == 0 {
+            anyhow::bail!(timed_out(desired_enabled, phase));
         }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    anyhow::bail!(timed_out(desired_enabled, last.unwrap_or_default()))
 }
 
 #[cfg(test)]
