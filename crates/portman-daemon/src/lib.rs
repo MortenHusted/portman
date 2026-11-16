@@ -5,10 +5,10 @@ mod dashboard;
 mod dashboard_auth;
 mod discovery;
 mod dns;
-mod docker_events;
 mod egress;
 mod egress_client;
 mod egress_grants;
+mod engine;
 mod env_compose;
 mod handlers;
 mod ipc_server;
@@ -240,7 +240,7 @@ pub async fn daemon_main() -> Result<()> {
 
     ensure_data_dir_owned_by_login_user().context("preparing data dir")?;
 
-    let (registry, container_resync) = docker_events::registry_with_resync();
+    let (registry, container_resync) = engine::registry_with_resync();
     // Shared host → loopback-address map: the DNS server answers TCP hosts with
     // their front, and the forwarder binds a listener there. Same handle, so
     // they always agree on the address.
@@ -389,8 +389,6 @@ pub async fn daemon_main() -> Result<()> {
     });
     let ipc = tokio::spawn(ipc_server::run(state.clone()));
     let dashboard = tokio::spawn(dashboard::run(state.clone(), args.dashboard_port));
-    // Hand bridge_health a clone of the Docker handle before docker_events
-    // takes ownership; bollard::Docker is a cheap Arc internally.
     let bridge_health_task = bridge_health::run(
         docker.clone(),
         bridge_health_shared,
@@ -422,7 +420,7 @@ pub async fn daemon_main() -> Result<()> {
         }
         netbridge_task.await
     });
-    let events = docker_events::run(docker, state.clone());
+    let events = engine::run(docker, state.clone());
     let events = tokio::spawn(async move {
         if managed_broker {
             std::future::pending::<()>().await;

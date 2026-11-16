@@ -806,7 +806,7 @@ pub(crate) mod tests {
             )
             .expect("lazy docker handle")
         };
-        let (registry, container_resync) = crate::docker_events::registry_with_resync();
+        let (registry, container_resync) = crate::engine::registry_with_resync();
         let static_store =
             Arc::new(portman_core::StaticStore::load(dir.path().join("static.json")).unwrap());
         let tls_store =

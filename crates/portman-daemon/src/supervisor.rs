@@ -4277,7 +4277,7 @@ mod tests {
         use futures_util::FutureExt;
 
         let dir = tempdir().unwrap();
-        let (registry, resync) = crate::docker_events::registry_with_resync();
+        let (registry, resync) = crate::engine::registry_with_resync();
         let (sup, registry, _static_store) = route_test_setup_on(&dir, registry);
         let labelled = vec![container_entry("web.demo.localhost")];
         registry.replace_container_entries(labelled.clone());
@@ -4315,7 +4315,7 @@ mod tests {
         use futures_util::FutureExt;
 
         let dir = tempdir().unwrap();
-        let (registry, resync) = crate::docker_events::registry_with_resync();
+        let (registry, resync) = crate::engine::registry_with_resync();
         let (sup, registry, _static_store) = route_test_setup_on(&dir, registry);
         let labelled = vec![container_entry("api.demo.localhost")];
 
