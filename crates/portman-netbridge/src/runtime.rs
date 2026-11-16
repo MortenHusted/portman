@@ -87,6 +87,7 @@ impl Default for RuntimeOptions {
 /// bridge up; drop it or call [`Runtime::shutdown`] to tear down.
 pub struct Runtime {
     utun_name: String,
+    setup_container_id: String,
     docker: Docker,
     /// Held until the runtime is dropped, so that a shutdown removes the
     /// setup container before another daemon can bind the port.
@@ -176,7 +177,8 @@ impl Runtime {
         // network while endpoints are attached fails anyway, so
         // blunt remove-then-create is both wrong and not robust.
         remove_existing_setup_container(&docker, &listen_port).await?;
-        let vm_pubkey = spawn_setup_container(&docker, host_kp, &listen_port).await?;
+        let (setup_container_id, vm_pubkey) =
+            spawn_setup_container(&docker, host_kp, &listen_port).await?;
         info!(container = SETUP_CONTAINER, "VM setup container running");
 
         // ── utun + routes, last, and rolled back together on failure
@@ -200,6 +202,7 @@ impl Runtime {
 
         Ok(Self {
             utun_name,
+            setup_container_id,
             docker,
             listen_port,
             tasks: vec![rx, tx, timer, routes],
@@ -212,6 +215,12 @@ impl Runtime {
     /// a VPN/exit-node claiming the default route.
     pub fn utun_name(&self) -> &str {
         &self.utun_name
+    }
+
+    /// The engine's id of the setup container that this bridge started. The
+    /// VM end of the tunnel exists for as long as that container runs.
+    pub fn setup_container_id(&self) -> &str {
+        &self.setup_container_id
     }
 
     /// Cleanly tear down the bridge. Aborts the pump tasks and removes
@@ -511,11 +520,12 @@ fn spawn_route_reconciler(docker: Docker, mode: NetbridgeMode, iface: String) ->
 
 // ── Docker helpers ─────────────────────────────────────────────────
 
+/// Returns the engine's id of the container and the VM's public key.
 async fn spawn_setup_container(
     docker: &Docker,
     host: &Keypair,
     held: &ListenPort,
-) -> Result<boringtun::x25519::PublicKey> {
+) -> Result<(String, boringtun::x25519::PublicKey)> {
     let env = setup_container_env(host);
     let body = ContainerCreateBody {
         image: Some(SETUP_IMAGE.to_string()),
@@ -535,7 +545,7 @@ async fn spawn_setup_container(
     let opts = CreateContainerOptionsBuilder::default()
         .name(SETUP_CONTAINER)
         .build();
-    docker
+    let created = docker
         .create_container(Some(opts), body)
         .await
         .context("creating netbridge setup container")?;
@@ -555,7 +565,7 @@ async fn spawn_setup_container(
             return Err(err);
         }
         match read_setup_vm_public_key(docker).await {
-            Ok(key) => return Ok(key),
+            Ok(key) => return Ok((created.id, key)),
             Err(_) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
