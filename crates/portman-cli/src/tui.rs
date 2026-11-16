@@ -1039,15 +1039,15 @@ fn render_status_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
                     Style::default().fg(Color::Gray),
                 ),
                 Span::styled(bridge_word, Style::default().fg(bridge_color)),
-                Span::styled(
-                    if bridge_toggle_disables(s.bridge_phase) {
-                        "  [b] disable..."
-                    } else {
-                        "  [b] enable"
-                    },
-                    Style::default().fg(Color::DarkGray),
-                ),
             ]),
+            Line::from(Span::styled(
+                if bridge_toggle_disables(s.bridge_phase) {
+                    "  [b] disable..."
+                } else {
+                    "  [b] enable"
+                },
+                Style::default().fg(Color::DarkGray),
+            )),
         ]
     } else {
         vec![
@@ -2156,6 +2156,56 @@ mod tests {
         };
 
         assert_eq!(activity_container_label(&row), "dev/web");
+    }
+
+    /// The screen rows that the status panel covers, at 120 columns.
+    fn status_rows(phase: BridgePhase) -> Vec<String> {
+        let state = State {
+            status: Some(StatusSnapshot {
+                version: "0.1.5".to_string(),
+                running_since: "5s".to_string(),
+                dns_port: 5335,
+                proxy_port: 80,
+                tls_port: 443,
+                socket_path: String::new(),
+                data_dir: String::new(),
+                cert_dir: String::new(),
+                bridge_assessment: portman_protocol::BridgeAssessment::Healthy,
+                bridge_phase: phase,
+                bridge_mode: NetbridgeMode::OptIn,
+            }),
+            ..State::default()
+        };
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| view(f, &state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..8)
+            .map(|y| (0..120).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn the_status_panel_shows_the_whole_bridge_hint_in_every_phase_at_120_columns() {
+        // phase → hint
+        let table = [
+            (BridgePhase::Disabled, "  [b] enable  "),
+            (BridgePhase::WaitingForDocker, "  [b] disable...  "),
+            (BridgePhase::Starting, "  [b] disable...  "),
+            (BridgePhase::Up, "  [b] disable...  "),
+            (BridgePhase::Stopping, "  [b] disable...  "),
+        ];
+        for (phase, hint) in table {
+            let rows = status_rows(phase);
+            let bridge = format!("  netbridge {}  opt-in  ", phase.display_word());
+            assert!(
+                rows.iter().any(|row| row.contains(&bridge)),
+                "phase={phase:?}\n{rows:#?}"
+            );
+            assert!(
+                rows.iter().any(|row| row.contains(hint)),
+                "phase={phase:?}\n{rows:#?}"
+            );
+        }
     }
 
     #[test]
