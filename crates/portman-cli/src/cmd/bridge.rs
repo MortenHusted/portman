@@ -1,11 +1,10 @@
 //! Netbridge commands: status, enable/disable, mode, prepare, doctor.
 
-use crate::client::{bridge_phase, wait_for_bridge_state};
+use crate::client::{bridge_status, wait_for_bridge_state, Pauses};
 use crate::cmd::run_setup_image_build;
 use crate::doctor;
 use anyhow::{bail, Context, Result};
 use portman_protocol::NetbridgeMode;
-use tokio::time::{sleep, Duration};
 
 use crate::client::request;
 use portman_protocol::{BridgePhase, Request, Response};
@@ -69,7 +68,7 @@ pub(crate) async fn cmd_bridge_mode(mode: Option<String>) -> Result<()> {
     };
 
     let mode = parse_netbridge_mode(&raw_mode)?;
-    let was_up = bridge_phase().await? == BridgePhase::Up;
+    let was_up = bridge_status().await?.phase() == BridgePhase::Up;
     match request(Request::BridgeSetMode { mode }).await? {
         Response::Ok => {
             wait_for_bridge_mode(mode).await?;
@@ -99,25 +98,16 @@ pub(crate) async fn cmd_bridge_prepare() -> Result<()> {
 }
 
 pub(crate) async fn wait_for_bridge_mode(desired_mode: NetbridgeMode) -> Result<()> {
-    for attempt in 0..120 {
-        if bridge_mode().await? == desired_mode {
-            return Ok(());
-        }
-        if attempt < 119 {
-            sleep(Duration::from_millis(500)).await;
+    let mut pauses = Pauses::new();
+    while bridge_status().await?.mode != desired_mode {
+        if !pauses.pause().await {
+            bail!(
+                "netbridge did not report mode {} after 60s",
+                NetbridgeMode::display_word(desired_mode)
+            );
         }
     }
-    bail!(
-        "netbridge did not report mode {} after 60s",
-        NetbridgeMode::display_word(desired_mode)
-    );
-}
-
-pub(crate) async fn bridge_mode() -> Result<NetbridgeMode> {
-    match request(Request::Status).await? {
-        Response::Status { bridge_mode, .. } => Ok(bridge_mode),
-        other => other.unexpected(),
-    }
+    Ok(())
 }
 
 pub(crate) fn parse_netbridge_mode(raw: &str) -> Result<NetbridgeMode> {
