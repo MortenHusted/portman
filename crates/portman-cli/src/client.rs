@@ -12,6 +12,7 @@ use portman_core::paths::socket_path;
 use portman_protocol::transport::{read_response, write_request};
 use portman_protocol::{BridgePhase, NetbridgeMode, Request, Response};
 use tokio::net::UnixStream;
+use tokio::time::Instant;
 
 pub(crate) async fn request(req: Request) -> Result<Response> {
     let req = if std::env::var("PORTMAN_MANAGED_BROKER").is_ok_and(|v| v == "true" || v == "1") {
@@ -188,11 +189,25 @@ where
     }
 }
 
+/// How long the mode of another command has to stay reported before a mode
+/// wait ends with [`ModePoll::SetByAnother`]. The daemon takes `mode`
+/// requests in the order they arrive, so of two commands that start a few
+/// milliseconds apart, the second can read the mode of the first before its
+/// own shows. In a live run of 164 such pairs, the daemon published a mode
+/// 10 to 90 ms after the request for it. The grace time is more than five
+/// times the longest of those. A wait that the other command did win ends at
+/// the first read after the grace time, and no pause between reads is longer
+/// than 500 ms.
+const MODE_GRACE: Duration = Duration::from_millis(500);
+
 #[derive(Debug, PartialEq, Eq)]
 enum ModePoll {
     Reached,
     Pending,
     WaitsForDocker,
+    /// The mode of another command shows, for less than [`MODE_GRACE`] so
+    /// far.
+    Contested,
     SetByAnother(NetbridgeMode),
     TurnedOff,
 }
@@ -201,7 +216,9 @@ enum ModePoll {
 /// mode of the read before it, and the first one is from before the request.
 /// The daemon reports the old mode until the bridge built for it is gone, so
 /// a mode that is neither the last one seen nor the wanted one comes from
-/// another command.
+/// another command. `contested_for` is the time since the first read that
+/// showed such a mode, with the wanted mode in no read since. The other
+/// command won only when its mode still shows after [`MODE_GRACE`].
 ///
 /// With `wait_for_up` the bridge was up before the request. A daemon that
 /// sends the phase sends `disabled` only for a bridge that nobody wants, so
@@ -212,13 +229,14 @@ fn mode_poll(
     wanted: NetbridgeMode,
     wait_for_up: bool,
     previous: NetbridgeMode,
+    contested_for: Option<Duration>,
     now: BridgeStatus,
 ) -> ModePoll {
     if now.mode != wanted {
-        return if now.mode == previous {
-            ModePoll::Pending
-        } else {
-            ModePoll::SetByAnother(now.mode)
+        return match contested_for {
+            None if now.mode == previous => ModePoll::Pending,
+            Some(shown) if shown >= MODE_GRACE => ModePoll::SetByAnother(now.mode),
+            _ => ModePoll::Contested,
         };
     }
     if !wait_for_up || now.phase() == BridgePhase::Up {
@@ -253,10 +271,12 @@ where
     let not_up = || format!("netbridge mode is set to {word} and the bridge is not up");
     let wait_for_up = before.phase() == BridgePhase::Up;
     let mut previous = before.mode;
+    let mut contested_since: Option<Instant> = None;
     let mut pauses = Pauses::new();
     loop {
         let now = read().await?;
-        match mode_poll(wanted, wait_for_up, previous, now) {
+        let contested_for = contested_since.map(|since| since.elapsed());
+        match mode_poll(wanted, wait_for_up, previous, contested_for, now) {
             ModePoll::Reached => return Ok(Settled::Reached),
             ModePoll::WaitsForDocker => return Ok(Settled::WaitsForDocker),
             ModePoll::SetByAnother(mode) => bail!(
@@ -269,7 +289,13 @@ where
                 ))
                 .with_context(not_up)
             }
-            ModePoll::Pending => previous = now.mode,
+            ModePoll::Contested => {
+                contested_since.get_or_insert_with(Instant::now);
+            }
+            ModePoll::Pending => {
+                previous = now.mode;
+                contested_since = None;
+            }
         }
         if !pauses.pause().await {
             if now.mode != wanted {
@@ -283,7 +309,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::Instant;
     use BridgePhase::{Disabled, Starting, Stopping, Unknown, Up, WaitingForDocker};
     use NetbridgeMode::{All, Docker, OptIn};
 
@@ -397,14 +422,14 @@ mod tests {
                 mode_only,
                 OptIn,
                 sent(All, Starting),
-                ModePoll::SetByAnother(All),
+                ModePoll::Contested,
             ),
             (
                 Docker,
                 mode_only,
                 Docker,
                 sent(All, Disabled),
-                ModePoll::SetByAnother(All),
+                ModePoll::Contested,
             ),
             (Docker, for_up, OptIn, sent(OptIn, Up), ModePoll::Pending),
             (
@@ -426,21 +451,15 @@ mod tests {
                 for_up,
                 OptIn,
                 sent(All, Starting),
-                ModePoll::SetByAnother(All),
+                ModePoll::Contested,
             ),
-            (
-                Docker,
-                for_up,
-                OptIn,
-                sent(All, Up),
-                ModePoll::SetByAnother(All),
-            ),
+            (Docker, for_up, OptIn, sent(All, Up), ModePoll::Contested),
             (
                 Docker,
                 for_up,
                 Docker,
                 sent(OptIn, Stopping),
-                ModePoll::SetByAnother(OptIn),
+                ModePoll::Contested,
             ),
             (
                 Docker,
@@ -537,9 +556,65 @@ mod tests {
         ];
         for (wanted, wait_for_up, previous, now, want) in table {
             assert_eq!(
-                mode_poll(wanted, wait_for_up, previous, now),
+                mode_poll(wanted, wait_for_up, previous, None, now),
                 want,
                 "wanted={wanted:?} wait_for_up={wait_for_up} previous={previous:?} now={now:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn another_command_wins_a_mode_wait_only_when_its_mode_outlasts_the_grace_time() {
+        let (for_up, mode_only) = (true, false);
+        let ms = |ms| Some(Duration::from_millis(ms));
+        // The command wants docker, and the read before the request showed
+        // opt-in.
+        // (waits for up, time since another mode first showed, status) → what the read tells
+        let table = [
+            (mode_only, ms(0), sent(All, Disabled), ModePoll::Contested),
+            (mode_only, ms(90), sent(All, Disabled), ModePoll::Contested),
+            (mode_only, ms(499), sent(All, Disabled), ModePoll::Contested),
+            (
+                mode_only,
+                ms(500),
+                sent(All, Disabled),
+                ModePoll::SetByAnother(All),
+            ),
+            (
+                mode_only,
+                ms(2000),
+                sent(All, Disabled),
+                ModePoll::SetByAnother(All),
+            ),
+            (
+                mode_only,
+                ms(499),
+                sent(OptIn, Disabled),
+                ModePoll::Contested,
+            ),
+            (
+                mode_only,
+                ms(500),
+                sent(OptIn, Disabled),
+                ModePoll::SetByAnother(OptIn),
+            ),
+            (mode_only, ms(90), sent(Docker, Disabled), ModePoll::Reached),
+            (
+                mode_only,
+                ms(2000),
+                sent(Docker, Disabled),
+                ModePoll::Reached,
+            ),
+            (for_up, ms(90), sent(Docker, Starting), ModePoll::Pending),
+            (for_up, ms(90), sent(Docker, Up), ModePoll::Reached),
+            (for_up, ms(499), sent(All, Up), ModePoll::Contested),
+            (for_up, ms(500), sent(All, Up), ModePoll::SetByAnother(All)),
+        ];
+        for (wait_for_up, contested_for, now, want) in table {
+            assert_eq!(
+                mode_poll(Docker, wait_for_up, OptIn, contested_for, now),
+                want,
+                "wait_for_up={wait_for_up} contested_for={contested_for:?} now={now:?}"
             );
         }
     }
@@ -696,14 +771,55 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_mode_change_that_another_command_overrides_ends_at_once_and_names_its_mode() {
+    async fn a_mode_change_that_reads_the_mode_of_an_earlier_command_succeeds_when_its_own_shows() {
+        let bridge_off = [sent(All, Disabled), sent(Docker, Disabled)];
+        let bridge_up = [
+            sent(OptIn, Stopping),
+            sent(All, Starting),
+            sent(Docker, Starting),
+            sent(Docker, Up),
+        ];
+        let mut shows_late = vec![sent(All, Disabled); 5];
+        shows_late.push(sent(Docker, Disabled));
+        // (the status before the request, the status reads)
+        let table = [
+            (sent(OptIn, Disabled), &bridge_off[..]),
+            (sent(OptIn, Up), &bridge_up[..]),
+            (sent(OptIn, Disabled), &shows_late[..]),
+        ];
+        for (before, statuses) in table {
+            let mut script = Script::new(statuses);
+
+            let settled = wait_for_mode(|| script.read(), Docker, before).await;
+
+            assert_eq!(settled.unwrap(), Settled::Reached, "{statuses:?}");
+            assert_eq!(script.read_at.len(), statuses.len(), "{statuses:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_grace_time_starts_over_when_the_wanted_mode_has_shown() {
+        let mut statuses = vec![sent(All, Starting)];
+        statuses.extend([sent(Docker, Starting); 6]);
+        statuses.extend([sent(All, Starting), sent(Docker, Up)]);
+        let mut script = Script::new(&statuses);
+
+        let settled = wait_for_mode(|| script.read(), Docker, sent(OptIn, Up)).await;
+
+        let second_showing = script.read_at[7] - script.read_at[0];
+        assert!(second_showing > Duration::from_millis(500));
+        assert_eq!(settled.unwrap(), Settled::Reached);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_mode_change_that_another_command_overrides_fails_after_the_grace_time() {
         let before_it_showed = [sent(OptIn, Stopping), sent(All, Starting)];
         let back_to_the_old_mode_after_it_showed = [
             sent(OptIn, Stopping),
             sent(Docker, Starting),
             sent(OptIn, Starting),
         ];
-        // the status reads → the mode that the error names
+        // the status reads, of which the last repeats → the mode that the error names
         let table = [
             (&before_it_showed[..], "all"),
             (&back_to_the_old_mode_after_it_showed[..], "opt-in"),
@@ -715,7 +831,14 @@ mod tests {
                 .await
                 .unwrap_err();
 
-            assert_eq!(script.read_at.len(), statuses.len());
+            let first_shown = script.read_at[statuses.len() - 1];
+            let shown_for: Vec<_> = script.read_at.iter().map(|at| *at - first_shown).collect();
+            let [.., read_before, last_read] = shown_for[..] else {
+                panic!("the wait ended at its first read");
+            };
+            assert!(read_before < Duration::from_millis(500), "{shown_for:?}");
+            assert!(last_read >= Duration::from_millis(500), "{shown_for:?}");
+            assert!(last_read < Duration::from_secs(1), "{shown_for:?}");
             assert_eq!(
                 failed.to_string(),
                 format!("another command set the netbridge mode to {mode}")
