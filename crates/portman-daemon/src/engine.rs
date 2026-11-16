@@ -55,6 +55,8 @@ pub(crate) enum Absent {
     Idle,
     /// None of the candidate socket paths exists.
     NoSocket,
+    /// The configured socket path does not exist.
+    NoSocketAt(PathBuf),
     /// A socket exists and no engine answered on it.
     Unreachable { socket: PathBuf, error: String },
 }
@@ -66,7 +68,13 @@ impl Display for Absent {
             Absent::Idle => f.write_str("no connect attempt has ended"),
             Absent::NoSocket => f.write_str(
                 "no docker socket found; start a runtime (e.g. `colima start`) \
-                 or point PORTMAN_DOCKER_SOCKET at its socket",
+                 or set PORTMAN_DOCKER_SOCKET",
+            ),
+            Absent::NoSocketAt(socket) => write!(
+                f,
+                "no docker socket at {}, the path the daemon was given; \
+                 start the runtime that serves it or correct the path",
+                socket.display()
             ),
             Absent::Unreachable { socket, error } => {
                 write!(f, "no answer on {}: {error}", socket.display())
@@ -111,6 +119,32 @@ impl Engine {
     }
 }
 
+/// Where the daemon looks for the engine's socket.
+pub(crate) enum Sockets {
+    /// The one path that `--docker-socket` or `PORTMAN_DOCKER_SOCKET` names.
+    Configured(PathBuf),
+    /// The paths of the runtimes that the daemon knows, in the order it
+    /// tries them.
+    Detected(Vec<PathBuf>),
+}
+
+impl Sockets {
+    fn candidates(&self) -> &[PathBuf] {
+        match self {
+            Sockets::Configured(path) => std::slice::from_ref(path),
+            Sockets::Detected(paths) => paths,
+        }
+    }
+
+    /// Why no engine is connected when no candidate path holds a socket.
+    fn none_found(&self) -> Absent {
+        match self {
+            Sockets::Configured(path) => Absent::NoSocketAt(path.clone()),
+            Sockets::Detected(_) => Absent::NoSocket,
+        }
+    }
+}
+
 /// How long one candidate socket has to answer a connect attempt.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -136,15 +170,15 @@ pub(crate) fn open_socket(path: &Path) -> Option<Docker> {
 }
 
 /// Owns the link for as long as the daemon polls it. Every connect attempt
-/// goes through `candidates` in order until one answers, so a socket that
-/// appears or goes stale at one of those paths needs no daemon restart. The
-/// paths are fixed at boot.
+/// goes through the candidates of `sockets` in order until one answers, so a
+/// socket that appears or goes stale at one of those paths needs no daemon
+/// restart. The paths are fixed at boot.
 /// The container routes are cleared when an attempt finds no engine. They
 /// stay while a session that ended is replaced by the next one, and the
 /// first list of that session corrects them.
 pub(crate) async fn run(
     publisher: watch::Sender<Link>,
-    candidates: Vec<PathBuf>,
+    sockets: Sockets,
     open: impl Fn(&Path) -> Option<Docker>,
     state: DaemonState,
 ) -> Infallible {
@@ -153,7 +187,7 @@ pub(crate) async fn run(
     loop {
         tokio::time::sleep(RECONNECT_DELAYS[attempt.min(RECONNECT_DELAYS.len() - 1)]).await;
         let began = tokio::time::Instant::now();
-        match connect(&candidates, &open).await {
+        match connect(&sockets, &open).await {
             Ok(docker) => {
                 sessions += 1;
                 let session = Session(sessions);
@@ -177,11 +211,11 @@ pub(crate) async fn run(
 /// The first candidate that answers. When none does, the reason names the
 /// first socket that exists.
 async fn connect(
-    candidates: &[PathBuf],
+    sockets: &Sockets,
     open: &impl Fn(&Path) -> Option<Docker>,
 ) -> Result<Docker, Absent> {
-    let mut reason = Absent::NoSocket;
-    for socket in candidates {
+    let mut unreachable = None;
+    for socket in sockets.candidates() {
         let Some(docker) = open(socket) else {
             continue;
         };
@@ -198,14 +232,12 @@ async fn connect(
             Ok(Err(err)) => err.to_string(),
             Err(_) => format!("no answer in {} s", PROBE_TIMEOUT.as_secs()),
         };
-        if reason == Absent::NoSocket {
-            reason = Absent::Unreachable {
-                socket: socket.clone(),
-                error,
-            };
-        }
+        unreachable.get_or_insert(Absent::Unreachable {
+            socket: socket.clone(),
+            error,
+        });
     }
-    Err(reason)
+    Err(unreachable.unwrap_or_else(|| sockets.none_found()))
 }
 
 /// Publishes that no engine is connected and clears the container routes,
@@ -1272,6 +1304,12 @@ pub(crate) mod tests {
         /// `engines` are the socket candidates, in the order the task
         /// tries them.
         fn boot(engines: Vec<(&'static str, Arc<FakeEngine>)>) -> Self {
+            let candidates = engines.iter().map(|(path, _)| path.into()).collect();
+            Self::boot_on(Sockets::Detected(candidates), engines)
+        }
+
+        /// `engines` are the fake engines, each at its socket path.
+        fn boot_on(sockets: Sockets, engines: Vec<(&'static str, Arc<FakeEngine>)>) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let (engine, publisher) = channel();
             let state = DaemonState {
@@ -1280,12 +1318,11 @@ pub(crate) mod tests {
             };
             state.known_tlds.write().unwrap().insert("test".into());
             let link = publisher.subscribe();
-            let candidates = engines.iter().map(|(path, _)| path.into()).collect();
             let open = move |path: &Path| {
                 let (_, engine) = engines.iter().find(|(at, _)| Path::new(at) == path)?;
                 engine.open()
             };
-            let task = tokio::spawn(run(publisher, candidates, open, state.clone()));
+            let task = tokio::spawn(run(publisher, sockets, open, state.clone()));
             Self {
                 state,
                 link,
@@ -1346,6 +1383,19 @@ pub(crate) mod tests {
 
         tokio::time::sleep(HOUR).await;
         assert!(!rig.task.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_configured_socket_that_is_missing_is_named_and_the_user_is_not_told_to_set_it() {
+        let engines = vec![(SOCKET, FakeEngine::at(Socket::Missing))];
+        let mut rig = Rig::boot_on(Sockets::Configured(SOCKET.into()), engines);
+
+        let reason = rig.absent().await;
+
+        assert_eq!(reason, Absent::NoSocketAt(SOCKET.into()));
+        let message = reason.to_string();
+        assert!(message.contains(SOCKET), "{message}");
+        assert!(!message.contains("set PORTMAN_DOCKER_SOCKET"), "{message}");
     }
 
     #[tokio::test(start_paused = true)]

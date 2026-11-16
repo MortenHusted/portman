@@ -413,13 +413,13 @@ pub async fn daemon_main() -> Result<()> {
         }
         netbridge_task.await
     });
-    let socket_candidates = match args.docker_socket {
-        Some(path) => vec![path.into()],
-        None => portman_core::paths::docker_socket_candidates(),
+    let sockets = match args.docker_socket {
+        Some(path) => engine::Sockets::Configured(path.into()),
+        None => engine::Sockets::Detected(portman_core::paths::docker_socket_candidates()),
     };
     let engine_task = engine::run(
         engine_publisher,
-        socket_candidates,
+        sockets,
         engine::open_socket,
         state.clone(),
     );
