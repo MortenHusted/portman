@@ -2,8 +2,9 @@
 
 use portman_core::paths::{cert_dir as cert_dir_path, socket_path};
 use portman_core::{Mode, NetbridgeMode, Request, Response, VERSION};
-use portman_protocol::{BridgePhase, TldInfo};
+use portman_protocol::{BridgePhase, DockerState, DockerStatus, TldInfo};
 
+use crate::engine::{Absent, Link};
 use crate::DaemonState;
 
 pub(crate) async fn dispatch(request: Request, state: &DaemonState) -> Response {
@@ -485,6 +486,49 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
         bridge_phase: BridgePhase::from(published_phase),
         bridge_mode,
         dashboard_port: state.dashboard_port,
+        docker: Some(docker_status(
+            &state.engine.link(),
+            state.supervisor.managed_broker(),
+        )),
+    }
+}
+
+/// The engine link as status reports it. In managed-broker mode nothing
+/// polls the engine task, so the link says nothing and the mode decides.
+fn docker_status(link: &Link, managed_broker: bool) -> DockerStatus {
+    let path = |socket: &std::path::Path| Some(socket.display().to_string());
+    let because = |state, reason: &str| DockerStatus {
+        state,
+        reason: Some(reason.into()),
+        ..DockerStatus::default()
+    };
+    if managed_broker {
+        return because(DockerState::Disabled, "managed broker");
+    }
+    let disconnected = |reason| because(DockerState::Disconnected, reason);
+    match link {
+        Link::Connected {
+            socket, version, ..
+        } => DockerStatus {
+            state: DockerState::Connected,
+            socket: path(socket),
+            version: version.clone(),
+            ..DockerStatus::default()
+        },
+        Link::Absent(Absent::Idle) => disconnected("no connect attempt has ended yet"),
+        Link::Absent(Absent::NoSocket) => DockerStatus {
+            detail: Some("none of the known runtime paths exists".into()),
+            ..disconnected("no socket")
+        },
+        Link::Absent(Absent::NoSocketAt(socket)) => DockerStatus {
+            socket: path(socket),
+            ..disconnected("no socket")
+        },
+        Link::Absent(Absent::Unreachable { socket, error }) => DockerStatus {
+            socket: path(socket),
+            detail: Some(error.clone()),
+            ..disconnected("unreachable")
+        },
     }
 }
 
@@ -1821,6 +1865,104 @@ pub(crate) mod tests {
             }
         ));
     }
+    fn status_docker(response: Response) -> DockerStatus {
+        match response {
+            Response::Status { docker, .. } => docker.expect("the daemon reports the engine"),
+            other => panic!("expected status response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_says_why_no_engine_is_connected() {
+        let socket = || Some("/run/demo/docker.sock".to_string());
+        let disconnected = |reason: &str| DockerStatus {
+            state: DockerState::Disconnected,
+            reason: Some(reason.into()),
+            ..DockerStatus::default()
+        };
+        // (why the link is absent, managed broker) → what status reports
+        let table = [
+            (
+                Absent::Idle,
+                false,
+                disconnected("no connect attempt has ended yet"),
+            ),
+            (
+                Absent::NoSocketAt("/run/demo/docker.sock".into()),
+                false,
+                DockerStatus {
+                    socket: socket(),
+                    ..disconnected("no socket")
+                },
+            ),
+            (
+                Absent::NoSocket,
+                false,
+                DockerStatus {
+                    detail: Some("none of the known runtime paths exists".into()),
+                    ..disconnected("no socket")
+                },
+            ),
+            (
+                Absent::Unreachable {
+                    socket: "/run/demo/docker.sock".into(),
+                    error: "no answer in 3 s".into(),
+                },
+                false,
+                DockerStatus {
+                    socket: socket(),
+                    detail: Some("no answer in 3 s".into()),
+                    ..disconnected("unreachable")
+                },
+            ),
+            (
+                Absent::Idle,
+                true,
+                DockerStatus {
+                    state: DockerState::Disabled,
+                    reason: Some("managed broker".into()),
+                    ..DockerStatus::default()
+                },
+            ),
+        ];
+        for (absent, managed_broker, want) in table {
+            let link = Link::Absent(absent.clone());
+            assert_eq!(
+                docker_status(&link, managed_broker),
+                want,
+                "absent={absent:?} managed_broker={managed_broker}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_engine_link_of_the_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(&dir);
+        assert_eq!(
+            status_docker(handle_status(&state).await).summary(),
+            "disconnected, no connect attempt has ended yet"
+        );
+
+        let (engine, _fake) = crate::engine::tests::connected();
+        state.engine = engine;
+        assert_eq!(
+            status_docker(handle_status(&state).await),
+            DockerStatus {
+                state: DockerState::Connected,
+                socket: Some("/run/demo/docker.sock".into()),
+                version: Some("29.2.1".into()),
+                ..DockerStatus::default()
+            }
+        );
+
+        state.supervisor.set_managed_broker();
+        assert_eq!(
+            status_docker(handle_status(&state).await).state,
+            DockerState::Disabled
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn status_reports_the_bridge_phase_and_bridge_enabled_for_older_clients() {

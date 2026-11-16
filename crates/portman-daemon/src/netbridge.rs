@@ -685,7 +685,9 @@ impl BridgeEngine for LinkedEngine {
 
 fn docker_of(link: &watch::Receiver<Link>, wanted: Session) -> Result<Docker> {
     match &*link.borrow() {
-        Link::Connected { session, docker } if *session == wanted => Ok(docker.clone()),
+        Link::Connected {
+            session, docker, ..
+        } if *session == wanted => Ok(docker.clone()),
         _ => anyhow::bail!("the engine session that the bridge was planned on has ended"),
     }
 }

@@ -35,7 +35,14 @@ pub(crate) struct Session(pub(crate) u64);
 #[derive(Clone)]
 pub(crate) enum Link {
     Absent(Absent),
-    Connected { session: Session, docker: Docker },
+    Connected {
+        session: Session,
+        docker: Docker,
+        /// The socket the engine answered on.
+        socket: PathBuf,
+        /// The engine's own version, when it reports one.
+        version: Option<String>,
+    },
 }
 
 impl Link {
@@ -109,6 +116,11 @@ impl Engine {
 
     pub(crate) fn session(&self) -> Option<Session> {
         self.link.borrow().session()
+    }
+
+    /// The link as it is at this call, for a status report.
+    pub(crate) fn link(&self) -> Link {
+        self.link.borrow().clone()
     }
 
     /// The link itself, for a task that acts when it changes. Only the
@@ -188,15 +200,17 @@ pub(crate) async fn run(
         tokio::time::sleep(RECONNECT_DELAYS[attempt.min(RECONNECT_DELAYS.len() - 1)]).await;
         let began = tokio::time::Instant::now();
         match connect(&sockets, &open).await {
-            Ok(docker) => {
+            Ok(found) => {
                 sessions += 1;
                 let session = Session(sessions);
                 info!(session = session.0, "docker session opened");
                 publisher.send_replace(Link::Connected {
                     session,
-                    docker: docker.clone(),
+                    docker: found.docker.clone(),
+                    socket: found.socket,
+                    version: found.version,
                 });
-                serve(&docker, &state).await;
+                serve(&found.docker, &state).await;
             }
             Err(reason) => lose(&publisher, &state, reason),
         }
@@ -208,12 +222,19 @@ pub(crate) async fn run(
     }
 }
 
+/// An engine that answered a connect attempt.
+struct Found {
+    docker: Docker,
+    socket: PathBuf,
+    version: Option<String>,
+}
+
 /// The first candidate that answers. When none does, the reason names the
 /// first socket that exists.
 async fn connect(
     sockets: &Sockets,
     open: &impl Fn(&Path) -> Option<Docker>,
-) -> Result<Docker, Absent> {
+) -> Result<Found, Absent> {
     let mut unreachable = None;
     for socket in sockets.candidates() {
         let Some(docker) = open(socket) else {
@@ -227,7 +248,11 @@ async fn connect(
                     server_version = version.version.as_deref().unwrap_or("?"),
                     "connected to docker"
                 );
-                return Ok(docker);
+                return Ok(Found {
+                    docker,
+                    socket: socket.clone(),
+                    version: version.version,
+                });
             }
             Ok(Err(err)) => err.to_string(),
             Err(_) => format!("no answer in {} s", PROBE_TIMEOUT.as_secs()),
@@ -1099,6 +1124,8 @@ pub(crate) mod tests {
         publisher.send_replace(Link::Connected {
             session: Session(1),
             docker,
+            socket: SOCKET.into(),
+            version: Some("29.2.1".into()),
         });
         fake
     }
@@ -1415,6 +1442,21 @@ pub(crate) mod tests {
             let entry = self.state.registry.get(host)?;
             (entry.source == Source::Container).then_some(entry.target)
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_records_its_socket_and_the_version_of_its_engine() {
+        let (rig, _engine) = Rig::connected().await;
+
+        match &*rig.link.borrow() {
+            Link::Connected {
+                socket, version, ..
+            } => {
+                assert_eq!(socket, Path::new(SOCKET));
+                assert_eq!(version.as_deref(), Some("29.2.1"));
+            }
+            Link::Absent(reason) => panic!("the link is absent: {reason}"),
+        };
     }
 
     #[tokio::test(start_paused = true)]
