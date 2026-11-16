@@ -780,7 +780,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_retry_that_is_due_ends_the_wait_when_no_message_is_ready() {
         let (_tx, mut rx) = mpsc::channel(1);
-        let wake = next_wake(&mut rx, Some(Duration::ZERO)).await;
+        let wake = tokio::time::timeout(LONGEST_WAIT, next_wake(&mut rx, Some(Duration::ZERO)))
+            .await
+            .expect("the retry timer ends the wait");
         assert!(matches!(wake, Wake::RetryDue));
     }
 }
