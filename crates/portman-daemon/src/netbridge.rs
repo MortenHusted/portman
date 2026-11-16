@@ -13,7 +13,10 @@
 //!     while the engine is unreachable is still an enable after a restart.
 //!   - [`plan`] compares the intent and the engine session with the running
 //!     bridge and names the next step. The loop applies steps until none is
-//!     left, then waits for a control message or a retry timer.
+//!     left, then waits for a control message or a retry timer. Before each
+//!     step it takes the messages that have arrived, so that it never
+//!     begins a start that the user has already cancelled. It does not
+//!     cancel a step in flight.
 //!   - a failed start is retried with a growing delay. The wait does not
 //!     hold up control messages.
 //!   - [`publish`] tells the rest of the daemon what the bridge is doing:
@@ -317,56 +320,59 @@ async fn converge<E: BridgeStarter>(
     let mut epoch = 0;
 
     loop {
-        let intent = wanted.intent();
-        loop {
-            let built = running.as_ref().map(|r| r.built);
-            publish(
-                &handle,
-                &phase_tx,
-                phase(&intent, session, built),
-                reported_mode(&intent, built),
-                running.as_ref(),
-            )
-            .await;
-            match plan(&intent, session, built, attempts.retry_after.is_none()) {
-                Step::Keep => break,
-                Step::Start(session) => {
-                    if let Some(bridge) = try_start(&engine, intent.mode, &mut attempts).await {
-                        epoch += 1;
-                        running = Some(Running {
-                            bridge,
-                            built: Built {
-                                session,
-                                mode: intent.mode,
-                                epoch,
-                            },
-                        });
-                    }
-                }
-                Step::Abandon => running = None,
-                Step::Shutdown => {
-                    if let Some(old) = running.take() {
-                        old.bridge.shutdown().await;
-                    }
-                }
-                Step::Teardown => {
-                    if let Some(old) = running.take() {
-                        old.bridge.shutdown_and_remove_network().await;
-                    }
-                }
-            }
+        while let Ok(msg) = rx.try_recv() {
+            take(msg, &mut wanted, &mut attempts, &state_path);
         }
-
-        match next_wake(&mut rx, attempts.retry_after).await {
-            Wake::Control(msg) => {
-                wanted.apply(msg);
-                persist(&state_path, &wanted.saved);
-                attempts = Attempts::new();
+        let intent = wanted.intent();
+        let built = running.as_ref().map(|r| r.built);
+        publish(
+            &handle,
+            &phase_tx,
+            phase(&intent, session, built),
+            reported_mode(&intent, built),
+            running.as_ref(),
+        )
+        .await;
+        match plan(&intent, session, built, attempts.retry_after.is_none()) {
+            Step::Keep => match next_wake(&mut rx, attempts.retry_after).await {
+                Wake::Control(msg) => take(msg, &mut wanted, &mut attempts, &state_path),
+                Wake::RetryDue => attempts.retry_after = None,
+                Wake::Closed => return Ok(()),
+            },
+            Step::Start(session) => {
+                if let Some(bridge) = try_start(&engine, intent.mode, &mut attempts).await {
+                    epoch += 1;
+                    running = Some(Running {
+                        bridge,
+                        built: Built {
+                            session,
+                            mode: intent.mode,
+                            epoch,
+                        },
+                    });
+                }
             }
-            Wake::RetryDue => attempts.retry_after = None,
-            Wake::Closed => return Ok(()),
+            Step::Abandon => running = None,
+            Step::Shutdown => {
+                if let Some(old) = running.take() {
+                    old.bridge.shutdown().await;
+                }
+            }
+            Step::Teardown => {
+                if let Some(old) = running.take() {
+                    old.bridge.shutdown_and_remove_network().await;
+                }
+            }
         }
     }
+}
+
+/// A message changes what the user wants, so it also ends the start
+/// sequence that served the old intent.
+fn take(msg: Control, wanted: &mut Wanted, attempts: &mut Attempts, state_path: &Path) {
+    wanted.apply(msg);
+    persist(state_path, &wanted.saved);
+    *attempts = Attempts::new();
 }
 
 enum Wake {
@@ -981,6 +987,22 @@ mod tests {
         rig.end_stops();
         rig.reaches(BridgePhase::Disabled).await;
         rig.no_attempt_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_during_a_mode_change_ends_it_without_a_new_start() {
+        let mut rig = Rig::up().await;
+        rig.hold_stops();
+        rig.send(Control::SetMode(NetbridgeMode::All)).await;
+        assert_eq!(rig.next_stop().await, Stop::KeepsNetwork);
+
+        rig.send(Control::Disable).await;
+        rig.end_stops();
+
+        rig.reaches(BridgePhase::Disabled).await;
+        rig.no_attempt_follows().await;
+        let saved = netbridge_state::load(&rig.state_path);
+        assert_eq!((saved.enabled, saved.mode), (false, NetbridgeMode::All));
     }
 
     #[tokio::test(start_paused = true)]
