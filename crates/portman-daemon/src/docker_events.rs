@@ -277,6 +277,8 @@ fn trigger(event: &EventMessage) -> Option<Trigger> {
 mod tests {
     use super::*;
     use futures_util::{stream, FutureExt};
+    use hyper_util::rt::TokioIo;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn event(typ: EventMessageTypeEnum, action: &str) -> EventMessage {
         EventMessage {
@@ -459,6 +461,200 @@ mod tests {
 
         assert_eq!(next_trigger(&mut events).await, Some(Trigger::Container));
         assert_eq!(next_trigger(&mut events).await, None);
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Asked {
+        List,
+        Events,
+    }
+
+    /// A Docker engine inside the test. bollard reaches it over in-memory
+    /// pipes, because the paused clock runs ahead of a real socket. A list
+    /// takes `list_ms` and holds no containers. The events response follows
+    /// `replay`: each step waits its milliseconds and then sends its events
+    /// as one read. The response ends after the last step.
+    struct Engine {
+        started: tokio::time::Instant,
+        list_ms: u64,
+        replay: Vec<(u64, Vec<EventMessage>)>,
+        asked: std::sync::Mutex<Vec<(u128, Asked)>>,
+    }
+
+    impl Engine {
+        fn start(list_ms: u64, replay: Vec<(u64, Vec<EventMessage>)>) -> (Docker, Arc<Self>) {
+            let engine = Arc::new(Self {
+                started: tokio::time::Instant::now(),
+                list_ms,
+                replay,
+                asked: Default::default(),
+            });
+            let serving = engine.clone();
+            let docker = Docker::connect_with_custom_transport(
+                move |request: bollard::BollardRequest| {
+                    let engine = serving.clone();
+                    async move {
+                        let (client, server) = tokio::io::duplex(64 * 1024);
+                        tokio::spawn(engine.serve(server));
+                        let (mut sender, connection) =
+                            hyper::client::conn::http1::handshake(TokioIo::new(client)).await?;
+                        tokio::spawn(connection);
+                        Ok(sender.send_request(request).await?)
+                    }
+                },
+                Some("http://engine.test"),
+                5,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .unwrap();
+            (docker, engine)
+        }
+
+        async fn serve(self: Arc<Self>, mut pipe: tokio::io::DuplexStream) {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(pipe.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            let request_line = head.lines().next().unwrap();
+            let at = self.started.elapsed().as_millis();
+            if request_line.contains("/containers/json?") {
+                self.asked.lock().unwrap().push((at, Asked::List));
+                tokio::time::sleep(Duration::from_millis(self.list_ms)).await;
+                let listed = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n[]";
+                pipe.write_all(listed).await.unwrap();
+            } else if request_line.contains("/events?") {
+                self.asked.lock().unwrap().push((at, Asked::Events));
+                let streaming = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n";
+                pipe.write_all(streaming).await.unwrap();
+                for (after_ms, events) in &self.replay {
+                    tokio::time::sleep(Duration::from_millis(*after_ms)).await;
+                    let lines: String = events
+                        .iter()
+                        .map(|event| serde_json::to_string(event).unwrap() + "\n")
+                        .collect();
+                    if !lines.is_empty() {
+                        let read = format!("{:x}\r\n{lines}\r\n", lines.len());
+                        pipe.write_all(read.as_bytes()).await.unwrap();
+                    }
+                }
+                pipe.write_all(b"0\r\n\r\n").await.unwrap();
+            } else {
+                panic!("the loop asked for {request_line}");
+            }
+        }
+
+        fn asked(&self) -> Vec<(u128, Asked)> {
+            self.asked.lock().unwrap().clone()
+        }
+
+        fn lists(&self) -> Vec<u128> {
+            self.asked()
+                .into_iter()
+                .filter_map(|(at, asked)| (asked == Asked::List).then_some(at))
+                .collect()
+        }
+    }
+
+    /// Runs the loop against an engine until the events response ends, and
+    /// returns that engine. `release_at_ms` frees a hostname that many
+    /// milliseconds in, which wakes the loop. The test fails when the loop
+    /// has not ended one hour later, which takes no real time on the paused
+    /// clock.
+    async fn run_to_the_end(
+        list_ms: u64,
+        replay: Vec<(u64, Vec<EventMessage>)>,
+        release_at_ms: Option<u64>,
+    ) -> Arc<Engine> {
+        let (docker, engine) = Engine::start(list_ms, replay);
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::handlers::tests::test_state(&dir);
+        let running = tokio::spawn(run(docker, state.clone()));
+
+        if let Some(release_at_ms) = release_at_ms {
+            state.registry.upsert(portman_core::Entry {
+                host: "api.acme.test".into(),
+                target: "127.0.0.1:3070".into(),
+                source: portman_core::Source::Static,
+                mode: Mode::Http,
+                container_id: None,
+                project: None,
+                egress: None,
+            });
+            tokio::time::sleep(Duration::from_millis(release_at_ms)).await;
+            state.registry.remove("api.acme.test");
+        }
+        tokio::time::timeout(Duration::from_secs(3600), running)
+            .await
+            .expect("the loop ends when the event stream ends")
+            .unwrap()
+            .unwrap();
+        engine
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_start_lists_before_the_events_request_then_once_for_the_replay_and_twice_more() {
+        use EventMessageTypeEnum::{CONTAINER, NETWORK};
+        let replay = vec![
+            (
+                0,
+                vec![
+                    event(CONTAINER, "create"),
+                    event(NETWORK, "connect"),
+                    event(CONTAINER, "start"),
+                ],
+            ),
+            (
+                20,
+                vec![event(NETWORK, "connect"), event(CONTAINER, "start")],
+            ),
+            (2000, vec![]),
+        ];
+
+        let engine = run_to_the_end(0, replay, None).await;
+
+        assert_eq!(
+            engine.asked(),
+            [
+                (0, Asked::List),
+                (0, Asked::Events),
+                (50, Asked::List),
+                (300, Asked::List),
+                (800, Asked::List),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_ends_when_the_event_stream_ends() {
+        let engine = run_to_the_end(0, vec![(30, vec![])], None).await;
+
+        assert_eq!(engine.lists(), [0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_ends_in_the_quiet_time_gets_the_list_for_its_burst_and_ends_the_loop() {
+        let die = vec![event(EventMessageTypeEnum::CONTAINER, "die")];
+
+        let engine = run_to_the_end(0, vec![(0, die), (20, vec![])], None).await;
+
+        assert_eq!(engine.lists(), [0, 20]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hostname_released_in_the_quiet_time_lists_again_after_the_burst() {
+        let start = vec![event(EventMessageTypeEnum::CONTAINER, "start")];
+
+        let engine = run_to_the_end(0, vec![(0, start), (1000, vec![])], Some(20)).await;
+
+        assert_eq!(engine.lists(), [0, 50, 50]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hostname_released_during_a_list_lists_again_after_it() {
+        let engine = run_to_the_end(10, vec![(1000, vec![])], Some(5)).await;
+
+        assert_eq!(engine.lists(), [0, 10]);
     }
 
     #[derive(Clone, Default)]
