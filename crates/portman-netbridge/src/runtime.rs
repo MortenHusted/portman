@@ -162,31 +162,13 @@ impl Runtime {
         info!(container = SETUP_CONTAINER, "VM setup container running");
 
         // ── utun + routes, last, and rolled back together on failure
-        let mut cfg = tun::Configuration::default();
-        cfg.address(HOST_TUNNEL_IP)
-            .netmask((255, 255, 255, 0))
-            .destination(VM_TUNNEL_IP)
-            .mtu(i32::from(TUNNEL_MTU))
-            .up();
-        let device = tun::create_as_async(&cfg).context("creating utun")?;
-        prevent_child_inheritance(device.get_ref().as_raw_fd())?;
-        let utun_name = device.get_ref().name().context("utun name")?;
-        info!(utun = %utun_name, "utun up");
-        remember_own_utun(&utun_name);
-
-        let mut installed = InstalledRoutes::new(utun_name.clone());
-        for cmd in startup_route_plan(&utun_name, &extra_route_cidrs) {
-            if let Err(err) = ensure_route_command(&cmd) {
-                // The device drops with this error; stop claiming its name
-                // (same reasoning as shutdown — names are recycled).
-                forget_own_utun(&utun_name);
+        let (device, utun_name) = match open_utun(&extra_route_cidrs) {
+            Ok(opened) => opened,
+            Err(err) => {
+                best_effort_remove_setup_container(&docker).await;
                 return Err(err);
             }
-            installed.record(cmd.cidr);
-        }
-        // Past the last fallible step — these routes belong to a live runtime
-        // now, so the guard must not undo them.
-        installed.keep();
+        };
 
         // ── Peer + shared state
         let peer = Arc::new(Mutex::new(Peer::new(host_kp, &vm_pubkey, Some(25))));
@@ -253,6 +235,37 @@ impl Drop for Runtime {
         }
         forget_own_utun(&self.utun_name);
     }
+}
+
+/// Creates the utun and installs its routes. On a failure it drops the
+/// device and rolls back the routes it installed.
+fn open_utun(extra_route_cidrs: &BTreeSet<String>) -> Result<(tun::AsyncDevice, String)> {
+    let mut cfg = tun::Configuration::default();
+    cfg.address(HOST_TUNNEL_IP)
+        .netmask((255, 255, 255, 0))
+        .destination(VM_TUNNEL_IP)
+        .mtu(i32::from(TUNNEL_MTU))
+        .up();
+    let device = tun::create_as_async(&cfg).context("creating utun")?;
+    prevent_child_inheritance(device.get_ref().as_raw_fd())?;
+    let utun_name = device.get_ref().name().context("utun name")?;
+    info!(utun = %utun_name, "utun up");
+    remember_own_utun(&utun_name);
+
+    let mut installed = InstalledRoutes::new(utun_name.clone());
+    for cmd in startup_route_plan(&utun_name, extra_route_cidrs) {
+        if let Err(err) = ensure_route_command(&cmd) {
+            // The device drops with this error; stop claiming its name
+            // (same reasoning as shutdown — names are recycled).
+            forget_own_utun(&utun_name);
+            return Err(err);
+        }
+        installed.record(cmd.cidr);
+    }
+    // Past the last fallible step — these routes belong to a live runtime
+    // now, so the guard must not undo them.
+    installed.keep();
+    Ok((device, utun_name))
 }
 
 fn prevent_child_inheritance(fd: RawFd) -> Result<()> {
