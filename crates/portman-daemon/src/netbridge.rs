@@ -134,8 +134,8 @@ struct Built {
     epoch: u64,
 }
 
-struct Running {
-    runtime: Runtime,
+struct Running<B> {
+    bridge: B,
     built: Built,
 }
 
@@ -291,8 +291,8 @@ pub(crate) async fn run(
     converge(engine, handle, rx, phase_tx, state_path, forced_on).await
 }
 
-async fn converge(
-    engine: impl BridgeStarter,
+async fn converge<E: BridgeStarter>(
+    engine: E,
     handle: Handle,
     mut rx: mpsc::Receiver<Control>,
     phase_tx: watch::Sender<BridgePhase>,
@@ -312,7 +312,7 @@ async fn converge(
 
     // The boot-time Docker handle is the only engine session there is.
     let session = Some(Session(0));
-    let mut running: Option<Running> = None;
+    let mut running: Option<Running<E::Bridge>> = None;
     let mut attempts = Attempts::new();
     let mut epoch = 0;
 
@@ -331,10 +331,10 @@ async fn converge(
             match plan(&intent, session, built, attempts.retry_after.is_none()) {
                 Step::Keep => break,
                 Step::Start(session) => {
-                    if let Some(runtime) = try_start(&engine, intent.mode, &mut attempts).await {
+                    if let Some(bridge) = try_start(&engine, intent.mode, &mut attempts).await {
                         epoch += 1;
                         running = Some(Running {
-                            runtime,
+                            bridge,
                             built: Built {
                                 session,
                                 mode: intent.mode,
@@ -346,12 +346,12 @@ async fn converge(
                 Step::Abandon => running = None,
                 Step::Shutdown => {
                     if let Some(old) = running.take() {
-                        old.runtime.shutdown().await;
+                        old.bridge.shutdown().await;
                     }
                 }
                 Step::Teardown => {
                     if let Some(old) = running.take() {
-                        old.runtime.shutdown_and_remove_network().await;
+                        old.bridge.shutdown_and_remove_network().await;
                     }
                 }
             }
@@ -397,10 +397,10 @@ async fn publish(
     phase_tx: &watch::Sender<BridgePhase>,
     phase: BridgePhase,
     mode: NetbridgeMode,
-    running: Option<&Running>,
+    running: Option<&Running<impl Bridge>>,
 ) {
     let up = running.filter(|_| phase.epoch().is_some());
-    publish_ifindex(&handle.ifindex, up.map(|r| &r.runtime));
+    publish_ifindex(&handle.ifindex, up.map(|r| &r.bridge));
     phase_tx.send_replace(phase);
     *handle.mode.write().await = mode;
 }
@@ -409,9 +409,9 @@ async fn publish(
 /// connects can scope to it (see [`crate::upstream`]); `None` clears it.
 /// Resolution failure downgrades to unscoped connects rather than erroring —
 /// the bridge itself is fine, only exit-node immunity is lost.
-fn publish_ifindex(slot: &crate::upstream::BridgeIfIndex, runtime: Option<&Runtime>) {
-    let resolved = runtime.and_then(|rt| {
-        let name = rt.utun_name();
+fn publish_ifindex(slot: &crate::upstream::BridgeIfIndex, bridge: Option<&impl Bridge>) {
+    let resolved = bridge.and_then(|bridge| {
+        let name = bridge.utun_name();
         match nix::net::if_::if_nametoindex(name) {
             Ok(idx) => Some(idx),
             Err(err) => {
@@ -426,27 +426,54 @@ fn publish_ifindex(slot: &crate::upstream::BridgeIfIndex, runtime: Option<&Runti
 /// The control loop starts a bridge only through this, so that a test can
 /// run the loop with no container engine.
 pub(crate) trait BridgeStarter {
-    async fn start_bridge(&self, mode: NetbridgeMode, host_kp: &Keypair) -> Result<Runtime>;
+    type Bridge: Bridge;
+
+    async fn start_bridge(&self, mode: NetbridgeMode, host_kp: &Keypair) -> Result<Self::Bridge>;
+}
+
+/// A bridge that is up. The control loop holds it only through this, so
+/// that a test can hold one without root.
+pub(crate) trait Bridge {
+    fn utun_name(&self) -> &str;
+    /// Stops the bridge and keeps the docker network.
+    async fn shutdown(self);
+    async fn shutdown_and_remove_network(self);
 }
 
 impl BridgeStarter for Docker {
+    type Bridge = Runtime;
+
     async fn start_bridge(&self, mode: NetbridgeMode, host_kp: &Keypair) -> Result<Runtime> {
         Runtime::start_with_keypair(self.clone(), RuntimeOptions { mode }, host_kp).await
     }
 }
 
-async fn try_start(
-    engine: &impl BridgeStarter,
+impl Bridge for Runtime {
+    fn utun_name(&self) -> &str {
+        Runtime::utun_name(self)
+    }
+
+    async fn shutdown(self) {
+        Runtime::shutdown(self).await;
+    }
+
+    async fn shutdown_and_remove_network(self) {
+        Runtime::shutdown_and_remove_network(self).await;
+    }
+}
+
+async fn try_start<E: BridgeStarter>(
+    engine: &E,
     mode: NetbridgeMode,
     attempts: &mut Attempts,
-) -> Option<Runtime> {
+) -> Option<E::Bridge> {
     let started = engine.start_bridge(mode, &attempts.host_kp).await;
-    let runtime = attempts.settle(started)?;
+    let bridge = attempts.settle(started)?;
     info!(
         mode = mode.as_str(),
         "netbridge up: docker network `portman`, container pool 192.168.99.130–.253"
     );
-    Some(runtime)
+    Some(bridge)
 }
 
 fn persist(path: &Path, intent: &NetbridgeState) {
@@ -468,6 +495,7 @@ fn env_forces_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::{tempdir, TempDir};
     use tokio::time::Instant;
     use NetbridgeMode::{Docker as DockerMode, OptIn};
@@ -619,26 +647,82 @@ mod tests {
 
     struct Attempt {
         at: Instant,
+        mode: NetbridgeMode,
         host_key: String,
         /// What `netbridge.json` held while the attempt was in flight.
         saved: NetbridgeState,
     }
 
-    /// Fails every start with no I/O, so that the paused clock moves only
-    /// when the control loop waits.
-    struct NoEngine {
-        state_path: PathBuf,
-        seen: mpsc::UnboundedSender<Attempt>,
+    #[derive(Debug, PartialEq, Eq)]
+    enum Stop {
+        KeepsNetwork,
+        RemovesNetwork,
     }
 
-    impl BridgeStarter for NoEngine {
-        async fn start_bridge(&self, _mode: NetbridgeMode, host_kp: &Keypair) -> Result<Runtime> {
+    /// What a test sees of the bridges that the loop holds, and its hold on
+    /// their stops.
+    #[derive(Clone)]
+    struct Probe {
+        phase: watch::Receiver<BridgePhase>,
+        /// The phase that was published each time the loop asked a bridge
+        /// for its utun.
+        phase_at_utun_ask: Arc<Mutex<Vec<BridgePhase>>>,
+        stops: mpsc::UnboundedSender<Stop>,
+        stops_may_end: watch::Receiver<bool>,
+    }
+
+    impl Probe {
+        async fn stop(mut self, stop: Stop) {
+            let _ = self.stops.send(stop);
+            let _ = self.stops_may_end.wait_for(|may_end| *may_end).await;
+        }
+    }
+
+    /// Awaits nothing but a stop that a test holds open, so that the paused
+    /// clock moves only when the control loop waits.
+    struct TestEngine {
+        state_path: PathBuf,
+        seen: mpsc::UnboundedSender<Attempt>,
+        /// `None` fails every start, as an engine that is not there does.
+        probe: Option<Probe>,
+    }
+
+    impl BridgeStarter for TestEngine {
+        type Bridge = TestBridge;
+
+        async fn start_bridge(&self, mode: NetbridgeMode, host_kp: &Keypair) -> Result<TestBridge> {
             let _ = self.seen.send(Attempt {
                 at: Instant::now(),
+                mode,
                 host_key: host_kp.public_base64(),
                 saved: netbridge_state::load(&self.state_path),
             });
-            anyhow::bail!("no container engine")
+            match &self.probe {
+                Some(probe) => Ok(TestBridge(probe.clone())),
+                None => anyhow::bail!("no container engine"),
+            }
+        }
+    }
+
+    struct TestBridge(Probe);
+
+    /// The loopback interface stands in for the utun: its name resolves to
+    /// an index on every Mac.
+    const TEST_UTUN: &str = "lo0";
+
+    impl Bridge for TestBridge {
+        fn utun_name(&self) -> &str {
+            let published = *self.0.phase.borrow();
+            self.0.phase_at_utun_ask.lock().unwrap().push(published);
+            TEST_UTUN
+        }
+
+        async fn shutdown(self) {
+            self.0.stop(Stop::KeepsNetwork).await;
+        }
+
+        async fn shutdown_and_remove_network(self) {
+            self.0.stop(Stop::RemovesNetwork).await;
         }
     }
 
@@ -646,6 +730,9 @@ mod tests {
         handle: Handle,
         state_path: PathBuf,
         attempts: mpsc::UnboundedReceiver<Attempt>,
+        stops: mpsc::UnboundedReceiver<Stop>,
+        stops_may_end: watch::Sender<bool>,
+        phase_at_utun_ask: Arc<Mutex<Vec<BridgePhase>>>,
         _dir: TempDir,
     }
 
@@ -653,18 +740,40 @@ mod tests {
 
     impl Rig {
         fn start() -> Self {
-            Self::start_with_env_override(false)
+            Self::spawn(false, false)
         }
 
         fn start_with_env_override(forced_on: bool) -> Self {
+            Self::spawn(false, forced_on)
+        }
+
+        /// A rig whose engine starts every bridge, with the first one up.
+        async fn up() -> Self {
+            let mut rig = Self::spawn(true, false);
+            rig.send(Control::Enable).await;
+            rig.reaches(BridgePhase::Up { epoch: 1 }).await;
+            assert_eq!(rig.next_attempt().await.mode, OptIn);
+            rig
+        }
+
+        fn spawn(engine_starts_bridges: bool, forced_on: bool) -> Self {
             let dir = tempdir().unwrap();
             let state_path = dir.path().join("netbridge.json");
             let (seen, attempts) = mpsc::unbounded_channel();
-            let engine = NoEngine {
+            let (stop_seen, stops) = mpsc::unbounded_channel();
+            let (stops_may_end, may_end) = watch::channel(true);
+            let phase_at_utun_ask = Arc::new(Mutex::new(Vec::new()));
+            let (handle, rx, phase_tx) = handle_pair();
+            let engine = TestEngine {
                 state_path: state_path.clone(),
                 seen,
+                probe: engine_starts_bridges.then(|| Probe {
+                    phase: handle.phase.clone(),
+                    phase_at_utun_ask: phase_at_utun_ask.clone(),
+                    stops: stop_seen,
+                    stops_may_end: may_end,
+                }),
             };
-            let (handle, rx, phase_tx) = handle_pair();
             tokio::spawn(converge(
                 engine,
                 handle.clone(),
@@ -677,8 +786,40 @@ mod tests {
                 handle,
                 state_path,
                 attempts,
+                stops,
+                stops_may_end,
+                phase_at_utun_ask,
                 _dir: dir,
             }
+        }
+
+        /// The stop that the loop began. With `hold_stops` it stays in
+        /// flight until `end_stops`.
+        async fn next_stop(&mut self) -> Stop {
+            tokio::time::timeout(LONGEST_WAIT, self.stops.recv())
+                .await
+                .expect("a bridge stop")
+                .unwrap()
+        }
+
+        fn hold_stops(&self) {
+            self.stops_may_end.send_replace(false);
+        }
+
+        fn end_stops(&self) {
+            self.stops_may_end.send_replace(true);
+        }
+
+        fn phase(&self) -> BridgePhase {
+            *self.handle.phase.borrow()
+        }
+
+        async fn mode(&self) -> NetbridgeMode {
+            *self.handle.mode.read().await
+        }
+
+        fn ifindex(&self) -> Option<u32> {
+            *self.handle.ifindex.read().unwrap()
         }
 
         async fn send(&self, msg: Control) {
@@ -758,6 +899,87 @@ mod tests {
             "the disable waited for the retry timer"
         );
         assert!(!netbridge_state::load(&rig.state_path).enabled);
+        rig.no_attempt_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_control_message_ends_the_wait_for_a_retry_and_starts_a_new_sequence() {
+        let mut rig = Rig::start();
+        rig.send(Control::Enable).await;
+        rig.next_attempt().await;
+        rig.next_attempt().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let sent = Instant::now();
+        rig.send(Control::SetMode(DockerMode)).await;
+        let at_once = rig.next_attempt().await;
+        let retry = rig.next_attempt().await;
+
+        assert_eq!(at_once.at - sent, Duration::ZERO);
+        assert_eq!(retry.at - at_once.at, RETRY_BASE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_utun_index_is_published_before_the_phase_says_up() {
+        let rig = Rig::up().await;
+
+        assert_eq!(rig.ifindex(), nix::net::if_::if_nametoindex(TEST_UTUN).ok());
+        assert!(rig.ifindex().is_some());
+        assert_eq!(
+            rig.phase_at_utun_ask.lock().unwrap().first(),
+            Some(&BridgePhase::Starting),
+            "the phase said up before the loop asked the bridge for its utun"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_mode_change_keeps_the_network_and_reports_the_old_mode_until_the_bridge_is_gone() {
+        let mut rig = Rig::up().await;
+        rig.hold_stops();
+        rig.send(Control::SetMode(DockerMode)).await;
+
+        assert_eq!(rig.next_stop().await, Stop::KeepsNetwork);
+        assert_eq!(rig.phase(), BridgePhase::Stopping);
+        assert_eq!(rig.mode().await, OptIn);
+        assert_eq!(rig.ifindex(), None);
+
+        rig.end_stops();
+        rig.reaches(BridgePhase::Up { epoch: 2 }).await;
+        assert_eq!(rig.mode().await, DockerMode);
+        assert_eq!(rig.next_attempt().await.mode, DockerMode);
+        assert!(rig.ifindex().is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_phase_moves_on_from_the_old_bridge_before_the_mode_does() {
+        let mut rig = Rig::up().await;
+        rig.hold_stops();
+        rig.send(Control::SetMode(DockerMode)).await;
+        rig.next_stop().await;
+
+        // A status read that took the mode and has yet to take the phase.
+        let status_read = rig.handle.mode.read().await;
+        rig.end_stops();
+        rig.reaches(BridgePhase::Starting).await;
+        assert_eq!(*status_read, OptIn);
+
+        drop(status_read);
+        rig.reaches(BridgePhase::Up { epoch: 2 }).await;
+        assert_eq!(rig.mode().await, DockerMode);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_reports_stopping_until_the_bridge_and_its_network_are_gone() {
+        let mut rig = Rig::up().await;
+        rig.hold_stops();
+        rig.send(Control::Disable).await;
+
+        assert_eq!(rig.next_stop().await, Stop::RemovesNetwork);
+        assert_eq!(rig.phase(), BridgePhase::Stopping);
+        assert_eq!(rig.ifindex(), None);
+
+        rig.end_stops();
+        rig.reaches(BridgePhase::Disabled).await;
         rig.no_attempt_follows().await;
     }
 
