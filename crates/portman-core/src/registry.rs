@@ -8,6 +8,7 @@
 //! take a shared lock, writers an exclusive one. Keyed by hostname.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::{Arc, RwLock};
 
 use portman_protocol::Entry;
@@ -27,14 +28,33 @@ pub struct ContainerDiff {
 }
 
 /// Cloneable handle to the shared registry — all clones point at the same data.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Registry {
     inner: Arc<RwLock<HashMap<String, Entry>>>,
+    on_release: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl fmt::Debug for Registry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Registry")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Registry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A registry that calls `on_release` after each [`Registry::remove`] that
+    /// takes an entry out. A container can carry the freed hostname as a
+    /// label, and nothing else reports that the hostname is free.
+    pub fn with_release_hook(on_release: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Arc::default(),
+            on_release: Some(Arc::new(on_release)),
+        }
     }
 
     /// Insert or replace the entry for `entry.host`. Returns the previous entry, if any.
@@ -54,14 +74,20 @@ impl Registry {
     /// Remove and return the entry for `host`, if present.
     pub fn remove(&self, host: &str) -> Option<Entry> {
         let key = host.to_ascii_lowercase();
-        let mut guard = self.inner.write().expect("registry lock poisoned");
-        if guard
-            .get(&key)
-            .is_some_and(|entry| entry.source == portman_protocol::Source::Builtin)
-        {
-            return None;
+        let removed = {
+            let mut guard = self.inner.write().expect("registry lock poisoned");
+            if guard
+                .get(&key)
+                .is_some_and(|entry| entry.source == portman_protocol::Source::Builtin)
+            {
+                return None;
+            }
+            guard.remove(&key)
+        };
+        if let (Some(_), Some(on_release)) = (&removed, &self.on_release) {
+            on_release();
         }
-        guard.remove(&key)
+        removed
     }
 
     /// Make the set of container-sourced entries equal `desired`, under one
@@ -354,6 +380,30 @@ mod tests {
 
         assert_eq!(diff.added, desired);
         assert_eq!(r.get("api.test").unwrap().source, Source::Container);
+    }
+
+    #[test]
+    fn release_hook_runs_once_for_each_entry_removed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let releases = Arc::new(AtomicUsize::new(0));
+        let counter = releases.clone();
+        let r = Registry::with_release_hook(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let seen_by_clone = r.clone();
+        r.upsert(at("api.test", "127.0.0.1:3070"));
+        r.upsert(builtin(DASHBOARD_HOST));
+        r.replace_container_entries(vec![container("web.test", "aaa")]);
+        r.replace_container_entries(Vec::new());
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+
+        assert!(seen_by_clone.remove("api.test").is_some());
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+
+        assert!(r.remove("api.test").is_none());
+        assert!(r.remove(DASHBOARD_HOST).is_none());
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 
     #[test]

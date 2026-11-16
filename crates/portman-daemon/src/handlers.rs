@@ -671,7 +671,6 @@ fn handle_remove(state: &DaemonState, host: String) -> Response {
     if let Some(existing) = state.registry.get(&host) {
         if existing.source == portman_core::Source::Static {
             state.registry.remove(&host);
-            state.container_resync.notify_one();
         }
     }
     info!(host = %host, "removed static rule");
@@ -804,7 +803,7 @@ mod tests {
             )
             .expect("lazy docker handle")
         };
-        let registry = portman_core::Registry::new();
+        let (registry, container_resync) = crate::docker_events::registry_with_resync();
         let static_store =
             Arc::new(portman_core::StaticStore::load(dir.path().join("static.json")).unwrap());
         let tls_store =
@@ -842,7 +841,7 @@ mod tests {
             tls_store,
             cert_manager: crate::certs::CertManager::new(dir.path().join("certs"), None),
             known_tlds: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-            container_resync: Arc::new(tokio::sync::Notify::new()),
+            container_resync,
             bridge_health: crate::bridge_health::new_shared(),
             netbridge: netbridge_handle,
             resource_samples: crate::resources::new_shared_samples(),
@@ -1208,6 +1207,39 @@ mod tests {
         let (key, entry) = state.registry.lookup("7.demo.test").expect("wildcard hit");
         assert_eq!(key, "*.demo.test");
         assert_eq!(entry.target, "127.0.0.1:3070");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_static_rule_wakes_the_container_reconcile() {
+        use futures_util::FutureExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        state.known_tlds.write().unwrap().insert("test".to_string());
+
+        let added = dispatch(
+            Request::AddStatic {
+                host: "api.demo.test".into(),
+                target: "127.0.0.1:3070".into(),
+                mode: Mode::Http,
+                service: None,
+                project: None,
+            },
+            &state,
+        )
+        .await;
+        assert!(matches!(added, Response::Ok), "{added:?}");
+        assert!(state.container_resync.notified().now_or_never().is_none());
+
+        let removed = dispatch(
+            Request::RemoveStatic {
+                host: "api.demo.test".into(),
+            },
+            &state,
+        )
+        .await;
+        assert!(matches!(removed, Response::Ok), "{removed:?}");
+        assert!(state.container_resync.notified().now_or_never().is_some());
     }
 
     #[tokio::test(flavor = "multi_thread")]

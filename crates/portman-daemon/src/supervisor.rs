@@ -4187,7 +4187,17 @@ mod tests {
         portman_core::Registry,
         Arc<portman_core::StaticStore>,
     ) {
-        let registry = portman_core::Registry::new();
+        route_test_setup_on(dir, portman_core::Registry::new())
+    }
+
+    fn route_test_setup_on(
+        dir: &TempDir,
+        registry: portman_core::Registry,
+    ) -> (
+        Supervisor,
+        portman_core::Registry,
+        Arc<portman_core::StaticStore>,
+    ) {
         let static_store =
             Arc::new(portman_core::StaticStore::load(dir.path().join("static.json")).unwrap());
         let binder = Arc::new(RouteBinder {
@@ -4247,6 +4257,95 @@ mod tests {
         assert!(
             registry.get("web.internal").is_none(),
             "route removed on down"
+        );
+    }
+
+    fn container_entry(host: &str) -> portman_protocol::Entry {
+        portman_protocol::Entry {
+            host: host.into(),
+            target: "192.168.99.130:80".into(),
+            source: portman_protocol::Source::Container,
+            mode: portman_protocol::Mode::Http,
+            container_id: Some("aaaaaaaaaaaa".into()),
+            project: None,
+            egress: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn down_hands_the_hostname_back_to_a_labelled_container() {
+        use futures_util::FutureExt;
+
+        let dir = tempdir().unwrap();
+        let (registry, resync) = crate::docker_events::registry_with_resync();
+        let (sup, registry, _static_store) = route_test_setup_on(&dir, registry);
+        let labelled = vec![container_entry("web.demo.localhost")];
+        registry.replace_container_entries(labelled.clone());
+
+        let svc = routed_def("web", "web.demo.localhost", 34569, dir.path());
+        sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
+            .await
+            .unwrap();
+        sup.up(&["web".to_string()]).await.unwrap();
+        registry.replace_container_entries(labelled.clone());
+        assert_eq!(
+            registry.get("web.demo.localhost").unwrap().source,
+            portman_protocol::Source::Service
+        );
+        assert!(
+            resync.notified().now_or_never().is_none(),
+            "a held hostname needs no reconcile"
+        );
+
+        sup.down(&["web".to_string()]).await.unwrap();
+
+        assert!(
+            resync.notified().now_or_never().is_some(),
+            "down wakes the container reconcile"
+        );
+        registry.replace_container_entries(labelled.clone());
+        assert_eq!(
+            registry.get("web.demo.localhost"),
+            labelled.first().cloned()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_egress_route_hands_the_hostname_back_to_a_labelled_container() {
+        use futures_util::FutureExt;
+
+        let dir = tempdir().unwrap();
+        let (registry, resync) = crate::docker_events::registry_with_resync();
+        let (sup, registry, _static_store) = route_test_setup_on(&dir, registry);
+        let labelled = vec![container_entry("api.demo.localhost")];
+
+        sup.sync(
+            dir.path(),
+            vec![],
+            egress_blocks(),
+            Map::from([("gh".to_string(), egress_route("api.demo.localhost"))]),
+        )
+        .await
+        .unwrap();
+        registry.replace_container_entries(labelled.clone());
+        assert_eq!(
+            registry.get("api.demo.localhost").unwrap().source,
+            portman_protocol::Source::Egress
+        );
+        assert!(resync.notified().now_or_never().is_none());
+
+        sup.sync(dir.path(), vec![], Map::new(), Map::new())
+            .await
+            .unwrap();
+
+        assert!(
+            resync.notified().now_or_never().is_some(),
+            "a dropped egress route wakes the container reconcile"
+        );
+        registry.replace_container_entries(labelled.clone());
+        assert_eq!(
+            registry.get("api.demo.localhost"),
+            labelled.first().cloned()
         );
     }
 

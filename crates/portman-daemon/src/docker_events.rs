@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -10,7 +11,8 @@ use bollard::models::{EventMessage, EventMessageTypeEnum};
 use bollard::query_parameters::{EventsOptionsBuilder, ListContainersOptionsBuilder};
 use bollard::Docker;
 use futures_util::{FutureExt, Stream, StreamExt};
-use portman_core::Mode;
+use portman_core::{Mode, Registry};
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::discovery::{self, Skipped};
@@ -24,6 +26,15 @@ const ADDRESS_RETRY: [Duration; 5] = [
     Duration::from_secs(2),
     Duration::from_secs(4),
 ];
+
+/// The daemon's registry and the handle that wakes [`run`]. The registry
+/// wakes it for every hostname it releases.
+pub(crate) fn registry_with_resync() -> (Registry, Arc<Notify>) {
+    let resync = Arc::new(Notify::new());
+    let wake = resync.clone();
+    let registry = Registry::with_release_hook(move || wake.notify_one());
+    (registry, resync)
+}
 
 pub(crate) async fn run(docker: Docker, state: DaemonState) -> Result<()> {
     // bollard sends the request on the first poll, so the subscription cannot

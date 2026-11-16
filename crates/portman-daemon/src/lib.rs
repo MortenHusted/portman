@@ -153,8 +153,8 @@ pub(crate) struct DaemonState {
     /// to answer `TldList` and to gate registration (hosts with unregistered
     /// TLDs are rejected with a warning).
     pub known_tlds: Arc<RwLock<HashSet<String>>>,
-    /// Wakes the container reconcile when the managed TLD set changes or a
-    /// static rule releases a host, because no Docker event reports either.
+    /// Wakes the container reconcile when a TLD is added or the registry
+    /// releases a hostname, because no Docker event reports either.
     pub container_resync: Arc<tokio::sync::Notify>,
     /// Current host↔VM bridge health assessment, updated every 5s by the
     /// `bridge_health` task. Surfaced via IPC `Status` so the menubar can
@@ -244,7 +244,7 @@ pub async fn daemon_main() -> Result<()> {
 
     ensure_data_dir_owned_by_login_user().context("preparing data dir")?;
 
-    let registry = Registry::new();
+    let (registry, container_resync) = docker_events::registry_with_resync();
     // Shared host → loopback-address map: the DNS server answers TCP hosts with
     // their front, and the forwarder binds a listener there. Same handle, so
     // they always agree on the address.
@@ -344,7 +344,7 @@ pub async fn daemon_main() -> Result<()> {
         tls_store: tls_store.clone(),
         cert_manager: cert_manager.clone(),
         known_tlds: known_tlds.clone(),
-        container_resync: Arc::new(tokio::sync::Notify::new()),
+        container_resync,
         bridge_health: bridge_health_shared.clone(),
         netbridge: netbridge_handle.clone(),
         resource_samples,
