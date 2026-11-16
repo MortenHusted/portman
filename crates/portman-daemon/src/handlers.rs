@@ -93,7 +93,7 @@ pub(crate) async fn dispatch(request: Request, state: &DaemonState) -> Response 
         Request::TldList => Response::Tlds {
             tlds: build_tld_infos(state),
         },
-        Request::TldAdd { tld, tls_mode } => handle_tld_add(state, tld, tls_mode).await,
+        Request::TldAdd { tld, tls_mode } => handle_tld_add(state, tld, tls_mode),
         Request::TldRemove { tld } => handle_tld_remove(state, tld),
         Request::CertHealth => handle_cert_health(state),
         Request::ResourceUsage => handle_resource_usage(state),
@@ -671,13 +671,14 @@ fn handle_remove(state: &DaemonState, host: String) -> Response {
     if let Some(existing) = state.registry.get(&host) {
         if existing.source == portman_core::Source::Static {
             state.registry.remove(&host);
+            state.container_resync.notify_one();
         }
     }
     info!(host = %host, "removed static rule");
     Response::Ok
 }
 
-async fn handle_tld_add(
+fn handle_tld_add(
     state: &DaemonState,
     tld: String,
     tls_mode: Option<portman_core::TlsMode>,
@@ -708,7 +709,7 @@ async fn handle_tld_add(
     }
 
     state.tld_add(tld.clone());
-    crate::rehydrate_registry_for_managed_tlds(state).await;
+    crate::rehydrate_registry_for_managed_tlds(state);
 
     if state.tls_store.mode_for(&tld).requires_tls() {
         provision_certs_under(state, &tld);
@@ -841,6 +842,7 @@ mod tests {
             tls_store,
             cert_manager: crate::certs::CertManager::new(dir.path().join("certs"), None),
             known_tlds: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+            container_resync: Arc::new(tokio::sync::Notify::new()),
             bridge_health: crate::bridge_health::new_shared(),
             netbridge: netbridge_handle,
             resource_samples: crate::resources::new_shared_samples(),

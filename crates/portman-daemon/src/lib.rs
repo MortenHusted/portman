@@ -1,12 +1,13 @@
 //! portman daemon entry point.
 //!
-//! Phase 3: in-memory registry fed by (1) docker events, (2) a one-shot scan
-//! of already-running containers at boot, and (3) persisted static rules.
+//! Phase 3: in-memory registry fed by (1) a reconcile against the running
+//! containers on every docker event and (2) persisted static rules.
 //! IPC server answers list/status/add/remove.
 
 mod certs;
 mod dashboard;
 mod dashboard_auth;
+mod discovery;
 mod dns;
 mod docker_events;
 mod egress;
@@ -152,6 +153,9 @@ pub(crate) struct DaemonState {
     /// to answer `TldList` and to gate registration (hosts with unregistered
     /// TLDs are rejected with a warning).
     pub known_tlds: Arc<RwLock<HashSet<String>>>,
+    /// Wakes the container reconcile when the managed TLD set changes or a
+    /// static rule releases a host, because no Docker event reports either.
+    pub container_resync: Arc<tokio::sync::Notify>,
     /// Current host↔VM bridge health assessment, updated every 5s by the
     /// `bridge_health` task. Surfaced via IPC `Status` so the menubar can
     /// tint the sailboat icon green/yellow/red.
@@ -340,6 +344,7 @@ pub async fn daemon_main() -> Result<()> {
         tls_store: tls_store.clone(),
         cert_manager: cert_manager.clone(),
         known_tlds: known_tlds.clone(),
+        container_resync: Arc::new(tokio::sync::Notify::new()),
         bridge_health: bridge_health_shared.clone(),
         netbridge: netbridge_handle.clone(),
         resource_samples,
@@ -355,9 +360,6 @@ pub async fn daemon_main() -> Result<()> {
 
     seed_builtin_routes(&state);
     seed_from_static_store(&state);
-    if !args.managed_broker {
-        seed_from_running_containers(&docker, &state).await;
-    }
 
     // Provision certs for any already-registered entries under TLS-enabled TLDs.
     provision_certs_for_existing(&state);
@@ -567,9 +569,9 @@ fn seed_builtin_routes(state: &DaemonState) {
     });
 }
 
-pub(crate) async fn rehydrate_registry_for_managed_tlds(state: &DaemonState) {
+pub(crate) fn rehydrate_registry_for_managed_tlds(state: &DaemonState) {
     seed_from_static_store(state);
-    seed_from_running_containers(&state.docker, state).await;
+    state.container_resync.notify_one();
 }
 
 fn init_tracing() {
@@ -731,135 +733,6 @@ fn seed_from_static_store(state: &DaemonState) {
     if skipped > 0 {
         warn!(count = skipped, "static rules skipped (unmanaged TLD)");
     }
-}
-
-async fn seed_from_running_containers(docker: &Docker, state: &DaemonState) {
-    use bollard::query_parameters::{InspectContainerOptions, ListContainersOptionsBuilder};
-
-    let opts = ListContainersOptionsBuilder::default().build();
-    let summaries = match docker.list_containers(Some(opts)).await {
-        Ok(list) => list,
-        Err(err) => {
-            warn!(error = %err, "initial container scan failed");
-            return;
-        }
-    };
-
-    let mut seeded = 0_usize;
-    let mut skipped = 0_usize;
-    for summary in summaries {
-        let Some(labels) = summary.labels.as_ref() else {
-            continue;
-        };
-        let Some(raw_host) = labels.get("dev.portman.host").filter(|v| !v.is_empty()) else {
-            continue;
-        };
-        let host = match docker_events::normalize_host_label(raw_host) {
-            Ok(host) => host,
-            Err(err) => {
-                warn!(
-                    host = %raw_host,
-                    error = %err,
-                    "skipping container: invalid dev.portman.host label"
-                );
-                skipped += 1;
-                continue;
-            }
-        };
-        if host == portman_core::registry::DASHBOARD_HOST {
-            warn!(%host, "skipping container: hostname is reserved for portman's dashboard");
-            skipped += 1;
-            continue;
-        }
-        if !state.host_is_routable(&host) {
-            warn!(%host, "skipping container: TLD is not managed; run `portman tld add <tld>` first");
-            skipped += 1;
-            continue;
-        }
-        let mode = Mode::parse_label(labels.get("dev.portman.mode").map(String::as_str));
-        if mode == Mode::Tcp && portman_core::tld::host_is_localhost(&host) {
-            warn!(%host, "skipping container: .localhost is HTTP-only because the operating system fixes it to loopback");
-            skipped += 1;
-            continue;
-        }
-        let Some(port) = labels
-            .get("dev.portman.port")
-            .cloned()
-            .filter(|v| !v.is_empty())
-            .or_else(|| match mode {
-                Mode::Http | Mode::Egress | Mode::Unknown => Some("80".into()),
-                Mode::Tcp => None,
-            })
-        else {
-            warn!(
-                %host,
-                "skipping container: dev.portman.mode=tcp requires dev.portman.port"
-            );
-            skipped += 1;
-            continue;
-        };
-        let Some(id) = summary.id.as_deref() else {
-            continue;
-        };
-
-        match docker
-            .inspect_container(id, None::<InspectContainerOptions>)
-            .await
-        {
-            Ok(inspect) => {
-                if let Some(target) = pick_ip(&inspect).map(|ip| format!("{ip}:{port}")) {
-                    state.registry.upsert(Entry {
-                        host: host.clone(),
-                        target,
-                        source: Source::Container,
-                        mode,
-                        container_id: Some(short(id).to_string()),
-                        egress: None,
-                        project: inspect
-                            .config
-                            .as_ref()
-                            .and_then(|c| c.labels.as_ref())
-                            .and_then(|l| l.get("dev.portman.project"))
-                            .cloned(),
-                    });
-                    seeded += 1;
-                }
-            }
-            Err(err) => warn!(error = %err, id = short(id), "initial scan: inspect failed"),
-        }
-    }
-    if seeded > 0 {
-        info!(
-            count = seeded,
-            "seeded registry with already-running containers"
-        );
-    }
-    if skipped > 0 {
-        warn!(count = skipped, "containers skipped (unmanaged TLD)");
-    }
-}
-
-fn pick_ip(inspect: &bollard::models::ContainerInspectResponse) -> Option<String> {
-    let settings = inspect.network_settings.as_ref()?;
-    if let Some(ip) = settings.ip_address.as_deref() {
-        if !ip.is_empty() {
-            return Some(ip.to_string());
-        }
-    }
-    if let Some(networks) = settings.networks.as_ref() {
-        for net in networks.values() {
-            if let Some(ip) = net.ip_address.as_deref() {
-                if !ip.is_empty() {
-                    return Some(ip.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-fn short(id: &str) -> &str {
-    &id[..id.len().min(12)]
 }
 
 #[cfg(test)]
