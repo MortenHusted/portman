@@ -1788,6 +1788,11 @@ mod tests {
         fake.hold(&inspect, r#"{"State": {"Running": false}}"#);
         assert!(!engine.runs_container(Session(1), id).await, "stopped");
 
+        for silent in ["{}", r#"{"State": {}}"#] {
+            fake.hold(&inspect, silent);
+            assert!(!engine.runs_container(Session(1), id).await, "{silent}");
+        }
+
         fake.hold(&inspect, r#"{"State": {"Running": true}}"#);
         assert!(engine.runs_container(Session(1), id).await);
         assert!(
