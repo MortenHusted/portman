@@ -3,7 +3,7 @@
 use crate::client::{bridge_phase, wait_for_bridge_state};
 use crate::cmd::run_setup_image_build;
 use crate::doctor;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use portman_protocol::NetbridgeMode;
 use tokio::time::{sleep, Duration};
 
@@ -74,7 +74,12 @@ pub(crate) async fn cmd_bridge_mode(mode: Option<String>) -> Result<()> {
         Response::Ok => {
             wait_for_bridge_mode(mode).await?;
             if was_up {
-                wait_for_bridge_state(true).await?;
+                wait_for_bridge_state(true).await.with_context(|| {
+                    format!(
+                        "netbridge mode is set to {} and the bridge is not up",
+                        NetbridgeMode::display_word(mode)
+                    )
+                })?;
             }
             println!(
                 "netbridge mode set to {}",
