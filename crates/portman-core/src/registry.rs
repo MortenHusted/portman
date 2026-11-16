@@ -64,22 +64,6 @@ impl Registry {
         guard.remove(&key)
     }
 
-    /// Remove any entries whose `container_id` matches. Used on container
-    /// stop/die events where we know the id but not the host the user mapped.
-    /// Returns the removed entries.
-    pub fn remove_by_container_id(&self, id: &str) -> Vec<Entry> {
-        let mut guard = self.inner.write().expect("registry lock poisoned");
-        let victims: Vec<String> = guard
-            .iter()
-            .filter(|(_, e)| e.container_id.as_deref() == Some(id))
-            .map(|(k, _)| k.clone())
-            .collect();
-        victims
-            .into_iter()
-            .filter_map(|k| guard.remove(&k))
-            .collect()
-    }
-
     /// Make the set of container-sourced entries equal `desired`, under one
     /// write lock. A host that a static, service, or builtin entry holds keeps
     /// that entry, because an explicit route outranks a container label. A
@@ -258,18 +242,6 @@ mod tests {
         r.upsert(container("a.test", "new"));
         assert_eq!(r.len(), 1);
         assert_eq!(r.get("a.test").unwrap().container_id.unwrap(), "new");
-    }
-
-    #[test]
-    fn remove_by_container_id_removes_all_matching() {
-        let r = Registry::new();
-        r.upsert(container("a.test", "abc"));
-        r.upsert(container("b.test", "xyz"));
-        r.upsert(container("c.test", "abc")); // edge: same id, two hosts
-        let removed = r.remove_by_container_id("abc");
-        assert_eq!(removed.len(), 2);
-        assert_eq!(r.len(), 1);
-        assert!(r.get("b.test").is_some());
     }
 
     fn service(host: &str) -> Entry {
