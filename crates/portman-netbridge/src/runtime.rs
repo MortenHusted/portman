@@ -793,12 +793,21 @@ fn docker_removal_already_underway(err: &DockerError) -> bool {
     }
 }
 
+/// Removes what a bridge can leave in the engine: the setup container and
+/// the `portman` network. Each is removed only when it carries portman's
+/// labels, and one that is absent is passed over. The network stays while a
+/// container is attached to it, because the engine refuses that removal.
+pub async fn remove_leftovers(docker: &Docker) {
+    best_effort_remove_setup_container(docker).await;
+    remove_portman_network_if_owned(docker).await;
+}
+
 async fn remove_portman_network_if_owned(docker: &Docker) {
-    match docker
+    let inspected = docker
         .inspect_network(PORTMAN_NETWORK, None::<InspectNetworkOptions>)
-        .await
-    {
-        Ok(net) if network_is_portman_managed(net.labels.as_ref()) => {
+        .await;
+    match network_removal(inspected.as_ref().map(|net| net.labels.as_ref())) {
+        NetworkRemoval::Remove => {
             if let Err(err) = docker.remove_network(PORTMAN_NETWORK).await {
                 warn!(
                     network = PORTMAN_NETWORK,
@@ -807,15 +816,38 @@ async fn remove_portman_network_if_owned(docker: &Docker) {
                 );
             }
         }
-        Ok(_) => warn!(
+        NetworkRemoval::Foreign => warn!(
             network = PORTMAN_NETWORK,
             "skipping docker network removal because it is not marked as portman-managed"
         ),
-        Err(err) => warn!(
+        NetworkRemoval::Absent => {}
+        NetworkRemoval::Unknown(err) => warn!(
             network = PORTMAN_NETWORK,
             error = %err,
             "could not inspect docker network before removal"
         ),
+    }
+}
+
+/// What to do with the network named `portman`, given the answer to an
+/// inspect of it.
+#[derive(Debug)]
+enum NetworkRemoval<'a> {
+    Remove,
+    /// Something else owns the name.
+    Foreign,
+    Absent,
+    Unknown(&'a DockerError),
+}
+
+fn network_removal<'a>(
+    inspected: Result<Option<&HashMap<String, String>>, &'a DockerError>,
+) -> NetworkRemoval<'a> {
+    match inspected {
+        Ok(labels) if network_is_portman_managed(labels) => NetworkRemoval::Remove,
+        Ok(_) => NetworkRemoval::Foreign,
+        Err(err) if docker_not_found(err) => NetworkRemoval::Absent,
+        Err(err) => NetworkRemoval::Unknown(err),
     }
 }
 
@@ -1351,6 +1383,33 @@ destination: 172.18.0.0
         assert!(env.iter().any(|value| value.starts_with("HOST_PUBKEY=")));
         assert!(env.iter().any(|value| value == "PEER_CIDR=192.168.99.2/25"));
         assert!(!env.iter().any(|value| value.starts_with("PEER_PRIVKEY=")));
+    }
+
+    #[test]
+    fn the_cleanup_removes_the_network_only_when_it_carries_portmans_label() {
+        let ours = HashMap::from([(MANAGED_LABEL.to_string(), MANAGED_LABEL_VALUE.to_string())]);
+        let other_value = HashMap::from([(MANAGED_LABEL.to_string(), "0".to_string())]);
+        let other_label =
+            HashMap::from([("com.docker.compose.network".to_string(), "1".to_string())]);
+
+        assert!(matches!(
+            network_removal(Ok(Some(&ours))),
+            NetworkRemoval::Remove
+        ));
+        for foreign in [None, Some(&other_value), Some(&other_label)] {
+            assert!(
+                matches!(network_removal(Ok(foreign)), NetworkRemoval::Foreign),
+                "{foreign:?}"
+            );
+        }
+        assert!(matches!(
+            network_removal(Err(&server_err(404, "network portman not found"))),
+            NetworkRemoval::Absent
+        ));
+        assert!(matches!(
+            network_removal(Err(&server_err(500, "boom"))),
+            NetworkRemoval::Unknown(_)
+        ));
     }
 
     fn server_err(status_code: u16, message: &str) -> DockerError {
