@@ -97,9 +97,9 @@ pub struct Runtime {
 }
 
 /// The WireGuard listen port, bound. Every removal from the engine takes one
-/// as proof that no other daemon's bridge is up. A bridge holds its port from
-/// before its setup container exists until that container is removed, and
-/// two sockets cannot bind one port.
+/// as proof that no other daemon's bridge is up: two sockets cannot bind one
+/// port, and a bridge holds its port from before its setup container exists
+/// until a shutdown has removed that container or the bridge is dropped.
 struct ListenPort(Arc<UdpSocket>);
 
 impl ListenPort {
@@ -126,10 +126,9 @@ impl Runtime {
         Self::start_with_keypair(docker, options, &Keypair::generate()).await
     }
 
-    /// As [`Runtime::start_with_options`], but with the host keypair supplied by
-    /// the caller so a retry reuses the same identity instead of minting a new
-    /// one. A retry that regenerates keys leaves any tunnel the failed attempt
-    /// created peered to a VM that no longer knows it.
+    /// As [`Runtime::start_with_options`], with the host keypair supplied by
+    /// the caller. A caller that retries a failed start passes the same
+    /// keypair, and the key is then logged once and not for every retry.
     pub async fn start_with_keypair(
         docker: Docker,
         options: RuntimeOptions,
@@ -236,9 +235,9 @@ impl Runtime {
 
     /// Shutdown + best-effort remove the docker network. Used when the
     /// user explicitly disables the bridge (`portman bridge disable`),
-    /// not on daemon restart. If user containers are attached, the
-    /// network removal will fail silently — docker refuses to remove a
-    /// network with endpoints. The user disconnects them first.
+    /// not on daemon restart. Docker refuses the removal only while a
+    /// running container is attached, and that is logged. A stopped
+    /// container that refers to the network fails to start afterwards.
     pub async fn shutdown_and_remove_network(mut self) {
         self.stop().await;
         remove_portman_network_if_owned(&self.docker, &self.listen_port).await;

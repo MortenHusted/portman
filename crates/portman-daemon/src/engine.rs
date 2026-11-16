@@ -22,8 +22,11 @@ use tracing::{debug, info, warn};
 use crate::discovery::{self, Container, Skip, Skipped};
 use crate::DaemonState;
 
-/// One unbroken connection to an engine. What is built on an engine records
-/// its session, and is stale once the link holds another one.
+/// One event stream to an engine, from the connect attempt that the engine
+/// answered until the stream ends. bollard opens a connection for each
+/// request, so only that stream shows that the engine stayed. What is built
+/// on an engine records its session. Once the link holds another one, the
+/// engine can have restarted or be another engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Session(pub(crate) u64);
 
@@ -134,7 +137,8 @@ pub(crate) fn open_socket(path: &Path) -> Option<Docker> {
 
 /// Owns the link for as long as the daemon polls it. Every connect attempt
 /// goes through `candidates` in order until one answers, so a socket that
-/// appears, goes stale or moves to another runtime needs no daemon restart.
+/// appears or goes stale at one of those paths needs no daemon restart. The
+/// paths are fixed at boot.
 /// The container routes are cleared when an attempt finds no engine. They
 /// stay while a session that ended is replaced by the next one, and the
 /// first list of that session corrects them.
@@ -300,9 +304,9 @@ impl Relist {
     }
 }
 
-/// The daemon's registry and the handle that wakes the reconcile of the
-/// session that is open. The registry wakes it for every hostname it
-/// releases.
+/// The daemon's registry and the handle that wakes the reconcile loop. The
+/// registry wakes it for every hostname it releases. With no session open
+/// the handle keeps one wake, and the next session then lists once more.
 pub(crate) fn registry_with_resync() -> (Registry, Arc<Notify>) {
     let resync = Arc::new(Notify::new());
     let wake = resync.clone();

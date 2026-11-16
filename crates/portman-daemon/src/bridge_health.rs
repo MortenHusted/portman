@@ -7,9 +7,8 @@
 //!   2. For each such network, read its subnet(s) and ask the macOS
 //!      routing table whether that subnet is routed via the active bridge
 //!      interface (or a live legacy `utun` when the native bridge is disabled).
-//!   3. Reduce to a single assessment — `healthy` | `routes_missing` |
-//!      `offline` | `unknown` — and publish it to a `RwLock<String>` the
-//!      IPC Status handler reads.
+//!   3. Reduce to a single [`BridgeAssessment`] and publish it to the
+//!      [`Shared`] lock that the IPC Status handler reads.
 //!
 //! This is the first daemon-side consumer of the Phase-A primitives. It
 //! deliberately doesn't depend on the Phase-A example code in
