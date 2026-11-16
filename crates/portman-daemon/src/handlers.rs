@@ -1327,6 +1327,34 @@ pub(crate) mod tests {
         assert!(state.known_tlds.read().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn a_tld_add_and_a_tld_remove_each_wake_the_netbridge() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        let woken = || async {
+            let wake = state.netbridge.tlds_changed.notified();
+            tokio::time::timeout(std::time::Duration::ZERO, wake)
+                .await
+                .is_ok()
+        };
+        assert!(!woken().await);
+
+        let tld = || "test".to_string();
+        for request in [
+            Request::TldAdd {
+                tld: tld(),
+                tls_mode: None,
+            },
+            Request::TldRemove { tld: tld() },
+        ] {
+            let response = dispatch(request, &state).await;
+
+            assert!(matches!(response, Response::Ok), "{response:?}");
+            assert!(woken().await);
+            assert!(!woken().await, "one change woke the netbridge twice");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn localhost_tcp_routes_are_refused() {
         let dir = tempfile::tempdir().unwrap();

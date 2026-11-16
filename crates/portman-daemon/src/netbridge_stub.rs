@@ -1,11 +1,12 @@
 //! Linux stub — no VM↔host WireGuard bridge on Linux.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use portman_core::NetbridgeMode;
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{mpsc, watch, Notify, RwLock};
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -46,6 +47,9 @@ pub(crate) struct Handle {
     /// upstream connects stay unscoped. Present to keep the Handle shape
     /// identical across platforms.
     pub ifindex: crate::upstream::BridgeIfIndex,
+    /// Notified and never awaited on Linux, which runs no DNS forwarder.
+    /// Present to keep the Handle shape identical across platforms.
+    pub tlds_changed: Arc<Notify>,
 }
 
 pub(crate) fn handle_pair() -> (Handle, mpsc::Receiver<Control>, watch::Sender<BridgePhase>) {
@@ -58,6 +62,7 @@ pub(crate) fn handle_pair() -> (Handle, mpsc::Receiver<Control>, watch::Sender<B
             mode,
             phase,
             ifindex: crate::upstream::new_bridge_ifindex(),
+            tlds_changed: Arc::new(Notify::new()),
         },
         rx,
         phase_tx,
@@ -70,6 +75,7 @@ pub(crate) async fn run(
     mut rx: mpsc::Receiver<Control>,
     _phase_tx: watch::Sender<BridgePhase>,
     _state_path: PathBuf,
+    _known_tlds: Arc<std::sync::RwLock<HashSet<String>>>,
 ) -> Result<()> {
     while let Some(msg) = rx.recv().await {
         match msg {

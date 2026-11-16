@@ -38,9 +38,16 @@
 //!     cannot take what another daemon's bridge runs on.
 //!   - a failed start is retried with a growing delay. The wait does not
 //!     hold up control messages, and a new session starts the delay over.
+//!   - a bridge that is up gets the DNS forwarder in the VM: the loop makes
+//!     the bridge ensure it once, and again when the managed TLD set
+//!     changes. An ensure that does not put the forwarder in place leaves
+//!     the bridge up and is repeated a minute later. The forwarder outlives
+//!     the bridge and the daemon. It is removed only where the docker
+//!     network is, on the user's `Disable`.
 //!   - [`publish`] tells the rest of the daemon what the bridge is doing:
 //!     the [`phase`], the mode, and the interface index of the utun.
 
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,10 +57,11 @@ use bollard::query_parameters::InspectContainerOptions;
 use bollard::Docker;
 use portman_core::netbridge_state::{self, NetbridgeState};
 use portman_core::NetbridgeMode;
-use portman_netbridge::runtime::{Cleanup, Leftovers, Runtime, RuntimeOptions};
+use portman_netbridge::runtime::{Cleanup, DnsForwarder, Leftovers, Runtime, RuntimeOptions};
 use portman_netbridge::tunnel::{Keypair, HOST_WG_LISTEN_PORT};
-use tokio::sync::{mpsc, watch, RwLock};
-use tracing::{info, warn};
+use tokio::sync::{mpsc, watch, Notify, RwLock};
+use tokio::time::Instant;
+use tracing::{debug, info, warn};
 
 use crate::engine::{Engine, Link, Session};
 
@@ -73,6 +81,13 @@ const SETUP_CHECK_BUDGET: Duration = Duration::from_secs(3);
 
 const RETRY_BASE: Duration = Duration::from_secs(5);
 const RETRY_CAP: Duration = Duration::from_secs(60);
+/// The wait before the next ensure of a DNS forwarder that is not in place.
+/// It is also how soon a setup image that the user built with `portman
+/// bridge prepare` is noticed.
+const FORWARDER_RETRY: Duration = Duration::from_secs(60);
+
+/// Where the daemon keeps the managed TLD set.
+pub(crate) type KnownTlds = Arc<std::sync::RwLock<HashSet<String>>>;
 
 /// Messages the IPC server sends to the netbridge task.
 #[derive(Debug)]
@@ -148,6 +163,9 @@ pub(crate) struct Handle {
     /// forwarder subsystems scope upstream sockets to it so bridge-subnet
     /// traffic survives a VPN/exit-node claiming the default route.
     pub ifindex: crate::upstream::BridgeIfIndex,
+    /// Wakes the netbridge task after a change of the managed TLD set, which
+    /// the DNS forwarder is built from.
+    pub tlds_changed: Arc<Notify>,
 }
 
 /// Build the handle the daemon shares, and the two ends only the netbridge
@@ -162,6 +180,7 @@ pub(crate) fn handle_pair() -> (Handle, mpsc::Receiver<Control>, watch::Sender<B
             mode,
             phase,
             ifindex: crate::upstream::new_bridge_ifindex(),
+            tlds_changed: Arc::new(Notify::new()),
         },
         rx,
         phase_tx,
@@ -181,6 +200,35 @@ struct Built {
 struct Running<B> {
     bridge: B,
     built: Built,
+    /// `None` until the loop has ensured the DNS forwarder for this bridge.
+    forwarded: Option<Forwarded>,
+}
+
+/// The last ensure of a running bridge's DNS forwarder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Forwarded {
+    tlds: BTreeSet<String>,
+    ended: Ensured,
+    /// When the next ensure is due. `None` for a forwarder that is in place.
+    retry_at: Option<Instant>,
+}
+
+/// How an ensure of the DNS forwarder ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ensured {
+    InPlace,
+    /// The setup image in the engine cannot run the forwarder.
+    ImageWithoutDnsMode,
+    Failed,
+}
+
+/// Whether the loop ensures the forwarder of a running bridge now: for a
+/// new bridge, for a new managed TLD set, and when a retry is due.
+fn forwarder_due(forwarded: Option<&Forwarded>, tlds: &BTreeSet<String>, now: Instant) -> bool {
+    match forwarded {
+        None => true,
+        Some(last) => last.tlds != *tlds || last.retry_at.is_some_and(|at| at <= now),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -200,21 +248,26 @@ enum Step {
     /// Remove what an earlier bridge can have left in the engine. No bridge
     /// runs and the user wants none.
     Sweep(Session, Leftovers),
+    /// Make the running bridge ensure the DNS forwarder in the VM.
+    Forward,
 }
 
 /// `owed` is what a cleanup on this session is to remove. It is `None` once
 /// the session had its cleanup, also when that one left the network owed.
+/// `forwarder_due` is [`forwarder_due`] for the running bridge.
 fn plan(
     intent: &NetbridgeState,
     session: Option<Session>,
     running: Option<Built>,
     may_start: bool,
     owed: Option<Leftovers>,
+    forwarder_due: bool,
 ) -> Step {
     match (running, session, owed) {
         (Some(built), session, _) if session != Some(built.session) => Step::Abandon,
         (Some(_), _, _) if !intent.enabled => Step::Teardown,
         (Some(built), _, _) if built.mode != intent.mode => Step::Shutdown,
+        (Some(_), _, _) if forwarder_due => Step::Forward,
         (None, Some(session), _) if intent.enabled && may_start => Step::Start(session),
         (None, Some(session), Some(leftovers)) if !intent.enabled => {
             Step::Sweep(session, leftovers)
@@ -378,10 +431,14 @@ pub(crate) async fn run(
     rx: mpsc::Receiver<Control>,
     phase_tx: watch::Sender<BridgePhase>,
     state_path: PathBuf,
+    known_tlds: KnownTlds,
 ) -> Result<()> {
     let forced_on = env_forces_enabled();
     let engine = LinkedEngine::new(engine.watch());
-    converge(engine, handle, rx, phase_tx, state_path, forced_on).await
+    converge(
+        engine, handle, rx, phase_tx, state_path, forced_on, known_tlds,
+    )
+    .await
 }
 
 async fn converge<E: BridgeEngine>(
@@ -391,6 +448,7 @@ async fn converge<E: BridgeEngine>(
     phase_tx: watch::Sender<BridgePhase>,
     state_path: PathBuf,
     forced_on: bool,
+    known_tlds: KnownTlds,
 ) -> Result<()> {
     let mut wanted = Wanted {
         saved: netbridge_state::load(&state_path),
@@ -439,15 +497,36 @@ async fn converge<E: BridgeEngine>(
         )
         .await;
         let may_start = attempts.retry_after.is_none();
-        match plan(&intent, session, built, may_start, debt.owed_on(session)) {
-            Step::Keep => match next_wake(&mut rx, &mut engine, attempts.retry_after).await {
-                Wake::Control(msg) => {
-                    take(msg, &mut wanted, &mut attempts, &mut debt, &state_path);
+        let tlds = managed_tlds(&known_tlds);
+        let now = Instant::now();
+        let forwarded = running.as_ref().map(|r| r.forwarded.as_ref());
+        let forwarder_due = forwarded.is_some_and(|last| forwarder_due(last, &tlds, now));
+        let owed = debt.owed_on(session);
+        match plan(&intent, session, built, may_start, owed, forwarder_due) {
+            Step::Keep => {
+                // A start waits only while no bridge runs, and a forwarder
+                // only while one does, so one timer serves both.
+                let forwarder_retry = forwarded
+                    .flatten()
+                    .and_then(|last| last.retry_at)
+                    .map(|at| at.saturating_duration_since(now));
+                let retry_after = attempts.retry_after.or(forwarder_retry);
+                let tlds_changed = &handle.tlds_changed;
+                match next_wake(&mut rx, &mut engine, tlds_changed, retry_after).await {
+                    Wake::Control(msg) => {
+                        take(msg, &mut wanted, &mut attempts, &mut debt, &state_path);
+                    }
+                    Wake::RetryDue => attempts.retry_after = None,
+                    Wake::SessionChanged | Wake::TldsChanged => {}
+                    Wake::Closed => return Ok(()),
                 }
-                Wake::RetryDue => attempts.retry_after = None,
-                Wake::SessionChanged => {}
-                Wake::Closed => return Ok(()),
-            },
+            }
+            Step::Forward => {
+                if let Some(running) = running.as_mut() {
+                    let last = running.forwarded.take();
+                    running.forwarded = Some(forward(&running.bridge, tlds, last).await);
+                }
+            }
             Step::Start(session) => {
                 let started = try_start(&engine, session, intent.mode, &mut attempts).await;
                 if let Some(bridge) = started {
@@ -459,6 +538,7 @@ async fn converge<E: BridgeEngine>(
                             mode: intent.mode,
                             epoch,
                         },
+                        forwarded: None,
                     });
                 }
             }
@@ -508,9 +588,49 @@ async fn still_runs(engine: &impl BridgeEngine, session: Session, container: &st
         .unwrap_or(false)
 }
 
+fn managed_tlds(known_tlds: &KnownTlds) -> BTreeSet<String> {
+    let known = known_tlds.read().expect("known_tlds lock poisoned");
+    known.iter().cloned().collect()
+}
+
+/// Makes `bridge` ensure the DNS forwarder for `tlds`. Nothing here stops
+/// or restarts the bridge. An outcome that repeats the last one is logged
+/// at debug level, so that a retry every minute does not fill the log.
+async fn forward(
+    bridge: &impl Bridge,
+    tlds: BTreeSet<String>,
+    last: Option<Forwarded>,
+) -> Forwarded {
+    let ensured = bridge.ensure_dns_forwarder(&tlds).await;
+    let ended = match &ensured {
+        Ok(DnsForwarder::InPlace) => Ensured::InPlace,
+        Ok(DnsForwarder::ImageWithoutDnsMode) => Ensured::ImageWithoutDnsMode,
+        Err(_) => Ensured::Failed,
+    };
+    let repeats = last.is_some_and(|last| last.ended == ended && last.tlds == tlds);
+    let retry_in_secs = FORWARDER_RETRY.as_secs();
+    match (&ensured, repeats) {
+        (Ok(DnsForwarder::InPlace), false) => {
+            info!(?tlds, "dns forwarder in place at 192.168.99.129");
+        }
+        (Ok(DnsForwarder::ImageWithoutDnsMode), false) => warn!(
+            retry_in_secs,
+            "dns forwarder unavailable: the netbridge setup image has no dns mode; run `portman bridge prepare`"
+        ),
+        (Err(err), false) => warn!(%err, retry_in_secs, "dns forwarder not in place"),
+        (_, true) => debug!(?ended, "dns forwarder: the same as a minute ago"),
+    }
+    Forwarded {
+        tlds,
+        ended,
+        retry_at: (ended != Ensured::InPlace).then(|| Instant::now() + FORWARDER_RETRY),
+    }
+}
+
 enum Wake {
     Control(Control),
     SessionChanged,
+    TldsChanged,
     RetryDue,
     Closed,
 }
@@ -520,12 +640,14 @@ enum Wake {
 async fn next_wake(
     rx: &mut mpsc::Receiver<Control>,
     engine: &mut impl BridgeEngine,
+    tlds_changed: &Notify,
     retry_after: Option<Duration>,
 ) -> Wake {
     tokio::select! {
         biased;
         msg = rx.recv() => msg.map_or(Wake::Closed, Wake::Control),
         () = engine.session_changed() => Wake::SessionChanged,
+        () = tlds_changed.notified() => Wake::TldsChanged,
         () = tokio::time::sleep(retry_after.unwrap_or_default()), if retry_after.is_some() => {
             Wake::RetryDue
         }
@@ -608,8 +730,13 @@ pub(crate) trait Bridge {
     fn utun_name(&self) -> &str;
     /// The engine's id of the setup container that the bridge started.
     fn setup_container_id(&self) -> &str;
-    /// Stops the bridge and keeps the docker network.
+    /// Makes the bridge's engine run the DNS forwarder for `tlds`. It
+    /// changes the engine only while the forwarder differs from that.
+    async fn ensure_dns_forwarder(&self, tlds: &BTreeSet<String>) -> Result<DnsForwarder>;
+    /// Stops the bridge and keeps the docker network and the DNS forwarder.
     async fn shutdown(self);
+    /// Stops the bridge and removes the DNS forwarder and the docker
+    /// network.
     async fn shutdown_and_remove_network(self);
 }
 
@@ -701,6 +828,10 @@ impl Bridge for Runtime {
         Runtime::setup_container_id(self)
     }
 
+    async fn ensure_dns_forwarder(&self, tlds: &BTreeSet<String>) -> Result<DnsForwarder> {
+        Runtime::ensure_dns_forwarder(self, tlds).await
+    }
+
     async fn shutdown(self) {
         Runtime::shutdown(self).await;
     }
@@ -746,7 +877,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tempfile::{tempdir, TempDir};
-    use tokio::time::Instant;
     use Leftovers::{SetupContainer, SetupContainerAndNetwork};
     use NetbridgeMode::{Docker as DockerMode, OptIn};
 
@@ -793,7 +923,14 @@ mod tests {
         ];
         for (enabled, mode, session, running, may_start, want) in table {
             assert_eq!(
-                plan(&intent(enabled, mode), session, running, may_start, None),
+                plan(
+                    &intent(enabled, mode),
+                    session,
+                    running,
+                    may_start,
+                    None,
+                    false
+                ),
                 want,
                 "enabled={enabled} mode={mode:?} session={session:?} running={running:?} may_start={may_start}"
             );
@@ -827,9 +964,104 @@ mod tests {
         ];
         for (enabled, session, running, may_start, owed, want) in table {
             assert_eq!(
-                plan(&intent(enabled, OptIn), session, running, may_start, owed),
+                plan(
+                    &intent(enabled, OptIn),
+                    session,
+                    running,
+                    may_start,
+                    owed,
+                    false
+                ),
                 want,
                 "enabled={enabled} session={session:?} running={running:?} may_start={may_start} owed={owed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_ensures_the_forwarder_only_for_a_bridge_that_it_keeps() {
+        let on_s1 = built(S1, OptIn);
+        let container = Some(SetupContainer);
+        // (enabled, wanted mode, session, running, owed) → step, with the
+        // forwarder due
+        let table = [
+            (ON, OptIn, S1, on_s1, None, Step::Forward),
+            (ON, OptIn, S1, on_s1, container, Step::Forward),
+            (ON, DockerMode, S1, on_s1, None, Step::Shutdown),
+            (OFF, OptIn, S1, on_s1, None, Step::Teardown),
+            (ON, OptIn, S2, on_s1, None, Step::Abandon),
+            (ON, OptIn, None, on_s1, None, Step::Abandon),
+            (ON, OptIn, S1, None, None, Step::Start(Session(1))),
+            (ON, OptIn, None, None, None, Step::Keep),
+            (OFF, OptIn, S1, None, None, Step::Keep),
+            (
+                OFF,
+                OptIn,
+                S1,
+                None,
+                container,
+                Step::Sweep(Session(1), SetupContainer),
+            ),
+        ];
+        for (enabled, mode, session, running, owed, want) in table {
+            assert_eq!(
+                plan(&intent(enabled, mode), session, running, true, owed, true),
+                want,
+                "enabled={enabled} mode={mode:?} session={session:?} running={running:?} owed={owed:?}"
+            );
+        }
+    }
+
+    fn tlds(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn the_forwarder_is_due_for_a_new_bridge_a_new_tld_set_and_a_retry_that_is_due() {
+        let last = |names: &[&str], ended, retry_at| {
+            Some(Forwarded {
+                tlds: tlds(names),
+                ended,
+                retry_at,
+            })
+        };
+        let earlier = Instant::now();
+        let now = earlier + FORWARDER_RETRY;
+        let waits = Some(now + Duration::from_millis(1));
+        let (due_now, overdue) = (Some(now), Some(earlier));
+        use Ensured::{Failed, ImageWithoutDnsMode, InPlace};
+        // (the last ensure, the managed TLDs now) → due
+        let table = [
+            (None, vec!["test"], true),
+            (None, vec![], true),
+            (last(&["test"], InPlace, None), vec!["test"], false),
+            (last(&["test"], InPlace, None), vec!["acme", "test"], true),
+            (last(&["test"], InPlace, None), vec![], true),
+            (last(&[], InPlace, None), vec![], false),
+            (
+                last(&["test"], ImageWithoutDnsMode, waits),
+                vec!["test"],
+                false,
+            ),
+            (
+                last(&["test"], ImageWithoutDnsMode, due_now),
+                vec!["test"],
+                true,
+            ),
+            (
+                last(&["test"], ImageWithoutDnsMode, waits),
+                vec!["acme"],
+                true,
+            ),
+            (last(&["test"], Failed, waits), vec!["test"], false),
+            (last(&["test"], Failed, due_now), vec!["test"], true),
+            (last(&["test"], Failed, overdue), vec!["test"], true),
+        ];
+        for (forwarded, managed, want) in table {
+            assert_eq!(
+                forwarder_due(forwarded.as_ref(), &tlds(&managed), now),
+                want,
+                "forwarded={forwarded:?} managed={managed:?}"
             );
         }
     }
@@ -872,7 +1104,7 @@ mod tests {
                 for session in [None, S1, S2] {
                     for running in [None, built(S1, OptIn), built(S2, DockerMode)] {
                         let intent = intent(enabled, mode);
-                        let kept = plan(&intent, session, running, true, None) == Step::Keep;
+                        let kept = plan(&intent, session, running, true, None, false) == Step::Keep;
                         let phase = phase(&intent, session, running);
                         assert_eq!(
                             (
@@ -975,6 +1207,25 @@ mod tests {
         engine_froze: Arc<AtomicBool>,
         stops: mpsc::UnboundedSender<Stop>,
         stops_may_end: watch::Receiver<bool>,
+        /// Each ensure of the DNS forwarder that the loop asked a bridge
+        /// for.
+        forwards: mpsc::UnboundedSender<Forwarding>,
+        /// How the next ensure ends.
+        ensure: Arc<Mutex<Ensure>>,
+    }
+
+    struct Forwarding {
+        at: Instant,
+        tlds: BTreeSet<String>,
+        /// The phase that the loop had published when it asked.
+        phase: BridgePhase,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Ensure {
+        PutsItInPlace,
+        FindsAnImageWithoutTheDnsMode,
+        Fails,
     }
 
     impl Probe {
@@ -1080,6 +1331,20 @@ mod tests {
             &self.setup_container
         }
 
+        async fn ensure_dns_forwarder(&self, tlds: &BTreeSet<String>) -> Result<DnsForwarder> {
+            let _ = self.probe.forwards.send(Forwarding {
+                at: Instant::now(),
+                tlds: tlds.clone(),
+                phase: *self.probe.phase.borrow(),
+            });
+            let ensure = *self.probe.ensure.lock().unwrap();
+            match ensure {
+                Ensure::PutsItInPlace => Ok(DnsForwarder::InPlace),
+                Ensure::FindsAnImageWithoutTheDnsMode => Ok(DnsForwarder::ImageWithoutDnsMode),
+                Ensure::Fails => anyhow::bail!("the engine refused the container"),
+            }
+        }
+
         async fn shutdown(self) {
             self.probe.clone().stop(Stop::KeepsNetwork).await;
         }
@@ -1103,6 +1368,9 @@ mod tests {
         setup_container: Arc<Mutex<Option<String>>>,
         container_asks: Arc<Mutex<Vec<(Session, BridgePhase)>>>,
         engine_froze: Arc<AtomicBool>,
+        forwards: mpsc::UnboundedReceiver<Forwarding>,
+        ensure: Arc<Mutex<Ensure>>,
+        known_tlds: KnownTlds,
         _dir: TempDir,
     }
 
@@ -1142,6 +1410,10 @@ mod tests {
             let setup_container = Arc::new(Mutex::new(None));
             let container_asks = Arc::new(Mutex::new(Vec::new()));
             let engine_froze = Arc::new(AtomicBool::new(false));
+            let (forward_seen, forwards) = mpsc::unbounded_channel();
+            let ensure = Arc::new(Mutex::new(Ensure::PutsItInPlace));
+            let known_tlds = KnownTlds::default();
+            known_tlds.write().unwrap().insert("test".to_string());
             let (handle, rx, phase_tx) = handle_pair();
             let engine = TestEngine {
                 sessions: session_seen,
@@ -1158,6 +1430,8 @@ mod tests {
                     engine_froze: engine_froze.clone(),
                     stops: stop_seen,
                     stops_may_end: may_end,
+                    forwards: forward_seen,
+                    ensure: ensure.clone(),
                 }),
             };
             tokio::spawn(converge(
@@ -1167,6 +1441,7 @@ mod tests {
                 phase_tx,
                 state_path.clone(),
                 forced_on,
+                known_tlds.clone(),
             ));
             Rig {
                 handle,
@@ -1182,8 +1457,36 @@ mod tests {
                 setup_container,
                 container_asks,
                 engine_froze,
+                forwards,
+                ensure,
+                known_tlds,
                 _dir: dir,
             }
+        }
+
+        /// Changes the managed TLD set as `DaemonState` does.
+        fn manage(&self, names: &[&str]) {
+            *self.known_tlds.write().unwrap() = names.iter().map(|name| name.to_string()).collect();
+            self.handle.tlds_changed.notify_one();
+        }
+
+        fn the_next_ensure(&self, ensure: Ensure) {
+            *self.ensure.lock().unwrap() = ensure;
+        }
+
+        async fn next_forward(&mut self) -> Forwarding {
+            tokio::time::timeout(LONGEST_WAIT, self.forwards.recv())
+                .await
+                .expect("an ensure of the dns forwarder")
+                .unwrap()
+        }
+
+        async fn no_forward_follows(&mut self) {
+            let next = tokio::time::timeout(LONGEST_WAIT, self.forwards.recv()).await;
+            assert!(
+                next.is_err(),
+                "an ensure of the dns forwarder that nothing called for"
+            );
         }
 
         /// The stop that the loop began. With `hold_stops` it stays in
@@ -1508,7 +1811,8 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(1);
             tx.send(Control::Disable).await.unwrap();
             sessions.send_replace(S2);
-            let wake = next_wake(&mut rx, &mut engine, Some(Duration::ZERO)).await;
+            let quiet = Notify::new();
+            let wake = next_wake(&mut rx, &mut engine, &quiet, Some(Duration::ZERO)).await;
             assert!(matches!(wake, Wake::Control(Control::Disable)));
         }
     }
@@ -1517,7 +1821,8 @@ mod tests {
     async fn a_retry_that_is_due_ends_the_wait_when_nothing_else_is_ready() {
         let (_tx, mut rx) = mpsc::channel(1);
         let (mut engine, _sessions) = bare_engine();
-        let wait = next_wake(&mut rx, &mut engine, Some(Duration::ZERO));
+        let quiet = Notify::new();
+        let wait = next_wake(&mut rx, &mut engine, &quiet, Some(Duration::ZERO));
         let wake = tokio::time::timeout(LONGEST_WAIT, wait)
             .await
             .expect("the retry timer ends the wait");
@@ -1676,6 +1981,175 @@ mod tests {
 
         rig.reaches(BridgePhase::WaitingForDocker).await;
         rig.no_attempt_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bridge_that_comes_up_gets_the_forwarder_for_the_managed_tlds_once() {
+        let mut rig = Rig::spawn(S1, true, false);
+        rig.manage(&["test", "acme"]);
+        let enabled = Instant::now();
+        rig.send(Control::Enable).await;
+
+        let forward = rig.next_forward().await;
+
+        assert_eq!(forward.tlds, tlds(&["acme", "test"]));
+        assert_eq!(forward.at - enabled, Duration::ZERO);
+        assert_eq!(forward.phase, BridgePhase::Up { epoch: 1 });
+        rig.no_forward_follows().await;
+        assert_eq!(rig.phase(), BridgePhase::Up { epoch: 1 });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_of_the_managed_tlds_reaches_the_forwarder_while_a_bridge_is_up() {
+        let mut rig = Rig::up().await;
+        assert_eq!(rig.next_forward().await.tlds, tlds(&["test"]));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        for managed in [vec!["acme", "test"], vec!["acme"], vec![]] {
+            let changed = Instant::now();
+            rig.manage(&managed);
+            let forward = rig.next_forward().await;
+            assert_eq!(forward.tlds, tlds(&managed));
+            assert_eq!(forward.at - changed, Duration::ZERO);
+        }
+
+        rig.manage(&[]);
+        rig.no_forward_follows().await;
+        assert_eq!(rig.phase(), BridgePhase::Up { epoch: 1 });
+        assert_eq!(rig.bridges_held(), 1);
+        rig.no_attempt_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_forwarder_is_asked_for_only_while_a_bridge_is_up() {
+        let mut rig = Rig::spawn(S1, true, false);
+        rig.manage(&["acme"]);
+        rig.no_forward_follows().await;
+        assert_eq!(rig.phase(), BridgePhase::Disabled);
+
+        rig.send(Control::Enable).await;
+        assert_eq!(rig.next_forward().await.tlds, tlds(&["acme"]));
+
+        rig.engine_session(None);
+        rig.reaches(BridgePhase::WaitingForDocker).await;
+        rig.manage(&["acme", "test"]);
+        rig.no_forward_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_forwarder_that_is_not_in_place_leaves_the_bridge_up_and_is_tried_each_minute() {
+        for ensure in [Ensure::FindsAnImageWithoutTheDnsMode, Ensure::Fails] {
+            let mut rig = Rig::spawn(S1, true, false);
+            rig.the_next_ensure(ensure);
+            rig.send(Control::Enable).await;
+
+            let mut forwards = Vec::new();
+            for _ in 0..4 {
+                forwards.push(rig.next_forward().await);
+            }
+
+            let gaps: Vec<Duration> = forwards.windows(2).map(|w| w[1].at - w[0].at).collect();
+            assert_eq!(gaps, [FORWARDER_RETRY; 3], "{ensure:?}");
+            assert!(
+                forwards
+                    .iter()
+                    .all(|f| f.phase == BridgePhase::Up { epoch: 1 }),
+                "{ensure:?}"
+            );
+            assert_eq!(rig.bridges_held(), 1);
+            assert!(rig.no_stop_began(), "{ensure:?}");
+            rig.next_attempt().await;
+            assert!(rig.attempts.try_recv().is_err(), "the bridge started again");
+
+            rig.the_next_ensure(Ensure::PutsItInPlace);
+            let in_place = rig.next_forward().await;
+            assert_eq!(in_place.at - forwards[3].at, FORWARDER_RETRY, "{ensure:?}");
+            rig.no_forward_follows().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_of_the_managed_tlds_does_not_wait_for_the_forwarders_retry() {
+        let mut rig = Rig::spawn(S1, true, false);
+        rig.the_next_ensure(Ensure::FindsAnImageWithoutTheDnsMode);
+        rig.send(Control::Enable).await;
+        rig.next_forward().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let changed = Instant::now();
+        rig.manage(&["acme"]);
+        let at_once = rig.next_forward().await;
+        let retry = rig.next_forward().await;
+
+        assert_eq!(at_once.at - changed, Duration::ZERO);
+        assert_eq!(at_once.tlds, tlds(&["acme"]));
+        assert_eq!(retry.at - at_once.at, FORWARDER_RETRY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_for_another_reason_does_not_put_off_the_forwarders_retry() {
+        let mut rig = Rig::spawn(S1, true, false);
+        rig.the_next_ensure(Ensure::Fails);
+        rig.send(Control::Enable).await;
+        let first = rig.next_forward().await;
+        tokio::time::sleep(Duration::from_secs(40)).await;
+
+        rig.engine_session(S2);
+        let retry = rig.next_forward().await;
+
+        assert_eq!(retry.at - first.at, FORWARDER_RETRY);
+        assert_eq!(retry.phase, BridgePhase::Up { epoch: 1 });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_and_a_lost_session_end_the_forwarders_retries() {
+        for ends_it in ["a disable", "a lost session"] {
+            let mut rig = Rig::spawn(S1, true, false);
+            rig.the_next_ensure(Ensure::Fails);
+            rig.send(Control::Enable).await;
+            rig.next_forward().await;
+
+            match ends_it {
+                "a disable" => {
+                    rig.send(Control::Disable).await;
+                    assert_eq!(rig.next_stop().await, Stop::RemovesNetwork);
+                }
+                _ => rig.engine_session(None),
+            }
+
+            rig.no_forward_follows().await;
+            assert_eq!(rig.bridges_held(), 0, "{ends_it}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_new_bridge_gets_the_forwarder_and_a_kept_bridge_is_not_asked_again() {
+        let mut rig = Rig::up().await;
+        assert_eq!(rig.next_forward().await.phase, BridgePhase::Up { epoch: 1 });
+
+        rig.engine_session(S2);
+        rig.no_forward_follows().await;
+        assert_eq!(rig.phase(), BridgePhase::Up { epoch: 1 });
+
+        rig.send(Control::SetMode(DockerMode)).await;
+        assert_eq!(rig.next_stop().await, Stop::KeepsNetwork);
+        assert_eq!(rig.next_forward().await.phase, BridgePhase::Up { epoch: 2 });
+        rig.no_forward_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_of_the_managed_tlds_ends_the_wait_when_nothing_else_is_ready() {
+        let (_tx, mut rx) = mpsc::channel(1);
+        let (mut engine, _sessions) = bare_engine();
+        let tlds_changed = Notify::new();
+        tlds_changed.notify_one();
+
+        let wait = next_wake(&mut rx, &mut engine, &tlds_changed, None);
+        let wake = tokio::time::timeout(LONGEST_WAIT, wait)
+            .await
+            .expect("the change ends the wait");
+
+        assert!(matches!(wake, Wake::TldsChanged));
     }
 
     const SETUP_CONTAINER: &str = "/containers/portman-netbridge-setup/json";
@@ -2071,6 +2545,7 @@ mod tests {
                 phase_tx,
                 state_path,
                 false,
+                KnownTlds::default(),
             ));
             tokio::time::sleep(LONGEST_WAIT).await;
             Self {

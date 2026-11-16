@@ -221,6 +221,7 @@ impl DaemonState {
             .write()
             .expect("known_tlds lock poisoned")
             .insert(tld);
+        self.netbridge.tlds_changed.notify_one();
     }
 
     pub(crate) fn tld_remove(&self, tld: &str) {
@@ -228,6 +229,7 @@ impl DaemonState {
             .write()
             .expect("known_tlds lock poisoned")
             .remove(tld);
+        self.netbridge.tlds_changed.notify_one();
     }
 }
 
@@ -406,6 +408,7 @@ pub async fn daemon_main() -> Result<()> {
         netbridge_rx,
         netbridge_phase_tx,
         netbridge_state_path,
+        known_tlds.clone(),
     );
     let netbridge_task = tokio::spawn(async move {
         if managed_broker {
