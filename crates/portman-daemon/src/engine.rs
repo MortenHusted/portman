@@ -690,7 +690,7 @@ pub(crate) mod tests {
     /// waits its milliseconds and then sends its events as one read. After
     /// the last step the response ends, or with `holds_streams` it stays
     /// open until the test ends it.
-    struct FakeEngine {
+    pub(crate) struct FakeEngine {
         started: tokio::time::Instant,
         list_ms: u64,
         replay: Vec<(u64, Vec<EventMessage>)>,
@@ -844,7 +844,7 @@ pub(crate) mod tests {
             *self.listed.lock().unwrap() = Some(serde_json::to_string(containers).unwrap());
         }
 
-        fn fail_lists(&self) {
+        pub(crate) fn fail_lists(&self) {
             *self.listed.lock().unwrap() = None;
         }
 
@@ -922,16 +922,16 @@ pub(crate) mod tests {
         engine
     }
 
-    /// A handle whose link is in its first session, with an engine that
-    /// serves.
-    pub(crate) fn connected() -> Engine {
+    /// A handle whose link is in its first session, and the engine behind
+    /// it, which serves and lists no containers.
+    pub(crate) fn connected() -> (Engine, Arc<FakeEngine>) {
         let (engine, publisher) = channel();
-        let (docker, _) = FakeEngine::start(0, vec![]);
+        let (docker, fake) = FakeEngine::start(0, vec![]);
         publisher.send_replace(Link::Connected {
             session: Session(1),
             docker,
         });
-        engine
+        (engine, fake)
     }
 
     const HOUR: Duration = Duration::from_secs(3600);

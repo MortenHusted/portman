@@ -1364,7 +1364,10 @@ pub(crate) mod tests {
         assert!(matches!(response, Response::Err { .. }));
     }
 
-    fn sleeper(name: &str, dir: &std::path::Path) -> portman_protocol::ServiceDefinition {
+    pub(crate) fn sleeper(
+        name: &str,
+        dir: &std::path::Path,
+    ) -> portman_protocol::ServiceDefinition {
         portman_protocol::ServiceDefinition {
             name: name.into(),
             run: vec!["/bin/sleep".into(), "300".into()],
@@ -1390,7 +1393,7 @@ pub(crate) mod tests {
 
     /// Each service's desired state and pid, once every desired-up service
     /// reports a running pid.
-    async fn settled_services(state: &DaemonState) -> Vec<(String, bool, Option<u32>)> {
+    pub(crate) async fn settled_services(state: &DaemonState) -> Vec<(String, bool, Option<u32>)> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             let services: Vec<_> = state

@@ -321,7 +321,7 @@ mod tests {
             )
         };
         let absent = runner(crate::engine::channel().0);
-        let connected = runner(crate::engine::tests::connected());
+        let connected = runner(crate::engine::tests::connected().0);
         let container = Some("aaaaaaaaaaaa");
 
         assert!(connected.can_start("web.demo.test", container));

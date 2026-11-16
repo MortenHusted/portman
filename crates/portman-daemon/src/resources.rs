@@ -150,17 +150,9 @@ pub(crate) async fn run_sampler(state: crate::DaemonState, history: SharedHistor
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        match collect(&state).await {
-            Ok(snapshot) => {
-                let mut guard = history.lock().expect("history lock poisoned");
-                record_snapshot(&mut guard, snapshot);
-            }
-            Err(err) => {
-                // Docker down is the common cause; keep the last snapshot and
-                // series intact rather than publishing zeros.
-                tracing::debug!(error = %err, "resource sample skipped");
-            }
-        }
+        let snapshot = collect(&state).await;
+        let mut guard = history.lock().expect("history lock poisoned");
+        record_snapshot(&mut guard, snapshot);
     }
 }
 
@@ -211,7 +203,9 @@ fn sample_service_groups(
     rows
 }
 
-pub(crate) async fn collect(state: &DaemonState) -> Result<ResourceUsageSnapshot> {
+/// The usage row of each running container, and the longest time between
+/// two samples of one container.
+async fn collect_containers(state: &DaemonState) -> Result<(Vec<ContainerResourceUsage>, u64)> {
     let mut filters = HashMap::new();
     filters.insert("status".to_string(), vec!["running".to_string()]);
     let options = ListContainersOptionsBuilder::default()
@@ -268,6 +262,20 @@ pub(crate) async fn collect(state: &DaemonState) -> Result<ResourceUsageSnapshot
             .then_with(|| b.memory_usage_bytes.cmp(&a.memory_usage_bytes))
             .then_with(|| a.name.cmp(&b.name))
     });
+    Ok((rows, sample_window_ms))
+}
+
+/// One sample of the containers and of the supervised services. The service
+/// rows do not depend on the engine: with no engine, or with one that fails
+/// the list, the sample holds no container rows.
+pub(crate) async fn collect(state: &DaemonState) -> ResourceUsageSnapshot {
+    let (rows, sample_window_ms) = match collect_containers(state).await {
+        Ok(sampled) => sampled,
+        Err(err) => {
+            tracing::debug!(error = format!("{err:#}"), "no container samples");
+            (Vec::new(), 0)
+        }
+    };
 
     // Supervised services ride the same on-demand path; the pgid sweep is
     // bounded per-pid work, moved off the reactor.
@@ -293,14 +301,14 @@ pub(crate) async fn collect(state: &DaemonState) -> Result<ResourceUsageSnapshot
     };
 
     let totals = totals_for(&rows);
-    Ok(ResourceUsageSnapshot {
+    ResourceUsageSnapshot {
         sampled_at_unix_ms: crate::now_unix_ms(),
         sample_window_ms,
         container_count: rows.len() as u32,
         totals,
         containers: rows,
         services,
-    })
+    }
 }
 
 async fn collect_container(
@@ -671,6 +679,45 @@ mod tests {
     use portman_protocol::{Entry, Mode, Source};
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sample_holds_the_supervised_services_whatever_the_engine_does() {
+        use crate::handlers::tests::{settled_services, sleeper, test_state};
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        let services = vec![sleeper("web", dir.path())];
+        state
+            .supervisor
+            .sync(dir.path(), services, Default::default(), Default::default())
+            .await
+            .unwrap();
+        state.supervisor.up(&["web".to_string()]).await.unwrap();
+        settled_services(&state).await;
+
+        let (lists, _) = crate::engine::tests::connected();
+        let (fails_lists, engine) = crate::engine::tests::connected();
+        engine.fail_lists();
+        let cases = [
+            (state.engine.clone(), "no engine"),
+            (fails_lists, "a list that fails"),
+            (lists, "a list with no containers"),
+        ];
+        for (engine, case) in cases {
+            let state = DaemonState {
+                engine,
+                ..state.clone()
+            };
+
+            let snapshot = collect(&state).await;
+
+            let sampled: Vec<_> = snapshot.services.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(sampled, ["web"], "{case}");
+            assert!(snapshot.containers.is_empty(), "{case}");
+        }
+
+        state.supervisor.down(&["web".to_string()]).await.unwrap();
+    }
 
     #[test]
     fn cpu_percent_uses_counter_delta_and_online_cpus() {
