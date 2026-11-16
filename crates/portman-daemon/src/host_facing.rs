@@ -7,8 +7,10 @@
 //! depend on the answer.
 //!
 //! Today: DNS/HTTP/TLS listeners on `192.168.99.1` that answer the
-//! same way the host-facing DNS/proxy surfaces do, except DNS rewrites
-//! any A-record answer of `127.0.0.1` to `192.168.99.1`.
+//! same way the host-facing DNS/proxy surfaces do, with two exceptions
+//! in DNS. It rewrites any A-record answer of `127.0.0.1` to
+//! `192.168.99.1`, and it answers `REFUSED` for a name the registry does
+//! not hold (see `dns`).
 //! That's what makes static rules like `crm.acme → 127.0.0.1:3070`
 //! work from inside a portman-network container: the container
 //! resolves to the host's tunnel IP, hits Portman's tunnel-side proxy,
@@ -167,7 +169,7 @@ fn spawn_dns(registry: Registry, addr: SocketAddr) -> JoinHandle<()> {
         // this task is aborted by the parent when the bridge goes down.
         let mut attempt = 1u64;
         loop {
-            match dns::run_on(registry.clone(), addr, Some(HOST_TUNNEL_IP), None).await {
+            match dns::run_for_containers(registry.clone(), addr, HOST_TUNNEL_IP).await {
                 Ok(()) => {
                     warn!("container-facing dns listener stopped unexpectedly; retrying");
                 }
