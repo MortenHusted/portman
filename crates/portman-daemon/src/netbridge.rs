@@ -374,10 +374,7 @@ pub(crate) async fn run(
     state_path: PathBuf,
 ) -> Result<()> {
     let forced_on = env_forces_enabled();
-    let engine = LinkedEngine {
-        link: engine.watch(),
-        listen_port: HOST_WG_LISTEN_PORT,
-    };
+    let engine = LinkedEngine::new(engine.watch());
     converge(engine, handle, rx, phase_tx, state_path, forced_on).await
 }
 
@@ -607,11 +604,24 @@ pub(crate) trait Bridge {
     async fn shutdown_and_remove_network(self);
 }
 
-/// The engine behind the daemon's link. The UDP port that a bridge listens
-/// on is a field so that a test can hold or free the port it names.
+/// The engine behind the daemon's link. Its bridges listen on UDP port
+/// `listen_port`, and its cleanups need that port. The port is a field so
+/// that a test can name one that it holds or that is free.
 struct LinkedEngine {
     link: watch::Receiver<Link>,
     listen_port: u16,
+}
+
+impl LinkedEngine {
+    /// The engine as the daemon uses it, on the one port that every portman
+    /// daemon's bridge listens on. A cleanup that holds any other port has
+    /// not shown that no other daemon's bridge is up.
+    fn new(link: watch::Receiver<Link>) -> Self {
+        Self {
+            link,
+            listen_port: HOST_WG_LISTEN_PORT,
+        }
+    }
 }
 
 impl BridgeEngine for LinkedEngine {
@@ -1756,6 +1766,15 @@ mod tests {
         let lines = logged.lines();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("session"), "{lines:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_daemons_engine_is_on_the_port_that_every_portman_bridge_listens_on() {
+        let (engine, _fake) = crate::engine::tests::connected();
+
+        let engine = LinkedEngine::new(engine.watch());
+
+        assert_eq!(engine.listen_port, HOST_WG_LISTEN_PORT);
     }
 
     #[tokio::test(start_paused = true)]
