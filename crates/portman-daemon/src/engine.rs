@@ -691,6 +691,8 @@ pub(crate) mod tests {
         Serving,
     }
 
+    const ENGINE_URL: &str = "http://engine.test";
+
     /// A Docker engine inside the test. bollard reaches it over in-memory
     /// pipes, because the paused clock runs ahead of a real socket. A list
     /// takes `list_ms`. The events response follows `replay`: each step
@@ -705,6 +707,12 @@ pub(crate) mod tests {
         socket: Mutex<Socket>,
         /// The body of a list response. `None` fails the list.
         listed: Mutex<Option<String>>,
+        /// The body of the inspect response for each path. The engine
+        /// answers 404 for any other path.
+        holds: Mutex<HashMap<String, String>>,
+        /// Each request that is not for the version, the list or the
+        /// events, as its method and path.
+        calls: Mutex<Vec<String>>,
         stream_ends: watch::Sender<u64>,
         probed: Mutex<Vec<u128>>,
         asked: Mutex<Vec<(u128, Asked)>>,
@@ -739,6 +747,8 @@ pub(crate) mod tests {
                 holds_streams,
                 socket: Mutex::new(socket),
                 listed: Mutex::new(Some("[]".into())),
+                holds: Default::default(),
+                calls: Default::default(),
                 stream_ends: watch::Sender::new(0),
                 probed: Default::default(),
                 asked: Default::default(),
@@ -785,7 +795,7 @@ pub(crate) mod tests {
             };
             let docker = Docker::connect_with_custom_transport(
                 transport,
-                Some("http://engine.test"),
+                Some(ENGINE_URL),
                 5,
                 bollard::API_DEFAULT_VERSION,
             );
@@ -839,8 +849,39 @@ pub(crate) mod tests {
                 }
                 pipe.write_all(b"0\r\n\r\n").await.unwrap();
             } else {
-                panic!("the daemon asked for {request_line}");
+                let mut words = request_line.split(' ');
+                let (method, url) = (words.next().unwrap(), words.next().unwrap());
+                let path = url.trim_start_matches(ENGINE_URL);
+                let path = path.split('?').next().unwrap();
+                self.calls.lock().unwrap().push(format!("{method} {path}"));
+                let held = match method {
+                    "GET" => self.holds.lock().unwrap().get(path).cloned(),
+                    "DELETE" => {
+                        let mut holds = self.holds.lock().unwrap();
+                        let inspect_path = format!("{path}/json");
+                        holds.remove(path).or_else(|| holds.remove(&inspect_path))
+                    }
+                    _ => Some(String::new()),
+                };
+                match held {
+                    Some(json) if method == "GET" => respond(&mut pipe, "200 OK", &json).await,
+                    Some(_) => respond(&mut pipe, "204 No Content", "").await,
+                    None => {
+                        let missing = r#"{"message":"the engine holds no such thing"}"#;
+                        respond(&mut pipe, "404 Not Found", missing).await;
+                    }
+                }
             }
+        }
+
+        /// Makes the engine answer an inspect of `path` with `json`, until
+        /// a request deletes what is there.
+        pub(crate) fn hold(&self, path: &str, json: &str) {
+            self.holds.lock().unwrap().insert(path.into(), json.into());
+        }
+
+        pub(crate) fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
         }
 
         fn set_socket(&self, socket: Socket) {

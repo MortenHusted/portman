@@ -88,8 +88,24 @@ impl Default for RuntimeOptions {
 pub struct Runtime {
     utun_name: String,
     docker: Docker,
+    /// Held until the runtime is dropped, so that a shutdown removes the
+    /// setup container before another daemon can bind the port.
+    listen_port: ListenPort,
     /// Pump and route tasks, cancelled and joined on shutdown.
     tasks: Vec<JoinHandle<()>>,
+}
+
+/// The WireGuard listen port, bound. Every removal from the engine takes one
+/// as proof that no other daemon's bridge is up. A bridge holds its port from
+/// before its setup container exists until that container is removed, and
+/// two sockets cannot bind one port.
+struct ListenPort(Arc<UdpSocket>);
+
+impl ListenPort {
+    async fn claim(port: u16) -> std::io::Result<Self> {
+        let socket = UdpSocket::bind(("0.0.0.0", port)).await?;
+        Ok(Self(Arc::new(socket)))
+    }
 }
 
 impl Runtime {
@@ -143,11 +159,10 @@ impl Runtime {
         let extra_route_cidrs = docker_route_cidrs(&docker, options.mode).await?;
 
         // ── UDP
-        let udp = Arc::new(
-            UdpSocket::bind(("0.0.0.0", HOST_WG_LISTEN_PORT))
-                .await
-                .with_context(|| format!("binding 0.0.0.0:{HOST_WG_LISTEN_PORT}"))?,
-        );
+        let listen_port = ListenPort::claim(HOST_WG_LISTEN_PORT)
+            .await
+            .with_context(|| format!("binding 0.0.0.0:{HOST_WG_LISTEN_PORT}"))?;
+        let udp = &listen_port.0;
 
         // ── VM-side peer + docker network
         //
@@ -160,15 +175,15 @@ impl Runtime {
         // and stay reachable across daemon restarts. Removing the
         // network while endpoints are attached fails anyway, so
         // blunt remove-then-create is both wrong and not robust.
-        remove_existing_setup_container(&docker).await?;
-        let vm_pubkey = spawn_setup_container(&docker, host_kp).await?;
+        remove_existing_setup_container(&docker, &listen_port).await?;
+        let vm_pubkey = spawn_setup_container(&docker, host_kp, &listen_port).await?;
         info!(container = SETUP_CONTAINER, "VM setup container running");
 
         // ── utun + routes, last, and rolled back together on failure
         let (device, utun_name) = match open_utun(&extra_route_cidrs) {
             Ok(opened) => opened,
             Err(err) => {
-                best_effort_remove_setup_container(&docker).await;
+                best_effort_remove_setup_container(&docker, &listen_port).await;
                 return Err(err);
             }
         };
@@ -186,6 +201,7 @@ impl Runtime {
         Ok(Self {
             utun_name,
             docker,
+            listen_port,
             tasks: vec![rx, tx, timer, routes],
         })
     }
@@ -205,6 +221,22 @@ impl Runtime {
     /// `portman bridge disable` (user intent) still wants the network
     /// gone; call [`Runtime::shutdown_and_remove_network`] for that.
     pub async fn shutdown(mut self) {
+        self.stop().await;
+        info!(utun = %self.utun_name, "netbridge shut down (network retained)");
+    }
+
+    /// Shutdown + best-effort remove the docker network. Used when the
+    /// user explicitly disables the bridge (`portman bridge disable`),
+    /// not on daemon restart. If user containers are attached, the
+    /// network removal will fail silently — docker refuses to remove a
+    /// network with endpoints. The user disconnects them first.
+    pub async fn shutdown_and_remove_network(mut self) {
+        self.stop().await;
+        remove_portman_network_if_owned(&self.docker, &self.listen_port).await;
+        info!(utun = %self.utun_name, "netbridge shut down");
+    }
+
+    async fn stop(&mut self) {
         for t in &self.tasks {
             t.abort();
         }
@@ -215,19 +247,7 @@ impl Runtime {
         // device is gone and route repair would treat a *recycled* utun —
         // somebody else's VPN — as ours to repoint.
         forget_own_utun(&self.utun_name);
-        best_effort_remove_setup_container(&self.docker).await;
-        info!(utun = %self.utun_name, "netbridge shut down (network retained)");
-    }
-
-    /// Shutdown + best-effort remove the docker network. Used when the
-    /// user explicitly disables the bridge (`portman bridge disable`),
-    /// not on daemon restart. If user containers are attached, the
-    /// network removal will fail silently — docker refuses to remove a
-    /// network with endpoints. The user disconnects them first.
-    pub async fn shutdown_and_remove_network(self) {
-        let docker = self.docker.clone();
-        self.shutdown().await;
-        remove_portman_network_if_owned(&docker).await;
+        best_effort_remove_setup_container(&self.docker, &self.listen_port).await;
     }
 }
 
@@ -494,6 +514,7 @@ fn spawn_route_reconciler(docker: Docker, mode: NetbridgeMode, iface: String) ->
 async fn spawn_setup_container(
     docker: &Docker,
     host: &Keypair,
+    held: &ListenPort,
 ) -> Result<boringtun::x25519::PublicKey> {
     let env = setup_container_env(host);
     let body = ContainerCreateBody {
@@ -522,7 +543,7 @@ async fn spawn_setup_container(
         .start_container(SETUP_CONTAINER, None::<StartContainerOptions>)
         .await
     {
-        best_effort_remove_setup_container(docker).await;
+        best_effort_remove_setup_container(docker, held).await;
         return Err(err).context("starting netbridge setup container");
     }
     // Poll until the setup container is running and has printed `VM_PUBKEY=`,
@@ -530,7 +551,7 @@ async fn spawn_setup_container(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         if let Err(err) = ensure_setup_container_running(docker).await {
-            best_effort_remove_setup_container(docker).await;
+            best_effort_remove_setup_container(docker, held).await;
             return Err(err);
         }
         match read_setup_vm_public_key(docker).await {
@@ -539,7 +560,7 @@ async fn spawn_setup_container(
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Err(err) => {
-                best_effort_remove_setup_container(docker).await;
+                best_effort_remove_setup_container(docker, held).await;
                 return Err(err);
             }
         }
@@ -657,7 +678,7 @@ async fn create_portman_network(docker: &Docker) -> Result<()> {
     Ok(())
 }
 
-async fn remove_existing_setup_container(docker: &Docker) -> Result<()> {
+async fn remove_existing_setup_container(docker: &Docker, _held: &ListenPort) -> Result<()> {
     let Some((labels, running)) = setup_container_snapshot(docker).await? else {
         return Ok(());
     };
@@ -716,8 +737,8 @@ async fn wait_for_setup_container_gone(docker: &Docker) -> Result<()> {
     }
 }
 
-async fn best_effort_remove_setup_container(docker: &Docker) {
-    if let Err(err) = remove_existing_setup_container(docker).await {
+async fn best_effort_remove_setup_container(docker: &Docker, held: &ListenPort) {
+    if let Err(err) = remove_existing_setup_container(docker, held).await {
         warn!(
             container = SETUP_CONTAINER,
             error = %err,
@@ -826,12 +847,27 @@ fn docker_removal_already_underway(err: &DockerError) -> bool {
 /// the `portman` network. Each is removed only when it carries portman's
 /// labels, and one that is absent is passed over. The network stays while a
 /// container is attached to it, because the engine refuses that removal.
-pub async fn remove_leftovers(docker: &Docker) {
-    best_effort_remove_setup_container(docker).await;
-    remove_portman_network_if_owned(docker).await;
+///
+/// The labels name portman and not one daemon, so the removal also needs
+/// UDP port `listen_port`, the one a bridge listens on. When that port is
+/// taken, nothing is removed and the engine is not asked.
+pub async fn remove_leftovers(docker: &Docker, listen_port: u16) {
+    let held = match ListenPort::claim(listen_port).await {
+        Ok(held) => held,
+        Err(err) => {
+            info!(
+                listen_port,
+                %err,
+                "netbridge leftovers stay in the engine: the listen port is taken, and its holder may run a bridge on them"
+            );
+            return;
+        }
+    };
+    best_effort_remove_setup_container(docker, &held).await;
+    remove_portman_network_if_owned(docker, &held).await;
 }
 
-async fn remove_portman_network_if_owned(docker: &Docker) {
+async fn remove_portman_network_if_owned(docker: &Docker, _held: &ListenPort) {
     let inspected = docker
         .inspect_network(PORTMAN_NETWORK, None::<InspectNetworkOptions>)
         .await;
@@ -1439,6 +1475,21 @@ destination: 172.18.0.0
             network_removal(Err(&server_err(500, "boom"))),
             NetworkRemoval::Unknown(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn the_listen_port_has_one_holder_at_a_time() {
+        let first = ListenPort::claim(0).await.unwrap();
+        let port = first.0.local_addr().unwrap().port();
+
+        let second = ListenPort::claim(port).await;
+        assert_eq!(
+            second.err().map(|err| err.kind()),
+            Some(std::io::ErrorKind::AddrInUse)
+        );
+
+        drop(first);
+        assert!(ListenPort::claim(port).await.is_ok());
     }
 
     #[test]

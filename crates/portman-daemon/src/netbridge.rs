@@ -37,7 +37,7 @@ use bollard::Docker;
 use portman_core::netbridge_state::{self, NetbridgeState};
 use portman_core::NetbridgeMode;
 use portman_netbridge::runtime::{Runtime, RuntimeOptions};
-use portman_netbridge::tunnel::Keypair;
+use portman_netbridge::tunnel::{Keypair, HOST_WG_LISTEN_PORT};
 use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{info, warn};
 
@@ -319,7 +319,11 @@ pub(crate) async fn run(
     state_path: PathBuf,
 ) -> Result<()> {
     let forced_on = env_forces_enabled();
-    converge(engine.watch(), handle, rx, phase_tx, state_path, forced_on).await
+    let engine = LinkedEngine {
+        link: engine.watch(),
+        listen_port: HOST_WG_LISTEN_PORT,
+    };
+    converge(engine, handle, rx, phase_tx, state_path, forced_on).await
 }
 
 async fn converge<E: BridgeEngine>(
@@ -510,15 +514,22 @@ pub(crate) trait Bridge {
     async fn shutdown_and_remove_network(self);
 }
 
-impl BridgeEngine for watch::Receiver<Link> {
+/// The engine behind the daemon's link, and the UDP port that a bridge of
+/// this daemon listens on.
+struct LinkedEngine {
+    link: watch::Receiver<Link>,
+    listen_port: u16,
+}
+
+impl BridgeEngine for LinkedEngine {
     type Bridge = Runtime;
 
     fn session(&self) -> Option<Session> {
-        self.borrow().session()
+        self.link.borrow().session()
     }
 
     async fn session_changed(&mut self) {
-        if self.changed().await.is_err() {
+        if self.link.changed().await.is_err() {
             std::future::pending::<()>().await;
         }
     }
@@ -529,13 +540,13 @@ impl BridgeEngine for watch::Receiver<Link> {
         mode: NetbridgeMode,
         host_kp: &Keypair,
     ) -> Result<Runtime> {
-        let docker = docker_of(self, session)?;
+        let docker = docker_of(&self.link, session)?;
         Runtime::start_with_keypair(docker, RuntimeOptions { mode }, host_kp).await
     }
 
     async fn remove_leftovers(&self, session: Session) {
-        if let Ok(docker) = docker_of(self, session) {
-            portman_netbridge::runtime::remove_leftovers(&docker).await;
+        if let Ok(docker) = docker_of(&self.link, session) {
+            portman_netbridge::runtime::remove_leftovers(&docker, self.listen_port).await;
         }
     }
 }
@@ -1362,6 +1373,63 @@ mod tests {
 
         rig.reaches(BridgePhase::WaitingForDocker).await;
         rig.no_attempt_follows().await;
+    }
+
+    const SETUP_CONTAINER: &str = "/containers/portman-netbridge-setup/json";
+    const OWN_SETUP_CONTAINER: &str = r#"{
+        "Config": {"Labels": {"dev.portman.managed": "1", "dev.portman.role": "netbridge-setup"}},
+        "State": {"Running": true}
+    }"#;
+    const NETWORK: &str = "/networks/portman";
+    const OWN_NETWORK: &str = r#"{"Labels": {"dev.portman.managed": "1"}}"#;
+
+    /// The engine as the daemon reaches it, with a bridge's leftovers in
+    /// it, and a UDP socket that holds the listen port as another daemon's
+    /// bridge does.
+    fn engine_with_leftovers() -> (
+        LinkedEngine,
+        Arc<crate::engine::tests::FakeEngine>,
+        std::net::UdpSocket,
+    ) {
+        let (engine, fake) = crate::engine::tests::connected();
+        fake.hold(SETUP_CONTAINER, OWN_SETUP_CONTAINER);
+        fake.hold(NETWORK, OWN_NETWORK);
+        let port_holder = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let engine = LinkedEngine {
+            link: engine.watch(),
+            listen_port: port_holder.local_addr().unwrap().port(),
+        };
+        (engine, fake, port_holder)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_removed_from_the_engine_while_another_daemon_holds_the_listen_port() {
+        let (engine, fake, _another_daemons_bridge) = engine_with_leftovers();
+
+        engine.remove_leftovers(Session(1)).await;
+
+        assert_eq!(fake.calls(), [] as [&str; 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_leftovers_are_removed_while_the_listen_port_is_free() {
+        let (engine, fake, port_holder) = engine_with_leftovers();
+        drop(port_holder);
+
+        engine.remove_leftovers(Session(1)).await;
+
+        let removed: Vec<_> = fake
+            .calls()
+            .into_iter()
+            .filter(|call| call.starts_with("DELETE"))
+            .collect();
+        assert_eq!(
+            removed,
+            [
+                "DELETE /containers/portman-netbridge-setup",
+                "DELETE /networks/portman"
+            ]
+        );
     }
 
     #[tokio::test(start_paused = true)]
