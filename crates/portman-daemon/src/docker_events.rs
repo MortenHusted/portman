@@ -18,14 +18,71 @@ use tracing::{debug, info, warn};
 use crate::discovery::{self, Skipped};
 use crate::DaemonState;
 
-/// Delays between reconciles while a labelled container has no address.
-const ADDRESS_RETRY: [Duration; 5] = [
+/// Delays between lists that no wake caused. The loop takes these steps while
+/// a labelled container has no address, after a list that failed, and for the
+/// lists a network event owes.
+const RELIST_DELAYS: [Duration; 5] = [
     Duration::from_millis(250),
     Duration::from_millis(500),
     Duration::from_secs(1),
     Duration::from_secs(2),
     Duration::from_secs(4),
 ];
+
+/// Timed lists that a network event owes. The engine writes two small files
+/// between the event and its list update, so the first step is long enough
+/// unless the disk stalls. The second step covers a stall.
+const NETWORK_EVENT_RELISTS: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Trigger {
+    /// A container `start` or `die`. The engine updates its container list
+    /// before it sends the event.
+    Container,
+    /// A network `connect` or `disconnect`. The engine sends the event before
+    /// it updates its container list, so a list made at once can show the old
+    /// addresses.
+    Network,
+}
+
+/// When the loop lists again with no wake.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Relist {
+    /// Timed lists since the last wake.
+    attempt: usize,
+    /// Timed lists still owed to a network event.
+    owed: usize,
+}
+
+impl Relist {
+    fn after_trigger(self, trigger: Trigger) -> Self {
+        let owed = match trigger {
+            Trigger::Container => self.owed,
+            Trigger::Network => NETWORK_EVENT_RELISTS,
+        };
+        Self { attempt: 0, owed }
+    }
+
+    fn after_resync(self) -> Self {
+        Self { attempt: 0, ..self }
+    }
+
+    fn after_delay(self) -> Self {
+        Self {
+            attempt: self.attempt + 1,
+            owed: self.owed.saturating_sub(1),
+        }
+    }
+
+    /// `retry` says that the last list failed or left a container waiting for
+    /// an address. `None` means wait for a wake.
+    fn delay(self, retry: bool) -> Option<Duration> {
+        RELIST_DELAYS
+            .get(self.attempt)
+            .copied()
+            .filter(|_| retry || self.owed > 0)
+    }
+}
 
 /// The daemon's registry and the handle that wakes [`run`]. The registry
 /// wakes it for every hostname it releases.
@@ -47,27 +104,29 @@ pub(crate) async fn run(docker: Docker, state: DaemonState) -> Result<()> {
     info!("streaming docker events");
 
     let mut reported = HashSet::new();
-    let mut retries = 0;
+    let mut relist = Relist::default();
     loop {
-        let waiting = match reconcile(&docker, &state, &mut reported).await {
+        let retry = match reconcile(&docker, &state, &mut reported).await {
             Ok(waiting) => waiting,
             Err(err) => {
                 warn!(error = format!("{err:#}"), "container reconcile failed");
                 true
             }
         };
-        let retry = ADDRESS_RETRY.get(retries).copied().filter(|_| waiting);
-        tokio::select! {
-            trigger = next_trigger(&mut events) => {
-                if trigger.is_none() {
+        let delay = relist.delay(retry);
+        relist = tokio::select! {
+            trigger = next_trigger(&mut events) => match trigger {
+                Some(trigger) => relist.after_trigger(trigger),
+                None => {
                     warn!("docker events stream ended");
                     return Ok(());
                 }
-                retries = 0;
+            },
+            _ = state.container_resync.notified() => relist.after_resync(),
+            _ = tokio::time::sleep(delay.unwrap_or_default()), if delay.is_some() => {
+                relist.after_delay()
             }
-            _ = state.container_resync.notified() => retries = 0,
-            _ = tokio::time::sleep(retry.unwrap_or_default()), if retry.is_some() => retries += 1,
-        }
+        };
     }
 }
 
@@ -131,37 +190,37 @@ async fn reconcile(
 }
 
 /// Waits for an event that can change the container routes, then drains the
-/// events the stream already holds, so a burst costs one list. `None` when the
-/// stream has ended.
+/// events the stream already holds, so the events buffered behind it share its
+/// list. A burst that holds a network event is a network trigger. `None` when
+/// the stream has ended.
 async fn next_trigger<E: Display>(
     events: &mut (impl Stream<Item = Result<EventMessage, E>> + Unpin),
-) -> Option<()> {
-    let mut triggered = false;
+) -> Option<Trigger> {
+    let mut burst = None;
     loop {
-        let next = if triggered {
+        let next = if burst.is_some() {
             match events.next().now_or_never() {
                 Some(Some(next)) => next,
-                _ => return Some(()),
+                _ => return burst,
             }
         } else {
             events.next().await?
         };
         match next {
-            Ok(event) => triggered |= is_trigger(&event),
+            Ok(event) => burst = burst.max(trigger(&event)),
             Err(err) => warn!(error = %err, "docker events stream error"),
         }
     }
 }
 
-fn is_trigger(event: &EventMessage) -> bool {
-    matches!(
-        (event.typ, event.action.as_deref()),
-        (Some(EventMessageTypeEnum::CONTAINER), Some("start" | "die"))
-            | (
-                Some(EventMessageTypeEnum::NETWORK),
-                Some("connect" | "disconnect")
-            )
-    )
+fn trigger(event: &EventMessage) -> Option<Trigger> {
+    match (event.typ, event.action.as_deref()) {
+        (Some(EventMessageTypeEnum::CONTAINER), Some("start" | "die")) => Some(Trigger::Container),
+        (Some(EventMessageTypeEnum::NETWORK), Some("connect" | "disconnect")) => {
+            Some(Trigger::Network)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -189,20 +248,20 @@ mod tests {
     fn only_events_that_change_the_container_list_or_an_address_trigger() {
         use EventMessageTypeEnum::{CONTAINER, IMAGE, NETWORK};
         let cases = [
-            (CONTAINER, "start", true),
-            (CONTAINER, "die", true),
-            (NETWORK, "connect", true),
-            (NETWORK, "disconnect", true),
-            (CONTAINER, "create", false),
-            (CONTAINER, "exec_start: sh", false),
-            (CONTAINER, "health_status: healthy", false),
-            (NETWORK, "create", false),
-            (IMAGE, "pull", false),
+            (CONTAINER, "start", Some(Trigger::Container)),
+            (CONTAINER, "die", Some(Trigger::Container)),
+            (NETWORK, "connect", Some(Trigger::Network)),
+            (NETWORK, "disconnect", Some(Trigger::Network)),
+            (CONTAINER, "create", None),
+            (CONTAINER, "exec_start: sh", None),
+            (CONTAINER, "health_status: healthy", None),
+            (NETWORK, "create", None),
+            (IMAGE, "pull", None),
         ];
         for (typ, action, expected) in cases {
-            assert_eq!(is_trigger(&event(typ, action)), expected, "{typ} {action}");
+            assert_eq!(trigger(&event(typ, action)), expected, "{typ} {action}");
         }
-        assert!(!is_trigger(&EventMessage::default()));
+        assert_eq!(trigger(&EventMessage::default()), None);
     }
 
     #[tokio::test]
@@ -210,14 +269,61 @@ mod tests {
         use EventMessageTypeEnum::{CONTAINER, NETWORK};
         let mut events = open_stream(vec![
             event(CONTAINER, "create"),
-            event(NETWORK, "connect"),
             event(CONTAINER, "start"),
             event(NETWORK, "connect"),
             event(CONTAINER, "start"),
         ]);
 
-        assert_eq!(next_trigger(&mut events).await, Some(()));
+        assert_eq!(next_trigger(&mut events).await, Some(Trigger::Network));
         assert!(next_trigger(&mut events).now_or_never().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_burst_without_a_network_event_is_a_container_trigger() {
+        use EventMessageTypeEnum::CONTAINER;
+        let mut events = open_stream(vec![event(CONTAINER, "start"), event(CONTAINER, "die")]);
+
+        assert_eq!(next_trigger(&mut events).await, Some(Trigger::Container));
+    }
+
+    #[test]
+    fn a_network_trigger_owes_timed_lists_and_a_container_trigger_owes_none() {
+        let ms = |millis| Some(Duration::from_millis(millis));
+        let idle = Relist::default();
+        assert_eq!(idle.delay(false), None);
+        assert_eq!(idle.after_trigger(Trigger::Container).delay(false), None);
+        assert_eq!(idle.after_resync().delay(false), None);
+
+        let network = idle.after_trigger(Trigger::Network);
+        assert_eq!(network.delay(false), ms(250));
+        assert_eq!(network.after_delay().delay(false), ms(500));
+        assert_eq!(network.after_delay().after_delay().delay(false), None);
+
+        for later_wake in [
+            network.after_trigger(Trigger::Container),
+            network.after_resync(),
+        ] {
+            assert_eq!(later_wake.delay(false), ms(250), "{later_wake:?}");
+        }
+    }
+
+    #[test]
+    fn a_retry_follows_the_whole_schedule_and_a_wake_starts_it_over() {
+        let mut relist = Relist::default();
+        let mut delays = Vec::new();
+        while let Some(delay) = relist.delay(true) {
+            delays.push(delay);
+            relist = relist.after_delay();
+        }
+        assert_eq!(delays, RELIST_DELAYS);
+
+        for woken in [
+            relist.after_trigger(Trigger::Container),
+            relist.after_trigger(Trigger::Network),
+            relist.after_resync(),
+        ] {
+            assert_eq!(woken.delay(true), Some(RELIST_DELAYS[0]), "{woken:?}");
+        }
     }
 
     #[tokio::test]
@@ -238,7 +344,7 @@ mod tests {
         ])
         .fuse();
 
-        assert_eq!(next_trigger(&mut events).await, Some(()));
+        assert_eq!(next_trigger(&mut events).await, Some(Trigger::Container));
         assert_eq!(next_trigger(&mut events).await, None);
     }
 
@@ -288,7 +394,7 @@ mod tests {
         ])
         .fuse();
 
-        assert_eq!(next_trigger(&mut events).await, Some(()));
+        assert_eq!(next_trigger(&mut events).await, Some(Trigger::Container));
         assert_eq!(next_trigger(&mut events).await, None);
         assert!(logs.text().contains("connection reset"), "{}", logs.text());
     }
