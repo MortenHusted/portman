@@ -1659,7 +1659,7 @@ function renderStatus(status) {
   if (assessment !== 'healthy' && assessment !== 'unknown') {
     pushAlert(
       `Bridge ${assessment.replace('_', ' ')}`,
-      `<div class="alert-body">mode=${esc(status.bridge_mode)} · enabled=${esc(status.bridge_enabled)}</div>`,
+      `<div class="alert-body">mode=${esc(status.bridge_mode)} · netbridge=${esc(String(status.bridge_phase).replace(/_/g, ' '))}</div>`,
       assessment === 'tunnel_dead'
     );
   }
