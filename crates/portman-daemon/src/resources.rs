@@ -691,20 +691,25 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_sample_holds_the_supervised_services_whatever_the_engine_does() {
-        use crate::handlers::tests::{settled_services, sleeper, test_state};
+    /// Runs one supervised service, `web`, until the test takes it down.
+    async fn run_web(state: &DaemonState, dir: &std::path::Path) {
+        use crate::handlers::tests::{settled_services, sleeper};
 
-        let dir = tempfile::tempdir().unwrap();
-        let state = test_state(&dir);
-        let services = vec![sleeper("web", dir.path())];
+        let services = vec![sleeper("web", dir)];
         state
             .supervisor
-            .sync(dir.path(), services, Default::default(), Default::default())
+            .sync(dir, services, Default::default(), Default::default())
             .await
             .unwrap();
         state.supervisor.up(&["web".to_string()]).await.unwrap();
-        settled_services(&state).await;
+        settled_services(state).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sample_holds_the_supervised_services_whatever_the_engine_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::handlers::tests::test_state(&dir);
+        run_web(&state, dir.path()).await;
 
         let (lists, _) = crate::engine::tests::connected();
         let (fails_lists, engine) = crate::engine::tests::connected();
@@ -732,23 +737,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_list_that_never_ends_holds_back_no_service_row() {
-        use crate::handlers::tests::{settled_services, sleeper, test_state};
-
         let dir = tempfile::tempdir().unwrap();
         let (hangs, engine) = crate::engine::tests::connected();
         engine.hang_lists();
         let state = DaemonState {
             engine: hangs,
-            ..test_state(&dir)
+            ..crate::handlers::tests::test_state(&dir)
         };
-        let services = vec![sleeper("web", dir.path())];
-        state
-            .supervisor
-            .sync(dir.path(), services, Default::default(), Default::default())
-            .await
-            .unwrap();
-        state.supervisor.up(&["web".to_string()]).await.unwrap();
-        settled_services(&state).await;
+        run_web(&state, dir.path()).await;
 
         tokio::time::pause();
         let asked = tokio::time::Instant::now();
