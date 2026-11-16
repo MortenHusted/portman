@@ -31,7 +31,8 @@ pub(crate) struct Container {
     /// IPv4 address. `host` and `none` never appear.
     pub addresses: Vec<(String, Ipv4Addr)>,
     /// The network mode, when it is one that never gives the container an
-    /// address of its own: `host`, `none`, or `container:<id>`.
+    /// address of its own: `host`, `none`, or `container:<id>`. A `none`
+    /// container can still get an address from `docker network connect`.
     pub unaddressable: Option<String>,
 }
 
@@ -197,10 +198,10 @@ fn claim(
         (None, Mode::Tcp) => return Err(Skip::TcpWithoutPort),
         (None, Mode::Http | Mode::Egress | Mode::Unknown) => "80".to_string(),
     };
-    if let Some(mode) = &container.unaddressable {
-        return Err(Skip::NoAddress(mode.clone()));
+    match &container.unaddressable {
+        Some(mode) if container.addresses.is_empty() => Err(Skip::NoAddress(mode.clone())),
+        _ => Ok((host, port)),
     }
-    Ok((host, port))
 }
 
 fn short(id: &str) -> &str {
@@ -582,6 +583,26 @@ mod tests {
             plan.entries[0].container_id.as_deref(),
             Some("bbbbbbbbbbbb")
         );
+    }
+
+    #[test]
+    fn a_none_mode_container_routes_at_the_address_a_later_connect_gave_it() {
+        let mut listed = summary(
+            &[("dev.portman.host", "web.demo.test")],
+            &[("portman", "192.168.99.130")],
+        );
+        listed.host_config = Some(ContainerSummaryHostConfig {
+            network_mode: Some("none".into()),
+            ..Default::default()
+        });
+        let connected = observe(listed).expect("labelled container");
+
+        let plan = plan(&[connected], managed);
+
+        assert_eq!(plan.skipped, vec![]);
+        assert!(plan.waiting.is_empty());
+        let targets: Vec<&str> = plan.entries.iter().map(|e| e.target.as_str()).collect();
+        assert_eq!(targets, vec!["192.168.99.130:80"]);
     }
 
     #[test]
