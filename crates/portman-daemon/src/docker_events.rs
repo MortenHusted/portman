@@ -136,15 +136,21 @@ async fn reconcile(
 async fn next_trigger<E: Display>(
     events: &mut (impl Stream<Item = Result<EventMessage, E>> + Unpin),
 ) -> Option<()> {
+    let mut triggered = false;
     loop {
-        match events.next().await? {
-            Ok(event) if is_trigger(&event) => break,
-            Ok(_) => {}
+        let next = if triggered {
+            match events.next().now_or_never() {
+                Some(Some(next)) => next,
+                _ => return Some(()),
+            }
+        } else {
+            events.next().await?
+        };
+        match next {
+            Ok(event) => triggered |= is_trigger(&event),
             Err(err) => warn!(error = %err, "docker events stream error"),
         }
     }
-    while let Some(Some(_)) = events.next().now_or_never() {}
-    Some(())
 }
 
 fn is_trigger(event: &EventMessage) -> bool {
@@ -234,5 +240,56 @@ mod tests {
 
         assert_eq!(next_trigger(&mut events).await, Some(()));
         assert_eq!(next_trigger(&mut events).await, None);
+    }
+
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Logs {
+        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+            let logs = Self::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish();
+            (logs, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for Logs {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_error_behind_a_trigger_is_logged() {
+        let (logs, _guard) = Logs::capture();
+        let mut events = stream::iter(vec![
+            Ok(event(EventMessageTypeEnum::CONTAINER, "die")),
+            Err("connection reset".to_string()),
+        ])
+        .fuse();
+
+        assert_eq!(next_trigger(&mut events).await, Some(()));
+        assert_eq!(next_trigger(&mut events).await, None);
+        assert!(logs.text().contains("connection reset"), "{}", logs.text());
     }
 }
