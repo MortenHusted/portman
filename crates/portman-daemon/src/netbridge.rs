@@ -25,8 +25,8 @@
 //!     one.
 //!   - while the bridge is off and none runs, the loop removes the setup
 //!     container that an earlier bridge can have left in the engine, once
-//!     for each session and again after a start. It removes the docker
-//!     network only when the user turns the bridge off, because a stopped
+//!     for each session and again when the user turns the bridge off. Only
+//!     then does it also remove the docker network, because a stopped
 //!     container of the user can still refer to it. Each removal needs the
 //!     UDP port that a bridge listens on, so that it cannot take what
 //!     another daemon's bridge runs on.
@@ -554,8 +554,8 @@ pub(crate) trait Bridge {
     async fn shutdown_and_remove_network(self);
 }
 
-/// The engine behind the daemon's link, and the UDP port that a bridge of
-/// this daemon listens on.
+/// The engine behind the daemon's link. The UDP port that a bridge listens
+/// on is a field so that a test can hold or free the port it names.
 struct LinkedEngine {
     link: watch::Receiver<Link>,
     listen_port: u16,
