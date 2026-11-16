@@ -99,10 +99,13 @@ pub struct Runtime {
     tasks: Vec<JoinHandle<()>>,
 }
 
-/// The WireGuard listen port, bound. Every removal from the engine takes one
-/// as proof that no other daemon's bridge is up: two sockets cannot bind one
-/// port, and a bridge holds its port from before its setup container exists
-/// until a shutdown has removed that container or the bridge is dropped.
+/// A UDP port, bound. Every removal from the engine takes one. Two sockets
+/// cannot bind one port, and a bridge holds its port from before it asks the
+/// engine anything until a shutdown has removed its setup container or the
+/// bridge is dropped. A claim therefore shows that no other daemon's bridge
+/// is up, but only when the port is the one that every bridge listens on,
+/// [`HOST_WG_LISTEN_PORT`]. The caller of [`remove_leftovers`] names the
+/// port, so that is the caller's to get right.
 struct ListenPort(Arc<UdpSocket>);
 
 impl ListenPort {
@@ -898,8 +901,10 @@ pub enum Cleanup {
 /// to it.
 ///
 /// The labels name portman and not one daemon, so the removal also needs
-/// UDP port `listen_port`, the one a bridge listens on. When that port is
-/// taken, nothing is removed and the engine is not asked.
+/// UDP port `listen_port`. Pass [`HOST_WG_LISTEN_PORT`], the one that every
+/// bridge listens on: holding any other port shows nothing about a running
+/// bridge. When the port is taken, nothing is removed and the engine is not
+/// asked.
 pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Leftovers) -> Cleanup {
     let held = match ListenPort::claim(listen_port).await {
         Ok(held) => held,

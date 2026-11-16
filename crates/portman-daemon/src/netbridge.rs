@@ -19,10 +19,10 @@
 //!     the loop does not cancel a step in flight.
 //!   - a bridge is built on one engine session. When no session exists the
 //!     loop drops the bridge and asks the engine nothing. When another
-//!     session opens, the loop keeps the bridge if that engine still runs
-//!     the setup container that the bridge started, because the tunnel then
-//!     still has both ends. Otherwise it drops the bridge and builds a new
-//!     one.
+//!     session opens, the loop keeps the bridge if that engine says within
+//!     [`SETUP_CHECK_BUDGET`] that it still runs the setup container that
+//!     the bridge started, because the tunnel then still has both ends.
+//!     Otherwise it drops the bridge and builds a new one.
 //!   - while the bridge is off and none runs, the loop removes the setup
 //!     container that an earlier bridge can have left in the engine, once
 //!     for each session and again when the user turns the bridge off. Only
@@ -184,7 +184,8 @@ enum Step {
     Keep,
     Start(Session),
     /// Drop the bridge without a Docker call. Its session is gone, and no
-    /// engine that would answer runs its setup container.
+    /// later session's engine said in time that it runs the bridge's setup
+    /// container.
     Abandon,
     /// Stop the bridge and keep the docker network, so that attached
     /// containers keep their addresses while the mode changes.
@@ -588,8 +589,11 @@ pub(crate) trait BridgeEngine {
     async fn runs_container(&self, session: Session, id: &str) -> bool;
 
     /// Removes `leftovers` that carry portman's label from the engine of
-    /// `session`. Does nothing when another session exists at the call, or
-    /// when another daemon holds the UDP port that a bridge listens on.
+    /// `session`, and says whether that is done. Does nothing when another
+    /// session exists at the call, or when the UDP port that a bridge
+    /// listens on is taken. Another daemon's bridge holds that port. So do
+    /// the tasks of a bridge that this daemon dropped, until their abort
+    /// ends, and so can a process that is not portman.
     async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) -> Cleanup;
 }
 
