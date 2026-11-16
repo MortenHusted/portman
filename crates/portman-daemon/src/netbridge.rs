@@ -1035,6 +1035,22 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn mode_changes_that_queue_up_during_a_stop_start_one_bridge_in_the_last_mode() {
+        let mut rig = Rig::up().await;
+        rig.hold_stops();
+        rig.send(Control::SetMode(DockerMode)).await;
+        assert_eq!(rig.next_stop().await, Stop::KeepsNetwork);
+
+        rig.send(Control::SetMode(NetbridgeMode::All)).await;
+        rig.send(Control::SetMode(DockerMode)).await;
+        rig.end_stops();
+
+        assert_eq!(rig.next_attempt().await.mode, DockerMode);
+        rig.reaches(BridgePhase::Up { epoch: 2 }).await;
+        assert_eq!(rig.mode().await, DockerMode);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn the_env_override_runs_the_bridge_and_is_never_saved() {
         let mut rig = Rig::start_with_env_override(true);
         let unasked = rig.next_attempt().await;
