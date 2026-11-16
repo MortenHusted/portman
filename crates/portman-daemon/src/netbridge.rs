@@ -244,6 +244,39 @@ fn backoff(failures: u32) -> Duration {
     RETRY_BASE.saturating_mul(1 << doublings).min(RETRY_CAP)
 }
 
+/// What the bridge should be: the intent the user saved, with the
+/// `PORTMAN_NETBRIDGE` override on top. Only `saved` is written to
+/// `netbridge.json`.
+struct Wanted {
+    saved: NetbridgeState,
+    forced_on: bool,
+}
+
+impl Wanted {
+    fn intent(&self) -> NetbridgeState {
+        NetbridgeState {
+            enabled: self.saved.enabled || self.forced_on,
+            mode: self.saved.mode,
+        }
+    }
+
+    fn apply(&mut self, msg: Control) {
+        match msg {
+            Control::Enable => self.saved.enabled = true,
+            Control::Disable => {
+                self.saved.enabled = false;
+                self.forced_on = false;
+            }
+            Control::SetMode(mode) => {
+                if self.saved.mode != mode {
+                    info!(mode = mode.as_str(), "netbridge mode changed");
+                }
+                self.saved.mode = mode;
+            }
+        }
+    }
+}
+
 /// Long-running task spawned from `main`. It returns only when the control
 /// channel closes, and `handle` holds a sender, so it runs for as long as
 /// the daemon polls it.
@@ -258,20 +291,21 @@ pub(crate) async fn run(
     converge(engine, handle, rx, phase_tx, state_path, forced_on).await
 }
 
-/// `forced_on` is the `PORTMAN_NETBRIDGE` override. It counts toward what
-/// the loop wants and never reaches the saved intent.
 async fn converge(
     engine: impl BridgeStarter,
     handle: Handle,
     mut rx: mpsc::Receiver<Control>,
     phase_tx: watch::Sender<BridgePhase>,
     state_path: PathBuf,
-    mut forced_on: bool,
+    forced_on: bool,
 ) -> Result<()> {
-    let mut saved = netbridge_state::load(&state_path);
+    let mut wanted = Wanted {
+        saved: netbridge_state::load(&state_path),
+        forced_on,
+    };
     info!(
-        persisted_enabled = saved.enabled,
-        mode = saved.mode.as_str(),
+        persisted_enabled = wanted.saved.enabled,
+        mode = wanted.saved.mode.as_str(),
         env = forced_on,
         "netbridge subsystem starting"
     );
@@ -283,10 +317,7 @@ async fn converge(
     let mut epoch = 0;
 
     loop {
-        let intent = NetbridgeState {
-            enabled: saved.enabled || forced_on,
-            mode: saved.mode,
-        };
+        let intent = wanted.intent();
         loop {
             let built = running.as_ref().map(|r| r.built);
             publish(
@@ -328,20 +359,8 @@ async fn converge(
 
         match next_wake(&mut rx, attempts.retry_after).await {
             Wake::Control(msg) => {
-                match msg {
-                    Control::Enable => saved.enabled = true,
-                    Control::Disable => {
-                        saved.enabled = false;
-                        forced_on = false;
-                    }
-                    Control::SetMode(mode) => {
-                        if saved.mode != mode {
-                            info!(mode = mode.as_str(), "netbridge mode changed");
-                        }
-                        saved.mode = mode;
-                    }
-                }
-                persist(&state_path, &saved);
+                wanted.apply(msg);
+                persist(&state_path, &wanted.saved);
                 attempts = Attempts::new();
             }
             Wake::RetryDue => attempts.retry_after = None,
