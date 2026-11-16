@@ -16,7 +16,8 @@
 //!     left, then waits for a control message or a retry timer.
 //!   - a failed start is retried with a growing delay. The wait does not
 //!     hold up control messages.
-//!   - [`phase`] is the one fact the rest of the daemon reads.
+//!   - [`publish`] tells the rest of the daemon what the bridge is doing:
+//!     the [`phase`], the mode, and the interface index of the utun.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -57,8 +58,8 @@ pub(crate) enum BridgePhase {
     WaitingForDocker,
     /// A start is in flight or waiting for its retry.
     Starting,
-    /// `epoch` increments for every new `Runtime`. A listener on the tunnel
-    /// address belongs to one utun, so a new epoch means rebind.
+    /// `epoch` increments for every new `Runtime`, so that a reader can tell
+    /// a new bridge from the one it last saw up.
     Up {
         epoch: u64,
     },
@@ -243,9 +244,9 @@ fn backoff(failures: u32) -> Duration {
     RETRY_BASE.saturating_mul(1 << doublings).min(RETRY_CAP)
 }
 
-/// Long-running task spawned from `main`. Never returns `Ok` —
-/// mirrors the shape of the other daemon subsystems so `select!`
-/// handles panics uniformly.
+/// Long-running task spawned from `main`. It returns only when the control
+/// channel closes, and `handle` holds a sender, so it runs for as long as
+/// the daemon polls it.
 pub(crate) async fn run(
     engine: impl BridgeStarter,
     handle: Handle,
@@ -257,6 +258,8 @@ pub(crate) async fn run(
     converge(engine, handle, rx, phase_tx, state_path, forced_on).await
 }
 
+/// `forced_on` is the `PORTMAN_NETBRIDGE` override. It counts toward what
+/// the loop wants and never reaches the saved intent.
 async fn converge(
     engine: impl BridgeStarter,
     handle: Handle,

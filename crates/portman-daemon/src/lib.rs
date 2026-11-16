@@ -408,8 +408,6 @@ pub async fn daemon_main() -> Result<()> {
     // runtime via `Request::BridgeEnable` / `BridgeDisable`, which
     // forward through `netbridge_handle` as `Control` messages.
     let netbridge_state_path = portman_core::paths::netbridge_state_path()?;
-    // Subscribe a phase receiver *before* spawning the netbridge task
-    // so the very first phase publish isn't missed.
     let host_facing_rx = netbridge_handle.phase.clone();
     let netbridge_task = netbridge::run(
         docker.clone(),

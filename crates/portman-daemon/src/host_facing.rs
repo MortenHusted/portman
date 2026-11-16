@@ -1,7 +1,10 @@
 //! Container-facing listeners on `192.168.99.1` (the host's utun
 //! tunnel IP). Runs only while the v1 netbridge is up — the address
-//! doesn't exist otherwise — and binds again for every new bridge,
-//! because the address moves to a new utun.
+//! doesn't exist otherwise — and binds again for every new bridge.
+//! A new bridge puts the address on a new utun. The sockets carry no
+//! interface scope, and it is not established whether sockets bound
+//! before that move would keep serving after it. Binding again does not
+//! depend on the answer.
 //!
 //! Today: DNS/HTTP/TLS listeners on `192.168.99.1` that answer the
 //! same way the host-facing DNS/proxy surfaces do, except DNS rewrites
@@ -61,8 +64,11 @@ struct RunningServices {
 }
 
 impl RunningServices {
-    /// Returns once the listener tasks are gone, so that the next bind does
-    /// not race the old sockets for the address.
+    /// Returns once the HTTP and TLS listeners are closed, so that the next
+    /// bind does not race them for the address. The DNS sockets live in
+    /// child tasks that hickory aborts and does not join when its server
+    /// drops, so port 53 can still be bound for a moment after this
+    /// returns. `spawn_dns` retries a bind that loses that race.
     async fn stop(self) {
         for task in [self.dns, self.http, self.tls] {
             task.abort();
