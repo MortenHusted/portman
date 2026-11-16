@@ -508,13 +508,12 @@ fn persist(path: &Path, intent: &NetbridgeState) {
 }
 
 fn env_forces_enabled() -> bool {
-    match std::env::var(ENABLE_ENV) {
-        Ok(v) => {
-            let v = v.trim();
-            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        Err(_) => false,
-    }
+    std::env::var(ENABLE_ENV).is_ok_and(|value| forces_enabled(&value))
+}
+
+fn forces_enabled(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
 }
 
 #[cfg(test)]
@@ -645,6 +644,16 @@ mod tests {
                 want,
                 "mode={mode:?} running={running:?}"
             );
+        }
+    }
+
+    #[test]
+    fn the_env_override_is_on_for_any_value_but_empty_zero_and_false() {
+        for on in ["1", "true", "TRUE", "yes", "on", " 1 ", "2", "00"] {
+            assert!(forces_enabled(on), "{on:?}");
+        }
+        for off in ["", " ", "0", " 0 ", "false", "FALSE", "False", " false\n"] {
+            assert!(!forces_enabled(off), "{off:?}");
         }
     }
 
