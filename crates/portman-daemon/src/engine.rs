@@ -707,8 +707,7 @@ pub(crate) mod tests {
         replay: Vec<(u64, Vec<EventMessage>)>,
         holds_streams: bool,
         socket: Mutex<Socket>,
-        /// The body of a list response. `None` fails the list.
-        listed: Mutex<Option<String>>,
+        listed: Mutex<Listed>,
         /// The body of the inspect response for each path. The engine
         /// answers 404 for any other path.
         holds: Mutex<HashMap<String, String>>,
@@ -720,6 +719,17 @@ pub(crate) mod tests {
         asked: Mutex<Vec<(u128, Asked)>>,
         /// Runs when a request arrives, before the engine answers it.
         on_request: Mutex<Option<Box<dyn Fn() + Send>>>,
+    }
+
+    /// How the fake engine answers a list.
+    #[derive(Clone)]
+    enum Listed {
+        /// The body of the response.
+        Containers(String),
+        Fails,
+        /// Sends the head of the response and never its body, as a VM does
+        /// that froze with its socket open.
+        Hangs,
     }
 
     impl FakeEngine {
@@ -748,7 +758,7 @@ pub(crate) mod tests {
                 replay,
                 holds_streams,
                 socket: Mutex::new(socket),
-                listed: Mutex::new(Some("[]".into())),
+                listed: Mutex::new(Listed::Containers("[]".into())),
                 holds: Default::default(),
                 calls: Default::default(),
                 stream_ends: watch::Sender::new(0),
@@ -821,10 +831,17 @@ pub(crate) mod tests {
                 tokio::time::sleep(Duration::from_millis(self.list_ms)).await;
                 let listed = self.listed.lock().unwrap().clone();
                 match listed {
-                    Some(containers) => respond(&mut pipe, "200 OK", &containers).await,
-                    None => {
+                    Listed::Containers(containers) => {
+                        respond(&mut pipe, "200 OK", &containers).await;
+                    }
+                    Listed::Fails => {
                         let failed = r#"{"message":"the engine is shutting down"}"#;
                         respond(&mut pipe, "500 Internal Server Error", failed).await;
+                    }
+                    Listed::Hangs => {
+                        let head = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n";
+                        pipe.write_all(head).await.unwrap();
+                        std::future::pending::<()>().await;
                     }
                 }
             } else if request_line.contains("/events?") {
@@ -891,11 +908,16 @@ pub(crate) mod tests {
         }
 
         fn list(&self, containers: &[ContainerSummary]) {
-            *self.listed.lock().unwrap() = Some(serde_json::to_string(containers).unwrap());
+            let containers = serde_json::to_string(containers).unwrap();
+            *self.listed.lock().unwrap() = Listed::Containers(containers);
         }
 
         pub(crate) fn fail_lists(&self) {
-            *self.listed.lock().unwrap() = None;
+            *self.listed.lock().unwrap() = Listed::Fails;
+        }
+
+        pub(crate) fn hang_lists(&self) {
+            *self.listed.lock().unwrap() = Listed::Hangs;
         }
 
         /// Ends the events responses that are open. An engine that serves

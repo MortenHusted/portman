@@ -265,11 +265,22 @@ async fn collect_containers(state: &DaemonState) -> Result<(Vec<ContainerResourc
     Ok((rows, sample_window_ms))
 }
 
+/// How long the engine has to answer for one sample. bollard bounds only the
+/// wait for a response head, so a VM that froze with its socket open would
+/// hold a sample back without this. It is shorter than [`SAMPLE_PERIOD`], so
+/// that such an engine delays no tick.
+const ENGINE_BUDGET: Duration = Duration::from_secs(4);
+
 /// One sample of the containers and of the supervised services. The service
-/// rows do not depend on the engine: with no engine, or with one that fails
-/// the list, the sample holds no container rows.
+/// rows do not depend on the engine: with no engine, with one that fails the
+/// list, or with one that does not answer within [`ENGINE_BUDGET`], the
+/// sample holds no container rows.
 pub(crate) async fn collect(state: &DaemonState) -> ResourceUsageSnapshot {
-    let (rows, sample_window_ms) = match collect_containers(state).await {
+    let sampled = tokio::time::timeout(ENGINE_BUDGET, collect_containers(state))
+        .await
+        .context("no answer from the engine in time")
+        .and_then(|sampled| sampled);
+    let (rows, sample_window_ms) = match sampled {
         Ok(sampled) => sampled,
         Err(err) => {
             tracing::debug!(error = format!("{err:#}"), "no container samples");
@@ -715,6 +726,43 @@ mod tests {
             assert_eq!(sampled, ["web"], "{case}");
             assert!(snapshot.containers.is_empty(), "{case}");
         }
+
+        state.supervisor.down(&["web".to_string()]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_list_that_never_ends_holds_back_no_service_row() {
+        use crate::handlers::tests::{settled_services, sleeper, test_state};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (hangs, engine) = crate::engine::tests::connected();
+        engine.hang_lists();
+        let state = DaemonState {
+            engine: hangs,
+            ..test_state(&dir)
+        };
+        let services = vec![sleeper("web", dir.path())];
+        state
+            .supervisor
+            .sync(dir.path(), services, Default::default(), Default::default())
+            .await
+            .unwrap();
+        state.supervisor.up(&["web".to_string()]).await.unwrap();
+        settled_services(&state).await;
+
+        tokio::time::pause();
+        let asked = tokio::time::Instant::now();
+        let hour = Duration::from_secs(3600);
+        let snapshot = tokio::time::timeout(hour, collect(&state))
+            .await
+            .expect("the sample waited for the engine");
+        let waited = asked.elapsed();
+        tokio::time::resume();
+
+        let sampled: Vec<_> = snapshot.services.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(sampled, ["web"]);
+        assert!(snapshot.containers.is_empty());
+        assert!(waited < SAMPLE_PERIOD, "{waited:?} delays the next tick");
 
         state.supervisor.down(&["web".to_string()]).await.unwrap();
     }
