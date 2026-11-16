@@ -29,11 +29,11 @@ const RELIST_DELAYS: [Duration; 5] = [
     Duration::from_secs(4),
 ];
 
-/// Timed lists that a network event owes. Docker Engine 28 writes the
-/// container's two config files between the event and its list update, so the
-/// list lags the event by a disk write. Two steps put a list 250 ms and 750 ms
-/// after the event.
-const NETWORK_EVENT_RELISTS: usize = 2;
+/// Timed lists that a network event owes. On Docker 29.5.2 a list sent when
+/// the event arrived lacked the change in 9 of 10 attaches and had it 300 ms
+/// later. Three steps put lists 250 ms, 750 ms, and 1.75 s after the event,
+/// so two of them come after the one delay that was measured.
+const NETWORK_EVENT_RELISTS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Trigger {
@@ -306,10 +306,15 @@ mod tests {
         assert_eq!(idle.after_trigger(Trigger::Container).delay(false), None);
         assert_eq!(idle.after_resync().delay(false), None);
 
+        let mut network = idle.after_trigger(Trigger::Network);
+        let mut owed = Vec::new();
+        while let Some(delay) = network.delay(false) {
+            owed.push(delay);
+            network = network.after_delay();
+        }
+        assert_eq!(owed, [250, 500, 1000].map(Duration::from_millis));
+
         let network = idle.after_trigger(Trigger::Network);
-        assert_eq!(network.delay(false), ms(250));
-        assert_eq!(network.after_delay().delay(false), ms(500));
-        assert_eq!(network.after_delay().after_delay().delay(false), None);
 
         for later_wake in [
             network.after_trigger(Trigger::Container),
