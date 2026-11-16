@@ -114,20 +114,29 @@ pub(crate) async fn run(docker: Docker, state: DaemonState) -> Result<()> {
                 true
             }
         };
-        let delay = relist.delay(retry);
-        relist = tokio::select! {
-            trigger = next_trigger(&mut events) => match trigger {
-                Some(trigger) => relist.after_trigger(trigger),
-                None => {
-                    warn!("docker events stream ended");
-                    return Ok(());
-                }
-            },
-            _ = state.container_resync.notified() => relist.after_resync(),
-            _ = tokio::time::sleep(delay.unwrap_or_default()), if delay.is_some() => {
-                relist.after_delay()
-            }
+        let Some(next) = wait(&mut events, &state.container_resync, relist, retry).await else {
+            warn!("docker events stream ended");
+            return Ok(());
         };
+        relist = next;
+    }
+}
+
+/// Waits for the next reason to list and returns the schedule that follows
+/// it. `None` when the stream has ended.
+async fn wait<E: Display>(
+    events: &mut (impl Stream<Item = Result<EventMessage, E>> + Unpin),
+    resync: &Notify,
+    relist: Relist,
+    retry: bool,
+) -> Option<Relist> {
+    let delay = relist.delay(retry);
+    tokio::select! {
+        trigger = next_trigger(events) => Some(relist.after_trigger(trigger?)),
+        _ = resync.notified() => Some(relist.after_resync()),
+        _ = tokio::time::sleep(delay.unwrap_or_default()), if delay.is_some() => {
+            Some(relist.after_delay())
+        }
     }
 }
 
