@@ -30,8 +30,8 @@ use crossterm::terminal::{
 };
 use futures_util::StreamExt;
 use portman_protocol::{
-    BridgePhase, ContainerResourceUsage, Entry, LogLineInfo, Mode, NetbridgeMode, Request,
-    ResourceUsageSnapshot, Response, ServiceStatusInfo, Source, TldInfo,
+    BridgePhase, ContainerResourceUsage, DockerState, DockerStatus, Entry, LogLineInfo, Mode,
+    NetbridgeMode, Request, ResourceUsageSnapshot, Response, ServiceStatusInfo, Source, TldInfo,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -166,6 +166,8 @@ struct StatusSnapshot {
     bridge_assessment: portman_protocol::BridgeAssessment,
     bridge_phase: BridgePhase,
     bridge_mode: NetbridgeMode,
+    /// `None` from a daemon that predates the field.
+    docker: Option<DockerStatus>,
 }
 
 /// A bridge the user wants can be turned off whether or not it is up.
@@ -448,6 +450,7 @@ async fn fetch_status() -> Result<StatusSnapshot> {
             bridge_enabled,
             bridge_phase,
             bridge_mode,
+            docker,
             ..
         } => Ok(StatusSnapshot {
             version,
@@ -461,6 +464,7 @@ async fn fetch_status() -> Result<StatusSnapshot> {
             bridge_assessment,
             bridge_phase: bridge_phase.or_from_enabled(bridge_enabled),
             bridge_mode,
+            docker,
         }),
         _ => anyhow::bail!("unexpected Status response"),
     }
@@ -1002,6 +1006,20 @@ fn render_status_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
             "offline" => (Color::Yellow, "docker down"),
             _ => (Color::DarkGray, "unknown"),
         };
+        let ports = Line::from(vec![
+            Span::styled("  dns  ", Style::default().fg(Color::Gray)),
+            Span::styled(s.dns_port.to_string(), Style::default().bold()),
+            Span::styled("  http ", Style::default().fg(Color::Gray)),
+            Span::styled(format!(":{}", s.proxy_port), Style::default().bold()),
+            Span::styled("  tls ", Style::default().fg(Color::Gray)),
+            Span::styled(format!(":{}", s.tls_port), Style::default().bold()),
+        ]);
+        // The panel has six rows. The engine row takes the place of the
+        // empty one, and sits above the bridge row.
+        let (third, fourth) = match &s.docker {
+            Some(docker) => (ports, docker_row(docker, inner.width)),
+            None => (Line::from(""), ports),
+        };
         vec![
             Line::from(vec![
                 Span::styled("●", Style::default().fg(Color::Green)),
@@ -1013,15 +1031,8 @@ fn render_status_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
                 format!("  up {}", s.running_since),
                 Style::default().fg(Color::Gray),
             )),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  dns  ", Style::default().fg(Color::Gray)),
-                Span::styled(s.dns_port.to_string(), Style::default().bold()),
-                Span::styled("  http ", Style::default().fg(Color::Gray)),
-                Span::styled(format!(":{}", s.proxy_port), Style::default().bold()),
-                Span::styled("  tls ", Style::default().fg(Color::Gray)),
-                Span::styled(format!(":{}", s.tls_port), Style::default().bold()),
-            ]),
+            third,
+            fourth,
             Line::from(vec![
                 Span::styled("  netbridge ", Style::default().fg(Color::Gray)),
                 Span::styled(
@@ -1067,6 +1078,30 @@ fn render_status_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
         ]
     };
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The engine row of the status panel. The engine version, or the reason
+/// for a state that is not `connected`, follows the state only when the
+/// row holds it whole.
+fn docker_row(docker: &DockerStatus, width: u16) -> Line<'static> {
+    let label = "  docker ";
+    let word = docker.state.display_word();
+    let color = match docker.state {
+        DockerState::Connected => Color::Green,
+        DockerState::Disconnected => Color::Yellow,
+        _ => Color::Gray,
+    };
+    let mut spans = vec![
+        Span::styled(label, Style::default().fg(Color::Gray)),
+        Span::styled(word, Style::default().fg(color).bold()),
+    ];
+    let more = docker.version.as_deref().or(docker.reason.as_deref());
+    if let Some(more) = more.map(|more| format!("  {more}")) {
+        if label.len() + word.len() + more.chars().count() <= usize::from(width) {
+            spans.push(Span::styled(more, Style::default().fg(Color::Gray)));
+        }
+    }
+    Line::from(spans)
 }
 
 fn render_entries_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
@@ -1543,7 +1578,7 @@ fn activity_container_line(row: &ContainerResourceUsage) -> Line<'static> {
 
 fn detail_status(state: &State) -> (&'static str, Vec<Line<'static>>) {
     let lines = if let Some(s) = &state.status {
-        vec![
+        let mut lines = vec![
             Line::from(""),
             Line::from(vec![
                 Span::styled("  portman ", Style::default().fg(Color::Yellow).bold()),
@@ -1570,7 +1605,13 @@ fn detail_status(state: &State) -> (&'static str, Vec<Line<'static>>) {
                     NetbridgeMode::display_word(s.bridge_mode)
                 ),
             ),
-        ]
+        ];
+        lines.extend(
+            s.docker
+                .as_ref()
+                .map(|docker| kv("  docker    ", docker.summary())),
+        );
+        lines
     } else {
         vec![
             Line::from(""),
@@ -2158,9 +2199,8 @@ mod tests {
         assert_eq!(activity_container_label(&row), "dev/web");
     }
 
-    /// The screen rows that the status panel covers, at 120 columns.
-    fn status_rows(phase: BridgePhase) -> Vec<String> {
-        let state = State {
+    fn status_state(phase: BridgePhase, docker: Option<DockerStatus>) -> State {
+        State {
             status: Some(StatusSnapshot {
                 version: "0.1.5".to_string(),
                 running_since: "5s".to_string(),
@@ -2173,15 +2213,135 @@ mod tests {
                 bridge_assessment: portman_protocol::BridgeAssessment::Healthy,
                 bridge_phase: phase,
                 bridge_mode: NetbridgeMode::OptIn,
+                docker,
             }),
             ..State::default()
-        };
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
-        terminal.draw(|f| view(f, &state)).unwrap();
+        }
+    }
+
+    /// The six rows inside the border of the status panel, on a terminal of
+    /// `columns` columns.
+    fn status_panel(columns: u16, state: &State) -> Vec<String> {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(columns, 40)).unwrap();
+        terminal.draw(|f| view(f, state)).unwrap();
         let buffer = terminal.backend().buffer();
-        (0..8)
-            .map(|y| (0..120).map(|x| buffer[(x, y)].symbol()).collect())
+        let border = (0..columns)
+            .find(|x| buffer[(*x, 0)].symbol() == "┐")
+            .expect("the status panel has a top right corner");
+        (1..7)
+            .map(|y| (1..border).map(|x| buffer[(x, y)].symbol()).collect())
             .collect()
+    }
+
+    /// The rows of the status panel at 120 columns, for a daemon that
+    /// reports no engine state.
+    fn status_rows(phase: BridgePhase) -> Vec<String> {
+        status_panel(120, &status_state(phase, None))
+    }
+
+    fn docker(state: DockerState, reason: Option<&str>) -> DockerStatus {
+        DockerStatus {
+            state,
+            reason: reason.map(str::to_string),
+            ..DockerStatus::default()
+        }
+    }
+
+    #[test]
+    fn the_status_panel_shows_the_engine_state_uncut_at_120_100_and_80_columns() {
+        let states = [
+            DockerStatus {
+                socket: Some("/run/demo/docker.sock".to_string()),
+                version: Some("29.2.1".to_string()),
+                ..docker(DockerState::Connected, None)
+            },
+            docker(DockerState::Disconnected, Some("no socket")),
+            docker(DockerState::Disconnected, Some("unreachable")),
+            docker(
+                DockerState::Disconnected,
+                Some("no connect attempt has ended yet"),
+            ),
+            docker(DockerState::Disabled, Some("managed broker")),
+        ];
+        let wide = [
+            "  docker connected  29.2.1",
+            "  docker disconnected  no socket",
+            "  docker disconnected  unreachable",
+            "  docker disconnected",
+            "  docker disabled  managed broker",
+        ];
+        let narrow = [
+            "  docker connected  29.2.1",
+            "  docker disconnected",
+            "  docker disconnected",
+            "  docker disconnected",
+            "  docker disabled",
+        ];
+        // (terminal columns, columns inside the panel, the docker row)
+        let table = [(120, 41, wide), (100, 34, wide), (80, 27, narrow)];
+        for (columns, inside, lines) in table {
+            for (docker, line) in states.iter().zip(lines) {
+                let state = status_state(BridgePhase::WaitingForDocker, Some(docker.clone()));
+                let rows = status_panel(columns, &state);
+                let at = format!("columns={columns} docker={docker:?}\n{rows:#?}");
+                assert_eq!(rows[3].chars().count(), inside, "{at}");
+                assert_eq!(rows[3].trim_end(), line, "{at}");
+                assert!(line.chars().count() <= inside, "{at}");
+                assert!(rows[2].starts_with("  dns  5335"), "{at}");
+                assert!(rows[4].starts_with("  netbridge waiting"), "{at}");
+                assert_eq!(rows[5].trim_end(), "  [b] disable...", "{at}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_engine_state_is_green_when_connected_and_yellow_when_disconnected() {
+        // state → the colour of its word
+        let table = [
+            (DockerState::Connected, Color::Green),
+            (DockerState::Disconnected, Color::Yellow),
+            (DockerState::Disabled, Color::Gray),
+            (DockerState::Unknown, Color::Gray),
+        ];
+        for (state, colour) in table {
+            let row = docker_row(&docker(state, None), 41);
+            assert_eq!(row.spans[1].content, state.display_word());
+            assert_eq!(row.spans[1].style.fg, Some(colour), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn the_status_panel_keeps_its_rows_for_a_daemon_that_reports_no_engine_state() {
+        let rows = status_rows(BridgePhase::Up);
+
+        assert_eq!(rows[2].trim_end(), "");
+        assert!(rows[3].starts_with("  dns  5335"), "{rows:#?}");
+        assert!(rows[4].starts_with("  netbridge up"), "{rows:#?}");
+        assert!(!rows.iter().any(|row| row.contains("docker ")), "{rows:#?}");
+    }
+
+    #[test]
+    fn the_status_detail_names_the_engine_state_in_full() {
+        let text = |state: &State| -> Vec<String> {
+            let (_, lines) = detail_status(state);
+            lines.iter().map(|line| line.to_string()).collect()
+        };
+        let unreachable = DockerStatus {
+            socket: Some("/run/demo/docker.sock".to_string()),
+            detail: Some("no answer in 3 s".to_string()),
+            ..docker(DockerState::Disconnected, Some("unreachable"))
+        };
+
+        let reported = text(&status_state(BridgePhase::Up, Some(unreachable)));
+        let line =
+            "  docker    disconnected, unreachable at /run/demo/docker.sock: no answer in 3 s";
+        assert!(reported.iter().any(|row| row == line), "{reported:#?}");
+
+        let older = text(&status_state(BridgePhase::Up, None));
+        assert!(
+            !older.iter().any(|row| row.contains("docker")),
+            "{older:#?}"
+        );
     }
 
     #[test]
