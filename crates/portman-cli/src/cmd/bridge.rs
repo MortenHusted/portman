@@ -1,13 +1,13 @@
 //! Netbridge commands: status, enable/disable, mode, prepare, doctor.
 
-use crate::client::{bridge_status, wait_for_bridge_state, Pauses};
+use crate::client::{bridge_status, wait_for_bridge_mode, wait_for_bridge_state};
 use crate::cmd::run_setup_image_build;
 use crate::doctor;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use portman_protocol::NetbridgeMode;
 
 use crate::client::request;
-use portman_protocol::{BridgePhase, Request, Response};
+use portman_protocol::{Request, Response};
 
 pub(crate) async fn cmd_bridge_status() -> Result<()> {
     match request(Request::Status).await? {
@@ -68,18 +68,10 @@ pub(crate) async fn cmd_bridge_mode(mode: Option<String>) -> Result<()> {
     };
 
     let mode = parse_netbridge_mode(&raw_mode)?;
-    let was_up = bridge_status().await?.phase() == BridgePhase::Up;
+    let before = bridge_status().await?;
     match request(Request::BridgeSetMode { mode }).await? {
         Response::Ok => {
-            wait_for_bridge_mode(mode).await?;
-            if was_up {
-                wait_for_bridge_state(true).await.with_context(|| {
-                    format!(
-                        "netbridge mode is set to {} and the bridge is not up",
-                        NetbridgeMode::display_word(mode)
-                    )
-                })?;
-            }
+            wait_for_bridge_mode(mode, before).await?;
             println!(
                 "netbridge mode set to {}",
                 NetbridgeMode::display_word(mode)
@@ -94,19 +86,6 @@ pub(crate) async fn cmd_bridge_prepare() -> Result<()> {
     eprintln!("building netbridge setup image from the embedded context…");
     run_setup_image_build()?;
     println!("netbridge setup image ready: {}", doctor::SETUP_IMAGE);
-    Ok(())
-}
-
-pub(crate) async fn wait_for_bridge_mode(desired_mode: NetbridgeMode) -> Result<()> {
-    let mut pauses = Pauses::new();
-    while bridge_status().await?.mode != desired_mode {
-        if !pauses.pause().await {
-            bail!(
-                "netbridge did not report mode {} after 60s",
-                NetbridgeMode::display_word(desired_mode)
-            );
-        }
-    }
     Ok(())
 }
 
