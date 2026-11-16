@@ -703,8 +703,6 @@ mod tests {
     #[derive(Clone)]
     struct Probe {
         phase: watch::Receiver<BridgePhase>,
-        /// The phase that was published each time the loop asked a bridge
-        /// for its utun.
         phase_at_utun_ask: Arc<Mutex<Vec<BridgePhase>>>,
         stops: mpsc::UnboundedSender<Stop>,
         stops_may_end: watch::Receiver<bool>,
