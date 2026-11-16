@@ -1,6 +1,6 @@
 //! Netbridge commands: status, enable/disable, mode, prepare, doctor.
 
-use crate::client::{bridge_enabled, wait_for_bridge_state};
+use crate::client::{bridge_phase, wait_for_bridge_state};
 use crate::cmd::run_setup_image_build;
 use crate::doctor;
 use anyhow::{bail, Result};
@@ -8,24 +8,21 @@ use portman_protocol::NetbridgeMode;
 use tokio::time::{sleep, Duration};
 
 use crate::client::request;
-use portman_protocol::{Request, Response};
+use portman_protocol::{BridgePhase, Request, Response};
 
 pub(crate) async fn cmd_bridge_status() -> Result<()> {
     match request(Request::Status).await? {
         Response::Status {
             bridge_assessment,
             bridge_enabled,
+            bridge_phase,
             bridge_mode,
             ..
         } => {
             println!("bridge:    {bridge_assessment}");
             println!(
                 "netbridge: {}",
-                if bridge_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
+                bridge_phase.or_from_enabled(bridge_enabled).display_word()
             );
             println!("mode:      {}", NetbridgeMode::display_word(bridge_mode));
             for line in doctor::render_docker_routes(&doctor::collect_docker_routes()) {
@@ -97,11 +94,11 @@ pub(crate) async fn cmd_bridge_mode(mode: Option<String>) -> Result<()> {
     };
 
     let mode = parse_netbridge_mode(&raw_mode)?;
-    let was_enabled = bridge_enabled().await?;
+    let was_up = bridge_phase().await? == BridgePhase::Up;
     match request(Request::BridgeSetMode { mode }).await? {
         Response::Ok => {
             wait_for_bridge_mode(mode).await?;
-            if was_enabled {
+            if was_up {
                 wait_for_bridge_state(true).await?;
             }
             println!(

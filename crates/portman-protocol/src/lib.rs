@@ -1337,6 +1337,20 @@ mod tests {
     }
 
     #[test]
+    fn bridge_phase_reads_as_plain_words() {
+        let words = [
+            (BridgePhase::Disabled, "disabled"),
+            (BridgePhase::WaitingForDocker, "waiting for docker"),
+            (BridgePhase::Starting, "starting"),
+            (BridgePhase::Up, "up"),
+            (BridgePhase::Stopping, "stopping"),
+        ];
+        for (phase, word) in words {
+            assert_eq!(phase.display_word(), word);
+        }
+    }
+
+    #[test]
     fn bridge_phase_from_a_newer_daemon_deserializes_as_unknown() {
         let json = r#"{"kind":"status","bridge_phase":"hibernating","bridge_enabled":true}"#;
         assert_eq!(status_phase(json), BridgePhase::Unknown);

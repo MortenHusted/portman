@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use portman_core::paths::socket_path;
 use portman_protocol::transport::{read_response, write_request};
-use portman_protocol::{Request, Response};
+use portman_protocol::{BridgePhase, Request, Response};
 use tokio::net::UnixStream;
 
 pub(crate) async fn request(req: Request) -> Result<Response> {
@@ -32,18 +32,27 @@ pub(crate) async fn request(req: Request) -> Result<Response> {
     read_response(&mut stream).await
 }
 
-pub(crate) async fn bridge_enabled() -> Result<bool> {
+pub(crate) async fn bridge_phase() -> Result<BridgePhase> {
     match request(Request::Status).await? {
-        Response::Status { bridge_enabled, .. } => Ok(bridge_enabled),
+        Response::Status {
+            bridge_phase,
+            bridge_enabled,
+            ..
+        } => Ok(bridge_phase.or_from_enabled(bridge_enabled)),
         other => other.unexpected(),
     }
 }
 
-/// Poll until the daemon reports the desired bridge on/off state. The
-/// daemon applies bridge changes asynchronously; 120 × 500ms = 60s bound.
+/// Poll until the bridge is up, or until it is off and gone. The daemon
+/// applies bridge changes asynchronously; 120 × 500ms = 60s bound.
 pub(crate) async fn wait_for_bridge_state(desired_enabled: bool) -> Result<()> {
+    let desired = if desired_enabled {
+        BridgePhase::Up
+    } else {
+        BridgePhase::Disabled
+    };
     for attempt in 0..120 {
-        if bridge_enabled().await? == desired_enabled {
+        if bridge_phase().await? == desired {
             return Ok(());
         }
         if attempt < 119 {
@@ -52,10 +61,6 @@ pub(crate) async fn wait_for_bridge_state(desired_enabled: bool) -> Result<()> {
     }
     anyhow::bail!(
         "netbridge did not report {} after 60s",
-        if desired_enabled {
-            "enabled"
-        } else {
-            "disabled"
-        }
+        desired.display_word()
     )
 }

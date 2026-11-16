@@ -58,11 +58,9 @@ pub(crate) async fn cmd_status(repo: bool) -> Result<()> {
                 println!("bridge:          {_bridge_assessment}");
                 println!(
                     "netbridge:       {}",
-                    if _bridge_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
+                    _bridge_phase
+                        .or_from_enabled(_bridge_enabled)
+                        .display_word()
                 );
                 println!(
                     "netbridge mode:  {}",
