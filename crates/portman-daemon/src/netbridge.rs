@@ -71,6 +71,17 @@ impl BridgePhase {
     }
 }
 
+impl From<BridgePhase> for portman_protocol::BridgePhase {
+    fn from(phase: BridgePhase) -> Self {
+        match phase {
+            BridgePhase::Disabled => Self::Disabled,
+            BridgePhase::WaitingForDocker => Self::WaitingForDocker,
+            BridgePhase::Starting => Self::Starting,
+            BridgePhase::Up { .. } => Self::Up,
+        }
+    }
+}
+
 /// Shared handle the IPC server holds to push control messages and read
 /// what the netbridge task last published.
 #[derive(Clone)]

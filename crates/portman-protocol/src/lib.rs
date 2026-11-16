@@ -120,6 +120,57 @@ impl BridgeAssessment {
     }
 }
 
+/// What the in-process netbridge is doing. Same lossy-deserialize contract
+/// as [`ServiceState`]. `Unknown` is also what a daemon that predates the
+/// field yields; [`BridgePhase::or_from_enabled`] resolves it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case", from = "String")]
+pub enum BridgePhase {
+    Disabled,
+    /// The user wants a bridge and no container engine is reachable.
+    WaitingForDocker,
+    /// The user wants a bridge and none is up: a start is in flight or
+    /// waits for its retry.
+    Starting,
+    Up,
+    /// A bridge is being stopped, for a disable or a mode change.
+    Stopping,
+    #[default]
+    Unknown,
+}
+
+impl BridgePhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BridgePhase::Disabled => "disabled",
+            BridgePhase::WaitingForDocker => "waiting_for_docker",
+            BridgePhase::Starting => "starting",
+            BridgePhase::Up => "up",
+            BridgePhase::Stopping => "stopping",
+            BridgePhase::Unknown => "unknown",
+        }
+    }
+
+    /// Human-facing words used by the CLI and the TUI alike.
+    pub fn display_word(self) -> &'static str {
+        match self {
+            BridgePhase::WaitingForDocker => "waiting for docker",
+            other => other.as_str(),
+        }
+    }
+
+    /// The phase a client acts on. A daemon that sends no phase this client
+    /// knows still sends `bridge_enabled`, which is true only while a bridge
+    /// runs.
+    pub fn or_from_enabled(self, bridge_enabled: bool) -> Self {
+        match self {
+            BridgePhase::Unknown if bridge_enabled => BridgePhase::Up,
+            BridgePhase::Unknown => BridgePhase::Disabled,
+            known => known,
+        }
+    }
+}
+
 impl std::fmt::Display for TlsMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -135,6 +186,25 @@ impl std::fmt::Display for ServiceState {
 impl std::fmt::Display for BridgeAssessment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Display for BridgePhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<String> for BridgePhase {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "disabled" => BridgePhase::Disabled,
+            "waiting_for_docker" => BridgePhase::WaitingForDocker,
+            "starting" => BridgePhase::Starting,
+            "up" => BridgePhase::Up,
+            "stopping" => BridgePhase::Stopping,
+            _ => BridgePhase::Unknown,
+        }
     }
 }
 
@@ -450,13 +520,17 @@ pub enum Response {
         /// Default preserves backward compat with pre-Phase-A.3 daemons.
         #[serde(default)]
         bridge_assessment: BridgeAssessment,
-        /// Whether the v1 in-process netbridge is currently enabled
-        /// (i.e. owning the `portman` docker network + utun tunnel).
+        /// Whether the v1 in-process netbridge is up (i.e. owning the
+        /// `portman` docker network + utun tunnel). False for a bridge the
+        /// user wants that is not up; `bridge_phase` tells that one apart.
         /// Distinct from `bridge_assessment`, which describes health
         /// of whichever bridge is routing — including the wrapped
         /// chipmk bridge in v0.
         #[serde(default = "default_bridge_enabled")]
         bridge_enabled: bool,
+        /// What the in-process netbridge is doing.
+        #[serde(default)]
+        bridge_phase: BridgePhase,
         /// Route ownership mode for the native netbridge.
         #[serde(default = "default_netbridge_mode")]
         bridge_mode: NetbridgeMode,
@@ -1209,12 +1283,14 @@ mod tests {
                 cert_dir,
                 bridge_assessment,
                 bridge_enabled,
+                bridge_phase,
                 bridge_mode,
                 dashboard_port,
                 managed_broker,
                 egress_grants_version,
                 inference_provisioning_version,
             } => {
+                assert_eq!(bridge_phase, BridgePhase::Unknown);
                 assert!(!managed_broker);
                 assert_eq!(egress_grants_version, 0);
                 assert_eq!(inference_provisioning_version, 0);
@@ -1233,6 +1309,53 @@ mod tests {
             }
             other => panic!("expected status response, got {other:?}"),
         }
+    }
+
+    fn status_phase(json: &str) -> BridgePhase {
+        match serde_json::from_str(json).unwrap() {
+            Response::Status { bridge_phase, .. } => bridge_phase,
+            other => panic!("expected status response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bridge_phase_travels_as_a_snake_case_string() {
+        let wire = [
+            (BridgePhase::Disabled, "disabled"),
+            (BridgePhase::WaitingForDocker, "waiting_for_docker"),
+            (BridgePhase::Starting, "starting"),
+            (BridgePhase::Up, "up"),
+            (BridgePhase::Stopping, "stopping"),
+        ];
+        for (phase, word) in wire {
+            assert_eq!(serde_json::to_value(phase).unwrap(), word);
+            let json = format!(r#"{{"kind":"status","bridge_phase":"{word}"}}"#);
+            assert_eq!(status_phase(&json), phase);
+        }
+    }
+
+    #[test]
+    fn bridge_phase_from_a_newer_daemon_deserializes_as_unknown() {
+        let json = r#"{"kind":"status","bridge_phase":"hibernating","bridge_enabled":true}"#;
+        assert_eq!(status_phase(json), BridgePhase::Unknown);
+    }
+
+    #[test]
+    fn a_client_reads_the_phase_of_an_older_daemon_from_bridge_enabled() {
+        assert_eq!(BridgePhase::Unknown.or_from_enabled(true), BridgePhase::Up);
+        assert_eq!(
+            BridgePhase::Unknown.or_from_enabled(false),
+            BridgePhase::Disabled
+        );
+        // A phase the daemon did send wins over the older field.
+        assert_eq!(
+            BridgePhase::Starting.or_from_enabled(false),
+            BridgePhase::Starting
+        );
+        assert_eq!(
+            BridgePhase::Stopping.or_from_enabled(true),
+            BridgePhase::Stopping
+        );
     }
 
     #[test]

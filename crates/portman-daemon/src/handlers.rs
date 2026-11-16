@@ -464,7 +464,7 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
         .read()
         .map(|g| *g)
         .unwrap_or(portman_protocol::BridgeAssessment::Unknown);
-    let bridge_enabled = state.netbridge.phase.borrow().epoch().is_some();
+    let bridge_phase = portman_protocol::BridgePhase::from(*state.netbridge.phase.borrow());
     let bridge_mode = *state.netbridge.mode.read().await;
     Response::Status {
         managed_broker: state.supervisor.managed_broker(),
@@ -479,7 +479,8 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
         data_dir,
         cert_dir: certs,
         bridge_assessment,
-        bridge_enabled,
+        bridge_enabled: bridge_phase == portman_protocol::BridgePhase::Up,
+        bridge_phase,
         bridge_mode,
         dashboard_port: state.dashboard_port,
     }
@@ -1829,6 +1830,41 @@ pub(crate) mod tests {
             }
         ));
     }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn status_reports_the_bridge_phase_and_bridge_enabled_for_older_clients() {
+        use crate::netbridge::BridgePhase as Published;
+        use portman_protocol::BridgePhase as Wire;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(&dir);
+        let (handle, _rx, phase_tx) = crate::netbridge::handle_pair();
+        state.netbridge = handle;
+
+        // published phase → (phase on the wire, bridge_enabled)
+        let table = [
+            (Published::Disabled, Wire::Disabled, false),
+            (Published::WaitingForDocker, Wire::WaitingForDocker, false),
+            (Published::Starting, Wire::Starting, false),
+            (Published::Up { epoch: 3 }, Wire::Up, true),
+        ];
+        for (published, want_phase, want_enabled) in table {
+            phase_tx.send_replace(published);
+            match handle_status(&state).await {
+                Response::Status {
+                    bridge_phase,
+                    bridge_enabled,
+                    ..
+                } => assert_eq!(
+                    (bridge_phase, bridge_enabled),
+                    (want_phase, want_enabled),
+                    "published={published:?}"
+                ),
+                other => panic!("expected status response, got {other:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn issue_requires_selected_route_revision_and_inventory_omits_secret_locators() {
         let dir = tempfile::tempdir().unwrap();

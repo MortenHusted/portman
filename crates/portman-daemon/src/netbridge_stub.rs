@@ -16,22 +16,17 @@ pub(crate) enum Control {
     SetMode(NetbridgeMode),
 }
 
-/// Mirrors the macOS phase so readers compile on both platforms. Linux
-/// only ever publishes `Disabled`.
+/// Linux runs no bridge, so the phase has one value and nothing publishes
+/// another. The type exists so that the readers compile on both platforms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum BridgePhase {
     Disabled,
-    WaitingForDocker,
-    Starting,
-    Up { epoch: u64 },
 }
 
-impl BridgePhase {
-    pub(crate) fn epoch(self) -> Option<u64> {
-        match self {
-            BridgePhase::Up { epoch } => Some(epoch),
-            _ => None,
+impl From<BridgePhase> for portman_protocol::BridgePhase {
+    fn from(phase: BridgePhase) -> Self {
+        match phase {
+            BridgePhase::Disabled => Self::Disabled,
         }
     }
 }
