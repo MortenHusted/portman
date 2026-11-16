@@ -755,13 +755,19 @@ async fn wait_for_setup_container_gone(docker: &Docker) -> Result<()> {
     }
 }
 
-async fn best_effort_remove_setup_container(docker: &Docker, held: &ListenPort) {
-    if let Err(err) = remove_existing_setup_container(docker, held).await {
-        warn!(
-            container = SETUP_CONTAINER,
-            error = %err,
-            "could not remove netbridge setup container"
-        );
+/// Whether the removal ran to its end. It does not for a container of that
+/// name that is not portman's.
+async fn best_effort_remove_setup_container(docker: &Docker, held: &ListenPort) -> bool {
+    match remove_existing_setup_container(docker, held).await {
+        Ok(()) => true,
+        Err(err) => {
+            warn!(
+                container = SETUP_CONTAINER,
+                error = %err,
+                "could not remove netbridge setup container"
+            );
+            false
+        }
     }
 }
 
@@ -871,6 +877,16 @@ pub enum Leftovers {
     SetupContainerAndNetwork,
 }
 
+/// How a cleanup of [`Leftovers`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cleanup {
+    /// Nothing that was asked for is left for portman to remove.
+    Complete,
+    /// The cleanup was skipped, or a removal failed or was refused. What was
+    /// asked for can still be in the engine.
+    Owed,
+}
+
 /// Removes `leftovers` from the engine. Each is removed only when it carries
 /// portman's labels, and one that is absent is passed over. The engine
 /// refuses to remove the network only while a running container is attached
@@ -879,7 +895,7 @@ pub enum Leftovers {
 /// The labels name portman and not one daemon, so the removal also needs
 /// UDP port `listen_port`, the one a bridge listens on. When that port is
 /// taken, nothing is removed and the engine is not asked.
-pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Leftovers) {
+pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Leftovers) -> Cleanup {
     let held = match ListenPort::claim(listen_port).await {
         Ok(held) => held,
         Err(err) => {
@@ -888,39 +904,53 @@ pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Left
                 %err,
                 "netbridge leftovers stay in the engine: the listen port is taken, and its holder may run a bridge on them"
             );
-            return;
+            return Cleanup::Owed;
         }
     };
-    best_effort_remove_setup_container(docker, &held).await;
-    if leftovers == Leftovers::SetupContainerAndNetwork {
-        remove_portman_network_if_owned(docker, &held).await;
+    let container_gone = best_effort_remove_setup_container(docker, &held).await;
+    let network_gone = leftovers == Leftovers::SetupContainer
+        || remove_portman_network_if_owned(docker, &held).await;
+    if container_gone && network_gone {
+        Cleanup::Complete
+    } else {
+        Cleanup::Owed
     }
 }
 
-async fn remove_portman_network_if_owned(docker: &Docker, _held: &ListenPort) {
+/// Whether the engine is left with no network of portman's. A network of
+/// that name that something else owns is not portman's to remove.
+async fn remove_portman_network_if_owned(docker: &Docker, _held: &ListenPort) -> bool {
     let inspected = docker
         .inspect_network(PORTMAN_NETWORK, None::<InspectNetworkOptions>)
         .await;
     match network_removal(inspected.as_ref().map(|net| net.labels.as_ref())) {
-        NetworkRemoval::Remove => {
-            if let Err(err) = docker.remove_network(PORTMAN_NETWORK).await {
+        NetworkRemoval::Remove => match docker.remove_network(PORTMAN_NETWORK).await {
+            Ok(()) => true,
+            Err(err) => {
                 warn!(
                     network = PORTMAN_NETWORK,
                     error = %err,
                     "could not remove docker network (likely has attached containers)"
                 );
+                false
             }
+        },
+        NetworkRemoval::Foreign => {
+            warn!(
+                network = PORTMAN_NETWORK,
+                "skipping docker network removal because it is not marked as portman-managed"
+            );
+            true
         }
-        NetworkRemoval::Foreign => warn!(
-            network = PORTMAN_NETWORK,
-            "skipping docker network removal because it is not marked as portman-managed"
-        ),
-        NetworkRemoval::Absent => {}
-        NetworkRemoval::Unknown(err) => warn!(
-            network = PORTMAN_NETWORK,
-            error = %err,
-            "could not inspect docker network before removal"
-        ),
+        NetworkRemoval::Absent => true,
+        NetworkRemoval::Unknown(err) => {
+            warn!(
+                network = PORTMAN_NETWORK,
+                error = %err,
+                "could not inspect docker network before removal"
+            );
+            false
+        }
     }
 }
 
