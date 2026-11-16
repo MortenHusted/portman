@@ -337,9 +337,9 @@ pub(crate) fn render_report(report: &DoctorReport) -> String {
 fn bridge_guidance(phase: Option<BridgePhase>) -> &'static [&'static str] {
     match phase {
         Some(BridgePhase::Starting) => &[
-            "netbridge is enabled and has not come up; the daemon keeps retrying",
-            "the reason is in the daemon log: look for `netbridge start failed` (~/Library/Logs/portman/daemon.log when installed)",
-            "check the setup image line above and that Docker is running; `portman bridge disable` stops the retries",
+            "netbridge is enabled and not up yet; if a start fails, the daemon tries again",
+            "a failed start is in the daemon log as `netbridge start failed`, with the reason (~/Library/Logs/portman/daemon.log when installed)",
+            "check the setup image line above and that Docker is running; `portman bridge disable` turns the bridge off",
         ],
         Some(BridgePhase::WaitingForDocker) => &[
             "netbridge is enabled and waits for Docker; start your container runtime",

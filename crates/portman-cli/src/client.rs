@@ -130,8 +130,8 @@ fn timed_out(desired_enabled: bool, last: BridgePhase) -> String {
     let word = last.display_word();
     match (desired_enabled, last) {
         (true, BridgePhase::Starting | BridgePhase::WaitingForDocker) => format!(
-            "netbridge is still {word} after 60s. It stays enabled and the daemon keeps retrying; \
-             the daemon log has the reason. To stop it, run `portman bridge disable`."
+            "netbridge is still {word} after 60s. It stays enabled. If a start fails, the daemon \
+             logs the reason and tries again. To stop it, run `portman bridge disable`."
         ),
         (true, _) => format!("netbridge did not report up after 60s; it reports {word}"),
         (false, _) => format!("netbridge did not report disabled after 60s; it reports {word}"),
@@ -297,12 +297,12 @@ mod tests {
         for still_wanted in [Starting, WaitingForDocker] {
             let message = timed_out(ENABLE, still_wanted);
             assert!(message.contains("stays enabled"), "{message}");
-            assert!(message.contains("keeps retrying"), "{message}");
+            assert!(message.contains("If a start fails"), "{message}");
             assert!(message.contains("`portman bridge disable`"), "{message}");
         }
         for (desired_enabled, last) in [(ENABLE, Disabled), (DISABLE, Stopping), (DISABLE, Up)] {
             let message = timed_out(desired_enabled, last);
-            assert!(!message.contains("keeps retrying"), "{message}");
+            assert!(!message.contains("stays enabled"), "{message}");
             assert!(message.contains(last.display_word()), "{message}");
         }
     }
