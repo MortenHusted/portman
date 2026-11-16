@@ -299,10 +299,8 @@ async fn converge(
             }
         }
 
-        tokio::select! {
-            msg = rx.recv() => {
-                // `None` means every sender is gone, so the daemon is exiting.
-                let Some(msg) = msg else { return Ok(()) };
+        match next_wake(&mut rx, attempts.retry_after).await {
+            Wake::Control(msg) => {
                 match msg {
                     Control::Enable => saved.enabled = true,
                     Control::Disable => {
@@ -319,11 +317,28 @@ async fn converge(
                 persist(&state_path, &saved);
                 attempts = Attempts::new();
             }
-            () = tokio::time::sleep(attempts.retry_after.unwrap_or_default()),
-                if attempts.retry_after.is_some() =>
-            {
-                attempts.retry_after = None;
-            }
+            Wake::RetryDue => attempts.retry_after = None,
+            Wake::Closed => return Ok(()),
+        }
+    }
+}
+
+/// What ends a wait of the control loop.
+enum Wake {
+    Control(Control),
+    RetryDue,
+    /// Every `Control` sender is gone.
+    Closed,
+}
+
+/// A message that is ready goes before a retry that is due, so that no
+/// start runs ahead of a `Disable` that is already in the channel.
+async fn next_wake(rx: &mut mpsc::Receiver<Control>, retry_after: Option<Duration>) -> Wake {
+    tokio::select! {
+        biased;
+        msg = rx.recv() => msg.map_or(Wake::Closed, Wake::Control),
+        () = tokio::time::sleep(retry_after.unwrap_or_default()), if retry_after.is_some() => {
+            Wake::RetryDue
         }
     }
 }
@@ -718,5 +733,24 @@ mod tests {
         rig.send(Control::Disable).await;
         rig.reaches(BridgePhase::Disabled).await;
         rig.no_attempt_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_control_message_goes_before_a_retry_that_is_due() {
+        // An unbiased wait picks one of two ready branches at random, so
+        // one round would pass half the time.
+        for _ in 0..64 {
+            let (tx, mut rx) = mpsc::channel(1);
+            tx.send(Control::Disable).await.unwrap();
+            let wake = next_wake(&mut rx, Some(Duration::ZERO)).await;
+            assert!(matches!(wake, Wake::Control(Control::Disable)));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_that_is_due_ends_the_wait_when_no_message_is_ready() {
+        let (_tx, mut rx) = mpsc::channel(1);
+        let wake = next_wake(&mut rx, Some(Duration::ZERO)).await;
+        assert!(matches!(wake, Wake::RetryDue));
     }
 }
