@@ -521,9 +521,10 @@ pub enum Response {
         #[serde(default)]
         bridge_assessment: BridgeAssessment,
         /// Whether the v1 in-process netbridge runs (i.e. owns the
-        /// `portman` docker network + utun tunnel): it is up or still
-        /// stopping. False for a bridge the user wants that is not up;
-        /// `bridge_phase` tells that one apart.
+        /// `portman` docker network + utun tunnel): it is up, or it still
+        /// stops because the user turned it off. False for a bridge the
+        /// user wants that is not up, one that stops to be replaced
+        /// included; `bridge_phase` tells those apart.
         /// Distinct from `bridge_assessment`, which describes health
         /// of whichever bridge is routing — including the wrapped
         /// chipmk bridge in v0.

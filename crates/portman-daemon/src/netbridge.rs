@@ -67,8 +67,12 @@ pub(crate) enum BridgePhase {
         epoch: u64,
     },
     /// A bridge still runs and the next step removes it. The phase that
-    /// follows is published only when that bridge is gone.
-    Stopping,
+    /// follows is published only when that bridge is gone. `turned_off`
+    /// tells a bridge that the user turned off from one that a new bridge
+    /// replaces.
+    Stopping {
+        turned_off: bool,
+    },
 }
 
 impl BridgePhase {
@@ -77,6 +81,18 @@ impl BridgePhase {
             BridgePhase::Up { epoch } => Some(epoch),
             _ => None,
         }
+    }
+
+    /// What `bridge_enabled` tells a client that predates the phase. Such a
+    /// client waits on this flag alone. It stays true while a bridge that
+    /// the user turned off is on its way out, so that `disable` returns
+    /// when the bridge is gone. It is false while a bridge stops to be
+    /// replaced, so that `enable` does not take that bridge for up.
+    pub(crate) fn reads_as_enabled(self) -> bool {
+        matches!(
+            self,
+            BridgePhase::Up { .. } | BridgePhase::Stopping { turned_off: true }
+        )
     }
 }
 
@@ -87,7 +103,7 @@ impl From<BridgePhase> for portman_protocol::BridgePhase {
             BridgePhase::WaitingForDocker => Self::WaitingForDocker,
             BridgePhase::Starting => Self::Starting,
             BridgePhase::Up { .. } => Self::Up,
-            BridgePhase::Stopping => Self::Stopping,
+            BridgePhase::Stopping { .. } => Self::Stopping,
         }
     }
 }
@@ -183,7 +199,9 @@ fn phase(intent: &NetbridgeState, session: Option<Session>, running: Option<Buil
         {
             BridgePhase::Up { epoch: built.epoch }
         }
-        (Some(_), _) => BridgePhase::Stopping,
+        (Some(_), _) => BridgePhase::Stopping {
+            turned_off: !intent.enabled,
+        },
         (None, _) if !intent.enabled => BridgePhase::Disabled,
         (None, None) => BridgePhase::WaitingForDocker,
         (None, Some(_)) => BridgePhase::Starting,
@@ -560,6 +578,8 @@ mod tests {
     fn phase_reports_what_the_daemon_can_rely_on() {
         let on_s1 = built(S1, OptIn);
         let up = BridgePhase::Up { epoch: 7 };
+        let turned_off = BridgePhase::Stopping { turned_off: true };
+        let replaced = BridgePhase::Stopping { turned_off: false };
         // (enabled, wanted mode, session, running) → phase
         let table = [
             (OFF, OptIn, S1, None, BridgePhase::Disabled),
@@ -568,13 +588,13 @@ mod tests {
             (ON, OptIn, S1, None, BridgePhase::Starting),
             (ON, OptIn, S1, on_s1, up),
             (ON, DockerMode, S2, built(S2, DockerMode), up),
-            (OFF, OptIn, S1, on_s1, BridgePhase::Stopping),
-            (OFF, DockerMode, S1, on_s1, BridgePhase::Stopping),
-            (ON, DockerMode, S1, on_s1, BridgePhase::Stopping),
-            (ON, OptIn, None, on_s1, BridgePhase::Stopping),
-            (ON, OptIn, S2, on_s1, BridgePhase::Stopping),
-            (OFF, OptIn, None, on_s1, BridgePhase::Stopping),
-            (OFF, OptIn, S2, on_s1, BridgePhase::Stopping),
+            (OFF, OptIn, S1, on_s1, turned_off),
+            (OFF, DockerMode, S1, on_s1, turned_off),
+            (ON, DockerMode, S1, on_s1, replaced),
+            (ON, OptIn, None, on_s1, replaced),
+            (ON, OptIn, S2, on_s1, replaced),
+            (OFF, OptIn, None, on_s1, turned_off),
+            (OFF, OptIn, S2, on_s1, turned_off),
         ];
         for (enabled, mode, session, running, want) in table {
             assert_eq!(
@@ -595,7 +615,10 @@ mod tests {
                         let kept = plan(&intent, session, running, true) == Step::Keep;
                         let phase = phase(&intent, session, running);
                         assert_eq!(
-                            (phase.epoch().is_some(), phase == BridgePhase::Stopping),
+                            (
+                                phase.epoch().is_some(),
+                                matches!(phase, BridgePhase::Stopping { .. })
+                            ),
                             (running.is_some() && kept, running.is_some() && !kept),
                             "enabled={enabled} mode={mode:?} session={session:?} running={running:?}"
                         );
@@ -945,7 +968,7 @@ mod tests {
         rig.send(Control::SetMode(DockerMode)).await;
 
         assert_eq!(rig.next_stop().await, Stop::KeepsNetwork);
-        assert_eq!(rig.phase(), BridgePhase::Stopping);
+        assert_eq!(rig.phase(), BridgePhase::Stopping { turned_off: false });
         assert_eq!(rig.mode().await, OptIn);
         assert_eq!(rig.ifindex(), None);
 
@@ -981,7 +1004,7 @@ mod tests {
         rig.send(Control::Disable).await;
 
         assert_eq!(rig.next_stop().await, Stop::RemovesNetwork);
-        assert_eq!(rig.phase(), BridgePhase::Stopping);
+        assert_eq!(rig.phase(), BridgePhase::Stopping { turned_off: true });
         assert_eq!(rig.ifindex(), None);
 
         rig.end_stops();

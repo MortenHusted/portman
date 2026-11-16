@@ -23,6 +23,12 @@ pub(crate) enum BridgePhase {
     Disabled,
 }
 
+impl BridgePhase {
+    pub(crate) fn reads_as_enabled(self) -> bool {
+        false
+    }
+}
+
 impl From<BridgePhase> for portman_protocol::BridgePhase {
     fn from(phase: BridgePhase) -> Self {
         match phase {

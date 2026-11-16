@@ -467,7 +467,7 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
     // Mode first, phase second: `netbridge::publish` writes them in the
     // opposite order, and the pair is consistent only when read this way.
     let bridge_mode = *state.netbridge.mode.read().await;
-    let bridge_phase = BridgePhase::from(*state.netbridge.phase.borrow());
+    let published_phase = *state.netbridge.phase.borrow();
     Response::Status {
         managed_broker: state.supervisor.managed_broker(),
         egress_grants_version: 1,
@@ -481,8 +481,8 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
         data_dir,
         cert_dir: certs,
         bridge_assessment,
-        bridge_enabled: matches!(bridge_phase, BridgePhase::Up | BridgePhase::Stopping),
-        bridge_phase,
+        bridge_enabled: published_phase.reads_as_enabled(),
+        bridge_phase: BridgePhase::from(published_phase),
         bridge_mode,
         dashboard_port: state.dashboard_port,
     }
@@ -1849,7 +1849,16 @@ pub(crate) mod tests {
             (Published::WaitingForDocker, Wire::WaitingForDocker, false),
             (Published::Starting, Wire::Starting, false),
             (Published::Up { epoch: 3 }, Wire::Up, true),
-            (Published::Stopping, Wire::Stopping, true),
+            (
+                Published::Stopping { turned_off: true },
+                Wire::Stopping,
+                true,
+            ),
+            (
+                Published::Stopping { turned_off: false },
+                Wire::Stopping,
+                false,
+            ),
         ];
         for (published, want_phase, want_enabled) in table {
             phase_tx.send_replace(published);

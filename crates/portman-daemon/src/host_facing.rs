@@ -269,6 +269,7 @@ mod tests {
     #[test]
     fn listeners_follow_the_bridge_epoch() {
         let up = |epoch| BridgePhase::Up { epoch };
+        let stopping = |turned_off| BridgePhase::Stopping { turned_off };
         // (epoch the listeners are bound for, phase) → decision
         let table = [
             (None, BridgePhase::Disabled, Rebind::Keep),
@@ -277,8 +278,9 @@ mod tests {
             (None, up(1), Rebind::Bind(1)),
             (Some(1), up(1), Rebind::Keep),
             (Some(1), up(2), Rebind::Bind(2)),
-            (None, BridgePhase::Stopping, Rebind::Keep),
-            (Some(1), BridgePhase::Stopping, Rebind::Drop),
+            (None, stopping(true), Rebind::Keep),
+            (Some(1), stopping(true), Rebind::Drop),
+            (Some(1), stopping(false), Rebind::Drop),
             (Some(1), BridgePhase::Starting, Rebind::Drop),
             (Some(1), BridgePhase::WaitingForDocker, Rebind::Drop),
             (Some(1), BridgePhase::Disabled, Rebind::Drop),
