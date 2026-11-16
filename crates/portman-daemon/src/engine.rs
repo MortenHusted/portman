@@ -873,38 +873,47 @@ pub(crate) mod tests {
                 }
                 pipe.write_all(b"0\r\n\r\n").await.unwrap();
             } else {
-                let mut words = request_line.split(' ');
-                let (method, url) = (words.next().unwrap(), words.next().unwrap());
-                let path = url.trim_start_matches(ENGINE_URL);
-                let path = path.split('?').next().unwrap();
                 asked(Asked::Other);
-                self.calls.lock().unwrap().push(format!("{method} {path}"));
-                let held = match method {
-                    "GET" => self.holds.lock().unwrap().get(path).cloned(),
-                    "DELETE" => {
-                        let mut holds = self.holds.lock().unwrap();
-                        let inspect_path = format!("{path}/json");
-                        holds.remove(path).or_else(|| holds.remove(&inspect_path))
-                    }
-                    _ => Some(String::new()),
-                };
-                match held {
-                    Some(json) if method == "GET" => respond(&mut pipe, "200 OK", &json).await,
-                    Some(_) => respond(&mut pipe, "204 No Content", "").await,
-                    None => {
-                        let missing = r#"{"message":"the engine holds no such thing"}"#;
-                        respond(&mut pipe, "404 Not Found", missing).await;
-                    }
+                self.serve_held(&mut pipe, request_line).await;
+            }
+        }
+
+        /// Answers an inspect with what the engine holds at the path, takes
+        /// a delete for the removal of that, and takes any other request as
+        /// done.
+        async fn serve_held(&self, pipe: &mut tokio::io::DuplexStream, request_line: &str) {
+            let mut words = request_line.split(' ');
+            let (method, url) = (words.next().unwrap(), words.next().unwrap());
+            let path = url.trim_start_matches(ENGINE_URL);
+            let path = path.split('?').next().unwrap();
+            self.calls.lock().unwrap().push(format!("{method} {path}"));
+            let held = match method {
+                "GET" => self.holds.lock().unwrap().get(path).cloned(),
+                "DELETE" => {
+                    let mut holds = self.holds.lock().unwrap();
+                    let inspect_path = format!("{path}/json");
+                    holds.remove(path).or_else(|| holds.remove(&inspect_path))
+                }
+                _ => Some(String::new()),
+            };
+            match held {
+                Some(json) if method == "GET" => respond(pipe, "200 OK", &json).await,
+                Some(_) => respond(pipe, "204 No Content", "").await,
+                None => {
+                    let missing = r#"{"message":"the engine holds no such thing"}"#;
+                    respond(pipe, "404 Not Found", missing).await;
                 }
             }
         }
 
         /// Makes the engine answer an inspect of `path` with `json`, until
         /// a request deletes what is there.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
         pub(crate) fn hold(&self, path: &str, json: &str) {
             self.holds.lock().unwrap().insert(path.into(), json.into());
         }
 
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
         pub(crate) fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }
