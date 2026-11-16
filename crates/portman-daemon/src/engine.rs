@@ -684,6 +684,8 @@ pub(crate) mod tests {
         Version,
         List,
         Events,
+        /// Any other request. [`FakeEngine::calls`] says which.
+        Other,
     }
 
     /// What is at the fake engine's socket path.
@@ -715,8 +717,7 @@ pub(crate) mod tests {
         /// The body of the inspect response for each path. The engine
         /// answers 404 for any other path.
         holds: Mutex<HashMap<String, String>>,
-        /// Each request that is not for the version, the list or the
-        /// events, as its method and path.
+        /// The method and path of each [`Asked::Other`].
         calls: Mutex<Vec<String>>,
         stream_ends: watch::Sender<u64>,
         probed: Mutex<Vec<u128>>,
@@ -876,6 +877,7 @@ pub(crate) mod tests {
                 let (method, url) = (words.next().unwrap(), words.next().unwrap());
                 let path = url.trim_start_matches(ENGINE_URL);
                 let path = path.split('?').next().unwrap();
+                asked(Asked::Other);
                 self.calls.lock().unwrap().push(format!("{method} {path}"));
                 let held = match method {
                     "GET" => self.holds.lock().unwrap().get(path).cloned(),

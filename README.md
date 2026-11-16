@@ -81,7 +81,7 @@ portman dashboard        # opens http://portman.localhost
 
 ### Linux (experimental)
 
-Requires systemd, and (recommended) systemd-resolved. Docker is needed only for container routes: the daemon starts without it and connects when a Docker socket appears. Container IPs are natively routable, so there is no bridge; DNS and proxy work the same way.
+Requires systemd and (recommended) systemd-resolved. Docker is needed only for container routes. The daemon starts without it and connects when a Docker socket appears. Container IPs are natively routable, so there is no bridge; DNS and proxy work the same way.
 
 ```bash
 portman install          # builds binaries and installs a systemd unit
