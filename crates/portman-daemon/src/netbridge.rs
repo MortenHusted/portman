@@ -20,6 +20,9 @@
 //!   - a bridge is built on one engine session. When that session is gone
 //!     the loop drops the bridge and asks the engine nothing, and it builds
 //!     a new bridge when a session exists again.
+//!   - while the bridge is off and none runs, the loop removes the setup
+//!     container and the docker network that an earlier bridge can have
+//!     left in the engine, once for each session and again after a start.
 //!   - a failed start is retried with a growing delay. The wait does not
 //!     hold up control messages, and a new session starts the delay over.
 //!   - [`publish`] tells the rest of the daemon what the bridge is doing:
@@ -172,19 +175,26 @@ enum Step {
     /// Stop the bridge and remove the docker network. The user asked for
     /// the bridge to be off.
     Teardown,
+    /// Remove the setup container and the docker network that an earlier
+    /// bridge can have left in the engine. No bridge runs and the user
+    /// wants none.
+    Sweep(Session),
 }
 
+/// `swept` is the session whose leftovers are removed, with no start since.
 fn plan(
     intent: &NetbridgeState,
     session: Option<Session>,
     running: Option<Built>,
     may_start: bool,
+    swept: Option<Session>,
 ) -> Step {
     match (running, session) {
         (Some(built), session) if session != Some(built.session) => Step::Abandon,
         (Some(_), _) if !intent.enabled => Step::Teardown,
         (Some(built), _) if built.mode != intent.mode => Step::Shutdown,
         (None, Some(session)) if intent.enabled && may_start => Step::Start(session),
+        (None, Some(session)) if !intent.enabled && swept != Some(session) => Step::Sweep(session),
         _ => Step::Keep,
     }
 }
@@ -335,6 +345,7 @@ async fn converge<E: BridgeEngine>(
     let mut running: Option<Running<E::Bridge>> = None;
     let mut attempts = Attempts::new();
     let mut epoch = 0;
+    let mut swept = None;
 
     loop {
         while let Ok(msg) = rx.try_recv() {
@@ -355,7 +366,8 @@ async fn converge<E: BridgeEngine>(
             running.as_ref(),
         )
         .await;
-        match plan(&intent, session, built, attempts.retry_after.is_none()) {
+        let may_start = attempts.retry_after.is_none();
+        match plan(&intent, session, built, may_start, swept) {
             Step::Keep => match next_wake(&mut rx, &mut engine, attempts.retry_after).await {
                 Wake::Control(msg) => take(msg, &mut wanted, &mut attempts, &state_path),
                 Wake::RetryDue => attempts.retry_after = None,
@@ -363,6 +375,7 @@ async fn converge<E: BridgeEngine>(
                 Wake::Closed => return Ok(()),
             },
             Step::Start(session) => {
+                swept = None;
                 let started = try_start(&engine, session, intent.mode, &mut attempts).await;
                 if let Some(bridge) = started {
                     epoch += 1;
@@ -386,6 +399,10 @@ async fn converge<E: BridgeEngine>(
                 if let Some(old) = running.take() {
                     old.bridge.shutdown_and_remove_network().await;
                 }
+            }
+            Step::Sweep(session) => {
+                engine.remove_leftovers(session).await;
+                swept = Some(session);
             }
         }
     }
@@ -477,6 +494,11 @@ pub(crate) trait BridgeEngine {
         mode: NetbridgeMode,
         host_kp: &Keypair,
     ) -> Result<Self::Bridge>;
+
+    /// Removes the setup container and the docker network that carry
+    /// portman's label from the engine of `session`. Does nothing when
+    /// that session is no longer the one that exists.
+    async fn remove_leftovers(&self, session: Session);
 }
 
 /// A bridge that is up. The control loop holds it only through this, so
@@ -509,6 +531,12 @@ impl BridgeEngine for watch::Receiver<Link> {
     ) -> Result<Runtime> {
         let docker = docker_of(self, session)?;
         Runtime::start_with_keypair(docker, RuntimeOptions { mode }, host_kp).await
+    }
+
+    async fn remove_leftovers(&self, session: Session) {
+        if let Ok(docker) = docker_of(self, session) {
+            portman_netbridge::runtime::remove_leftovers(&docker).await;
+        }
     }
 }
 
@@ -615,9 +643,34 @@ mod tests {
         ];
         for (enabled, mode, session, running, may_start, want) in table {
             assert_eq!(
-                plan(&intent(enabled, mode), session, running, may_start),
+                plan(&intent(enabled, mode), session, running, may_start, session),
                 want,
                 "enabled={enabled} mode={mode:?} session={session:?} running={running:?} may_start={may_start}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_sweeps_a_session_once_while_the_bridge_is_off_and_none_runs() {
+        let on_s1 = built(S1, OptIn);
+        let (may, wait) = (true, false);
+        // (enabled, session, running, may_start, swept) → step
+        let table = [
+            (OFF, S1, None, may, None, Step::Sweep(Session(1))),
+            (OFF, S1, None, wait, None, Step::Sweep(Session(1))),
+            (OFF, S2, None, may, S1, Step::Sweep(Session(2))),
+            (OFF, S1, None, may, S1, Step::Keep),
+            (OFF, None, None, may, None, Step::Keep),
+            (ON, S1, None, wait, None, Step::Keep),
+            (ON, S1, None, may, None, Step::Start(Session(1))),
+            (OFF, S1, on_s1, may, None, Step::Teardown),
+            (OFF, S2, on_s1, may, None, Step::Abandon),
+        ];
+        for (enabled, session, running, may_start, swept, want) in table {
+            assert_eq!(
+                plan(&intent(enabled, OptIn), session, running, may_start, swept),
+                want,
+                "enabled={enabled} session={session:?} running={running:?} may_start={may_start} swept={swept:?}"
             );
         }
     }
@@ -660,7 +713,7 @@ mod tests {
                 for session in [None, S1, S2] {
                     for running in [None, built(S1, OptIn), built(S2, DockerMode)] {
                         let intent = intent(enabled, mode);
-                        let kept = plan(&intent, session, running, true) == Step::Keep;
+                        let kept = plan(&intent, session, running, true, session) == Step::Keep;
                         let phase = phase(&intent, session, running);
                         assert_eq!(
                             (
@@ -772,6 +825,7 @@ mod tests {
         sessions: watch::Receiver<Option<Session>>,
         state_path: PathBuf,
         seen: mpsc::UnboundedSender<Attempt>,
+        swept: mpsc::UnboundedSender<Session>,
         /// `None` fails every start.
         probe: Option<Probe>,
     }
@@ -807,6 +861,10 @@ mod tests {
                 }
                 None => anyhow::bail!("the start failed"),
             }
+        }
+
+        async fn remove_leftovers(&self, session: Session) {
+            let _ = self.swept.send(session);
         }
     }
 
@@ -844,6 +902,7 @@ mod tests {
         bridges_held: Arc<AtomicUsize>,
         state_path: PathBuf,
         attempts: mpsc::UnboundedReceiver<Attempt>,
+        sweeps: mpsc::UnboundedReceiver<Session>,
         stops: mpsc::UnboundedReceiver<Stop>,
         stops_may_end: watch::Sender<bool>,
         phase_at_utun_ask: Arc<Mutex<Vec<BridgePhase>>>,
@@ -878,6 +937,7 @@ mod tests {
             let bridges_held = Arc::new(AtomicUsize::new(0));
             let state_path = dir.path().join("netbridge.json");
             let (seen, attempts) = mpsc::unbounded_channel();
+            let (swept, sweeps) = mpsc::unbounded_channel();
             let (stop_seen, stops) = mpsc::unbounded_channel();
             let (stops_may_end, may_end) = watch::channel(true);
             let phase_at_utun_ask = Arc::new(Mutex::new(Vec::new()));
@@ -886,6 +946,7 @@ mod tests {
                 sessions: session_seen,
                 state_path: state_path.clone(),
                 seen,
+                swept,
                 probe: engine_starts_bridges.then(|| Probe {
                     held: bridges_held.clone(),
                     phase: handle.phase.clone(),
@@ -908,6 +969,7 @@ mod tests {
                 bridges_held,
                 state_path,
                 attempts,
+                sweeps,
                 stops,
                 stops_may_end,
                 phase_at_utun_ask,
@@ -965,6 +1027,18 @@ mod tests {
                 .await
                 .expect("a start attempt")
                 .unwrap()
+        }
+
+        async fn next_sweep(&mut self) -> Session {
+            tokio::time::timeout(LONGEST_WAIT, self.sweeps.recv())
+                .await
+                .expect("a sweep")
+                .unwrap()
+        }
+
+        async fn no_sweep_follows(&mut self) {
+            let next = tokio::time::timeout(LONGEST_WAIT, self.sweeps.recv()).await;
+            assert!(next.is_err(), "a sweep that nothing called for");
         }
 
         async fn no_attempt_follows(&mut self) {
@@ -1172,10 +1246,12 @@ mod tests {
     fn bare_engine() -> (TestEngine, watch::Sender<Option<Session>>) {
         let (sessions, session_seen) = watch::channel(S1);
         let (seen, _) = mpsc::unbounded_channel();
+        let (swept, _) = mpsc::unbounded_channel();
         let engine = TestEngine {
             sessions: session_seen,
             state_path: PathBuf::new(),
             seen,
+            swept,
             probe: None,
         };
         (engine, sessions)
@@ -1285,6 +1361,60 @@ mod tests {
         rig.engine_session(None);
 
         rig.reaches(BridgePhase::WaitingForDocker).await;
+        rig.no_attempt_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_the_bridge_off_each_session_is_swept_once() {
+        let mut rig = Rig::spawn(S1, true, false);
+
+        assert_eq!(Some(rig.next_sweep().await), S1);
+        rig.no_sweep_follows().await;
+
+        rig.engine_session(None);
+        rig.no_sweep_follows().await;
+
+        rig.engine_session(S2);
+        assert_eq!(Some(rig.next_sweep().await), S2);
+        rig.no_sweep_follows().await;
+        assert_eq!(rig.phase(), BridgePhase::Disabled);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wanted_bridge_is_not_swept_while_its_start_fails() {
+        let mut rig = Rig::start();
+        rig.send(Control::Enable).await;
+        rig.next_attempt().await;
+        rig.next_attempt().await;
+
+        rig.no_sweep_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_after_a_failed_start_sweeps_the_session_again() {
+        let mut rig = Rig::start();
+        assert_eq!(Some(rig.next_sweep().await), S1);
+        rig.send(Control::Enable).await;
+        rig.next_attempt().await;
+
+        rig.send(Control::Disable).await;
+
+        assert_eq!(Some(rig.next_sweep().await), S1);
+        rig.no_sweep_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_during_a_mode_change_sweeps_the_network_that_the_stop_kept() {
+        let mut rig = Rig::up().await;
+        rig.hold_stops();
+        rig.send(Control::SetMode(DockerMode)).await;
+        assert_eq!(rig.next_stop().await, Stop::KeepsNetwork);
+
+        rig.send(Control::Disable).await;
+        rig.end_stops();
+
+        assert_eq!(Some(rig.next_sweep().await), S1);
+        assert_eq!(rig.phase(), BridgePhase::Disabled);
         rig.no_attempt_follows().await;
     }
 }
