@@ -14,9 +14,9 @@
 //!   - [`plan`] compares the intent and the engine session with the running
 //!     bridge and names the next step. The loop applies steps until none is
 //!     left, then waits for a control message or a retry timer. Before each
-//!     step it takes the messages that have arrived, so that it never
-//!     begins a start that the user has already cancelled. It does not
-//!     cancel a step in flight.
+//!     step it takes the messages that are in the channel. A message that
+//!     arrives later waits for the step to end: the loop does not cancel a
+//!     step in flight.
 //!   - a failed start is retried with a growing delay. The wait does not
 //!     hold up control messages.
 //!   - [`publish`] tells the rest of the daemon what the bridge is doing:
@@ -217,10 +217,8 @@ fn reported_mode(intent: &NetbridgeState, running: Option<Built>) -> NetbridgeMo
     running.map_or(intent.mode, |built| built.mode)
 }
 
-/// One start sequence: a first attempt and its retries. They share one host
-/// key because `Runtime::start_with_keypair` takes the key of the sequence.
-/// No failed attempt leaves a tunnel behind, so nothing breaks today if a
-/// retry has a new key.
+/// One start sequence: a first attempt and its retries. The doc of
+/// `Runtime::start_with_keypair` says why they share one host key.
 struct Attempts {
     host_kp: Keypair,
     failures: u32,

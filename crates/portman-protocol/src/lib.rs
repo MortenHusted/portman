@@ -141,8 +141,8 @@ pub enum BridgePhase {
 
 impl BridgePhase {
     /// The words that the CLI, the TUI and doctor print for the phase. The
-    /// type has no other way to text, so that no surface prints the wire
-    /// name by accident.
+    /// type has no `Display`, so that `{}` cannot print the wire name in
+    /// their place.
     pub fn display_word(self) -> &'static str {
         match self {
             BridgePhase::Disabled => "disabled",
@@ -509,11 +509,10 @@ pub enum Response {
         /// Default preserves backward compat with pre-Phase-A.3 daemons.
         #[serde(default)]
         bridge_assessment: BridgeAssessment,
-        /// Whether the v1 in-process netbridge runs (i.e. owns the
-        /// `portman` docker network + utun tunnel): it is up, or it still
-        /// stops because the user turned it off. False for a bridge the
-        /// user wants that is not up, one that stops to be replaced
-        /// included; `bridge_phase` tells those apart.
+        /// What a client that predates `bridge_phase` waits on. True while
+        /// the v1 in-process netbridge is up, and while it stops because
+        /// the user turned it off. False otherwise, also for a bridge that
+        /// still runs while a new one replaces it.
         /// Distinct from `bridge_assessment`, which describes health
         /// of whichever bridge is routing — including the wrapped
         /// chipmk bridge in v0.
