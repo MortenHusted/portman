@@ -998,7 +998,7 @@ pub(crate) mod tests {
                 .collect()
         }
 
-        fn lists(&self) -> Vec<u128> {
+        pub(crate) fn lists(&self) -> Vec<u128> {
             self.times(Asked::List)
         }
     }

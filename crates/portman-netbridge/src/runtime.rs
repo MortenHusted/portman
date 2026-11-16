@@ -73,12 +73,15 @@ const ROUTE_RECONCILE_PERIOD: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeOptions {
     pub mode: NetbridgeMode,
+    /// The UDP port that the bridge listens on and that the VM peer dials.
+    pub listen_port: u16,
 }
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
             mode: NetbridgeMode::OptIn,
+            listen_port: HOST_WG_LISTEN_PORT,
         }
     }
 }
@@ -144,25 +147,30 @@ impl Runtime {
         }
 
         // Ordering is load-bearing: everything that can realistically fail —
-        // docker network, route discovery, the setup container — happens before
-        // any host-level resource exists. A failure here used to unwind past an
-        // already-created utun and its installed routes, orphaning both; the
-        // routes then pinned the subnet to a dead interface and the reconciler
-        // treated them as fine, so the bridge stayed silently broken.
+        // the listen port, docker network, route discovery, the setup
+        // container — happens before the utun and its routes exist. A failure
+        // here used to unwind past an already-created utun and its installed
+        // routes, orphaning both; the routes then pinned the subnet to a dead
+        // interface and the reconciler treated them as fine, so the bridge
+        // stayed silently broken.
+
+        // ── UDP
+        //
+        // First, before the engine is asked anything. A cleanup removes the
+        // docker network only while it holds this port, so a start that holds
+        // it cannot lose the network it is about to rely on.
+        let listen_port = ListenPort::claim(options.listen_port)
+            .await
+            .with_context(|| format!("binding 0.0.0.0:{}", options.listen_port))?;
+        let udp = &listen_port.0;
 
         // ── Portman-owned docker network
         //
         // Preflight this before touching host routes or setup containers. A
         // network called "portman" is not enough ownership proof; another
         // user/tool may already own that name.
-        ensure_portman_network(&docker).await?;
+        ensure_portman_network(&docker, &listen_port).await?;
         let extra_route_cidrs = docker_route_cidrs(&docker, options.mode).await?;
-
-        // ── UDP
-        let listen_port = ListenPort::claim(HOST_WG_LISTEN_PORT)
-            .await
-            .with_context(|| format!("binding 0.0.0.0:{HOST_WG_LISTEN_PORT}"))?;
-        let udp = &listen_port.0;
 
         // ── VM-side peer + docker network
         //
@@ -177,7 +185,7 @@ impl Runtime {
         // blunt remove-then-create is both wrong and not robust.
         remove_existing_setup_container(&docker, &listen_port).await?;
         let (setup_container_id, vm_pubkey) =
-            spawn_setup_container(&docker, host_kp, &listen_port).await?;
+            spawn_setup_container(&docker, host_kp, options.listen_port, &listen_port).await?;
         info!(container = SETUP_CONTAINER, "VM setup container running");
 
         // ── utun + routes, last, and rolled back together on failure
@@ -523,9 +531,10 @@ fn spawn_route_reconciler(docker: Docker, mode: NetbridgeMode, iface: String) ->
 async fn spawn_setup_container(
     docker: &Docker,
     host: &Keypair,
+    listen_port: u16,
     held: &ListenPort,
 ) -> Result<(String, boringtun::x25519::PublicKey)> {
-    let env = setup_container_env(host);
+    let env = setup_container_env(host, listen_port);
     let body = ContainerCreateBody {
         image: Some(SETUP_IMAGE.to_string()),
         env: Some(env),
@@ -576,10 +585,10 @@ async fn spawn_setup_container(
     }
 }
 
-fn setup_container_env(host: &Keypair) -> Vec<String> {
+fn setup_container_env(host: &Keypair, listen_port: u16) -> Vec<String> {
     vec![
         format!("HOST_PUBKEY={}", host.public_base64()),
-        format!("HOST_ENDPOINT=host.docker.internal:{HOST_WG_LISTEN_PORT}"),
+        format!("HOST_ENDPOINT=host.docker.internal:{listen_port}"),
         format!("PEER_CIDR={VM_TUNNEL_IP}/25"),
         format!("ALLOWED_IPS={PORTMAN_SUBNET_CIDR}"),
     ]
@@ -625,7 +634,7 @@ fn parse_vm_public_key_from_logs(logs: &str) -> Result<boringtun::x25519::Public
 /// it. Idempotent across daemon restarts where user containers are
 /// still attached — removing a network with endpoints fails anyway,
 /// so reuse is the only correct path.
-async fn ensure_portman_network(docker: &Docker) -> Result<()> {
+async fn ensure_portman_network(docker: &Docker, _held: &ListenPort) -> Result<()> {
     match docker
         .inspect_network(PORTMAN_NETWORK, None::<InspectNetworkOptions>)
         .await
@@ -1464,7 +1473,7 @@ destination: 172.18.0.0
     #[test]
     fn setup_container_env_does_not_expose_vm_private_key() {
         let host = Keypair::generate();
-        let env = setup_container_env(&host);
+        let env = setup_container_env(&host, HOST_WG_LISTEN_PORT);
 
         assert!(env.iter().any(|value| value.starts_with("HOST_PUBKEY=")));
         assert!(env.iter().any(|value| value == "PEER_CIDR=192.168.99.2/25"));

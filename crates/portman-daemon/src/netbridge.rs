@@ -581,7 +581,11 @@ impl BridgeEngine for LinkedEngine {
         host_kp: &Keypair,
     ) -> Result<Runtime> {
         let docker = docker_of(&self.link, session)?;
-        Runtime::start_with_keypair(docker, RuntimeOptions { mode }, host_kp).await
+        let options = RuntimeOptions {
+            mode,
+            listen_port: self.listen_port,
+        };
+        Runtime::start_with_keypair(docker, options, host_kp).await
     }
 
     async fn runs_container(&self, session: Session, id: &str) -> bool {
@@ -1580,6 +1584,25 @@ mod tests {
             .await;
 
         assert_eq!(fake.calls(), [] as [&str; 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_start_asks_the_engine_nothing_until_it_holds_the_listen_port() {
+        let another_daemons_bridge = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let taken = another_daemons_bridge.local_addr().unwrap().port();
+        let (engine, fake) = engine_with_leftovers(taken);
+
+        let started = engine
+            .start_bridge(Session(1), NetbridgeMode::All, &Keypair::generate())
+            .await;
+
+        assert!(started.is_err(), "a bridge started on a port that is taken");
+        assert_eq!(fake.calls(), [] as [&str; 0]);
+        assert_eq!(
+            fake.lists(),
+            [],
+            "listed containers before it held the port"
+        );
     }
 
     #[tokio::test(start_paused = true)]
