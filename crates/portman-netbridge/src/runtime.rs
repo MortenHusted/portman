@@ -843,15 +843,25 @@ fn docker_removal_already_underway(err: &DockerError) -> bool {
     }
 }
 
-/// Removes what a bridge can leave in the engine: the setup container and
-/// the `portman` network. Each is removed only when it carries portman's
-/// labels, and one that is absent is passed over. The network stays while a
-/// container is attached to it, because the engine refuses that removal.
+/// What a bridge can leave in the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leftovers {
+    SetupContainer,
+    /// The engine removes a network that a stopped container refers to, and
+    /// that container then fails to start. Only a user's request to turn
+    /// the bridge off calls for this.
+    SetupContainerAndNetwork,
+}
+
+/// Removes `leftovers` from the engine. Each is removed only when it carries
+/// portman's labels, and one that is absent is passed over. The engine
+/// refuses to remove the network only while a running container is attached
+/// to it.
 ///
 /// The labels name portman and not one daemon, so the removal also needs
 /// UDP port `listen_port`, the one a bridge listens on. When that port is
 /// taken, nothing is removed and the engine is not asked.
-pub async fn remove_leftovers(docker: &Docker, listen_port: u16) {
+pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Leftovers) {
     let held = match ListenPort::claim(listen_port).await {
         Ok(held) => held,
         Err(err) => {
@@ -864,7 +874,9 @@ pub async fn remove_leftovers(docker: &Docker, listen_port: u16) {
         }
     };
     best_effort_remove_setup_container(docker, &held).await;
-    remove_portman_network_if_owned(docker, &held).await;
+    if leftovers == Leftovers::SetupContainerAndNetwork {
+        remove_portman_network_if_owned(docker, &held).await;
+    }
 }
 
 async fn remove_portman_network_if_owned(docker: &Docker, _held: &ListenPort) {

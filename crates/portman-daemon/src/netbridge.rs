@@ -21,8 +21,12 @@
 //!     the loop drops the bridge and asks the engine nothing, and it builds
 //!     a new bridge when a session exists again.
 //!   - while the bridge is off and none runs, the loop removes the setup
-//!     container and the docker network that an earlier bridge can have
-//!     left in the engine, once for each session and again after a start.
+//!     container that an earlier bridge can have left in the engine, once
+//!     for each session and again after a start. It removes the docker
+//!     network only when the user turns the bridge off, because a stopped
+//!     container of the user can still refer to it. Each removal needs the
+//!     UDP port that a bridge listens on, so that it cannot take what
+//!     another daemon's bridge runs on.
 //!   - a failed start is retried with a growing delay. The wait does not
 //!     hold up control messages, and a new session starts the delay over.
 //!   - [`publish`] tells the rest of the daemon what the bridge is doing:
@@ -36,7 +40,7 @@ use anyhow::Result;
 use bollard::Docker;
 use portman_core::netbridge_state::{self, NetbridgeState};
 use portman_core::NetbridgeMode;
-use portman_netbridge::runtime::{Runtime, RuntimeOptions};
+use portman_netbridge::runtime::{Leftovers, Runtime, RuntimeOptions};
 use portman_netbridge::tunnel::{Keypair, HOST_WG_LISTEN_PORT};
 use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{info, warn};
@@ -175,26 +179,27 @@ enum Step {
     /// Stop the bridge and remove the docker network. The user asked for
     /// the bridge to be off.
     Teardown,
-    /// Remove the setup container and the docker network that an earlier
-    /// bridge can have left in the engine. No bridge runs and the user
-    /// wants none.
-    Sweep(Session),
+    /// Remove what an earlier bridge can have left in the engine. No bridge
+    /// runs and the user wants none.
+    Sweep(Session, Leftovers),
 }
 
-/// `swept` is the session whose leftovers are removed, with no start since.
+/// `owed` is what the session's engine can still hold of an earlier bridge.
 fn plan(
     intent: &NetbridgeState,
     session: Option<Session>,
     running: Option<Built>,
     may_start: bool,
-    swept: Option<Session>,
+    owed: Option<Leftovers>,
 ) -> Step {
-    match (running, session) {
-        (Some(built), session) if session != Some(built.session) => Step::Abandon,
-        (Some(_), _) if !intent.enabled => Step::Teardown,
-        (Some(built), _) if built.mode != intent.mode => Step::Shutdown,
-        (None, Some(session)) if intent.enabled && may_start => Step::Start(session),
-        (None, Some(session)) if !intent.enabled && swept != Some(session) => Step::Sweep(session),
+    match (running, session, owed) {
+        (Some(built), session, _) if session != Some(built.session) => Step::Abandon,
+        (Some(_), _, _) if !intent.enabled => Step::Teardown,
+        (Some(built), _, _) if built.mode != intent.mode => Step::Shutdown,
+        (None, Some(session), _) if intent.enabled && may_start => Step::Start(session),
+        (None, Some(session), Some(leftovers)) if !intent.enabled => {
+            Step::Sweep(session, leftovers)
+        }
         _ => Step::Keep,
     }
 }
@@ -349,16 +354,18 @@ async fn converge<E: BridgeEngine>(
     let mut running: Option<Running<E::Bridge>> = None;
     let mut attempts = Attempts::new();
     let mut epoch = 0;
-    let mut swept = None;
+    let mut owed = None;
 
     loop {
         while let Ok(msg) = rx.try_recv() {
-            take(msg, &mut wanted, &mut attempts, &state_path);
+            take(msg, &mut wanted, &mut attempts, &mut owed, &state_path);
         }
-        // A start sequence serves one session, as it serves one intent.
+        // A start sequence serves one session, as it serves one intent. The
+        // network that a `Disable` owes is owed on the session it came in.
         if session != engine.session() {
             session = engine.session();
             attempts = Attempts::new();
+            owed = Some(Leftovers::SetupContainer);
         }
         let intent = wanted.intent();
         let built = running.as_ref().map(|r| r.built);
@@ -371,15 +378,17 @@ async fn converge<E: BridgeEngine>(
         )
         .await;
         let may_start = attempts.retry_after.is_none();
-        match plan(&intent, session, built, may_start, swept) {
+        match plan(&intent, session, built, may_start, owed) {
             Step::Keep => match next_wake(&mut rx, &mut engine, attempts.retry_after).await {
-                Wake::Control(msg) => take(msg, &mut wanted, &mut attempts, &state_path),
+                Wake::Control(msg) => {
+                    take(msg, &mut wanted, &mut attempts, &mut owed, &state_path);
+                }
                 Wake::RetryDue => attempts.retry_after = None,
                 Wake::SessionChanged => {}
                 Wake::Closed => return Ok(()),
             },
             Step::Start(session) => {
-                swept = None;
+                owed = Some(Leftovers::SetupContainer);
                 let started = try_start(&engine, session, intent.mode, &mut attempts).await;
                 if let Some(bridge) = started {
                     epoch += 1;
@@ -404,17 +413,27 @@ async fn converge<E: BridgeEngine>(
                     old.bridge.shutdown_and_remove_network().await;
                 }
             }
-            Step::Sweep(session) => {
-                engine.remove_leftovers(session).await;
-                swept = Some(session);
+            Step::Sweep(session, leftovers) => {
+                engine.remove_leftovers(session, leftovers).await;
+                owed = None;
             }
         }
     }
 }
 
 /// A message changes what the user wants, so it also ends the start
-/// sequence that served the old intent.
-fn take(msg: Control, wanted: &mut Wanted, attempts: &mut Attempts, state_path: &Path) {
+/// sequence that served the old intent. Only a `Disable` makes the loop
+/// remove the docker network.
+fn take(
+    msg: Control,
+    wanted: &mut Wanted,
+    attempts: &mut Attempts,
+    owed: &mut Option<Leftovers>,
+    state_path: &Path,
+) {
+    if matches!(msg, Control::Disable) {
+        *owed = Some(Leftovers::SetupContainerAndNetwork);
+    }
     wanted.apply(msg);
     persist(state_path, &wanted.saved);
     *attempts = Attempts::new();
@@ -499,10 +518,10 @@ pub(crate) trait BridgeEngine {
         host_kp: &Keypair,
     ) -> Result<Self::Bridge>;
 
-    /// Removes the setup container and the docker network that carry
-    /// portman's label from the engine of `session`. Does nothing when
-    /// that session is no longer the one that exists.
-    async fn remove_leftovers(&self, session: Session);
+    /// Removes `leftovers` that carry portman's label from the engine of
+    /// `session`. Does nothing when another session exists at the call, or
+    /// when another daemon holds the UDP port that a bridge listens on.
+    async fn remove_leftovers(&self, session: Session, leftovers: Leftovers);
 }
 
 /// A bridge that is up. The control loop holds it only through this, so
@@ -544,9 +563,10 @@ impl BridgeEngine for LinkedEngine {
         Runtime::start_with_keypair(docker, RuntimeOptions { mode }, host_kp).await
     }
 
-    async fn remove_leftovers(&self, session: Session) {
+    async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) {
         if let Ok(docker) = docker_of(&self.link, session) {
-            portman_netbridge::runtime::remove_leftovers(&docker, self.listen_port).await;
+            portman_netbridge::runtime::remove_leftovers(&docker, self.listen_port, leftovers)
+                .await;
         }
     }
 }
@@ -609,6 +629,7 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::{tempdir, TempDir};
     use tokio::time::Instant;
+    use Leftovers::{SetupContainer, SetupContainerAndNetwork};
     use NetbridgeMode::{Docker as DockerMode, OptIn};
 
     const S1: Option<Session> = Some(Session(1));
@@ -654,7 +675,7 @@ mod tests {
         ];
         for (enabled, mode, session, running, may_start, want) in table {
             assert_eq!(
-                plan(&intent(enabled, mode), session, running, may_start, session),
+                plan(&intent(enabled, mode), session, running, may_start, None),
                 want,
                 "enabled={enabled} mode={mode:?} session={session:?} running={running:?} may_start={may_start}"
             );
@@ -662,26 +683,49 @@ mod tests {
     }
 
     #[test]
-    fn plan_sweeps_a_session_once_while_the_bridge_is_off_and_none_runs() {
+    fn plan_sweeps_what_is_owed_while_the_bridge_is_off_and_none_runs() {
         let on_s1 = built(S1, OptIn);
         let (may, wait) = (true, false);
-        // (enabled, session, running, may_start, swept) → step
+        let (container, network) = (Some(SetupContainer), Some(SetupContainerAndNetwork));
+        let sweep = Step::Sweep;
+        // (enabled, session, running, may_start, owed) → step
         let table = [
-            (OFF, S1, None, may, None, Step::Sweep(Session(1))),
-            (OFF, S1, None, wait, None, Step::Sweep(Session(1))),
-            (OFF, S2, None, may, S1, Step::Sweep(Session(2))),
-            (OFF, S1, None, may, S1, Step::Keep),
-            (OFF, None, None, may, None, Step::Keep),
-            (ON, S1, None, wait, None, Step::Keep),
-            (ON, S1, None, may, None, Step::Start(Session(1))),
-            (OFF, S1, on_s1, may, None, Step::Teardown),
-            (OFF, S2, on_s1, may, None, Step::Abandon),
+            (
+                OFF,
+                S1,
+                None,
+                may,
+                container,
+                sweep(Session(1), SetupContainer),
+            ),
+            (
+                OFF,
+                S1,
+                None,
+                wait,
+                container,
+                sweep(Session(1), SetupContainer),
+            ),
+            (
+                OFF,
+                S2,
+                None,
+                may,
+                network,
+                sweep(Session(2), SetupContainerAndNetwork),
+            ),
+            (OFF, S1, None, may, None, Step::Keep),
+            (OFF, None, None, may, network, Step::Keep),
+            (ON, S1, None, wait, network, Step::Keep),
+            (ON, S1, None, may, network, Step::Start(Session(1))),
+            (OFF, S1, on_s1, may, network, Step::Teardown),
+            (OFF, S2, on_s1, may, network, Step::Abandon),
         ];
-        for (enabled, session, running, may_start, swept, want) in table {
+        for (enabled, session, running, may_start, owed, want) in table {
             assert_eq!(
-                plan(&intent(enabled, OptIn), session, running, may_start, swept),
+                plan(&intent(enabled, OptIn), session, running, may_start, owed),
                 want,
-                "enabled={enabled} session={session:?} running={running:?} may_start={may_start} swept={swept:?}"
+                "enabled={enabled} session={session:?} running={running:?} may_start={may_start} owed={owed:?}"
             );
         }
     }
@@ -724,7 +768,7 @@ mod tests {
                 for session in [None, S1, S2] {
                     for running in [None, built(S1, OptIn), built(S2, DockerMode)] {
                         let intent = intent(enabled, mode);
-                        let kept = plan(&intent, session, running, true, session) == Step::Keep;
+                        let kept = plan(&intent, session, running, true, None) == Step::Keep;
                         let phase = phase(&intent, session, running);
                         assert_eq!(
                             (
@@ -836,7 +880,7 @@ mod tests {
         sessions: watch::Receiver<Option<Session>>,
         state_path: PathBuf,
         seen: mpsc::UnboundedSender<Attempt>,
-        swept: mpsc::UnboundedSender<Session>,
+        swept: mpsc::UnboundedSender<(Session, Leftovers)>,
         /// `None` fails every start.
         probe: Option<Probe>,
     }
@@ -874,8 +918,8 @@ mod tests {
             }
         }
 
-        async fn remove_leftovers(&self, session: Session) {
-            let _ = self.swept.send(session);
+        async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) {
+            let _ = self.swept.send((session, leftovers));
         }
     }
 
@@ -913,7 +957,7 @@ mod tests {
         bridges_held: Arc<AtomicUsize>,
         state_path: PathBuf,
         attempts: mpsc::UnboundedReceiver<Attempt>,
-        sweeps: mpsc::UnboundedReceiver<Session>,
+        sweeps: mpsc::UnboundedReceiver<(Session, Leftovers)>,
         stops: mpsc::UnboundedReceiver<Stop>,
         stops_may_end: watch::Sender<bool>,
         phase_at_utun_ask: Arc<Mutex<Vec<BridgePhase>>>,
@@ -1040,7 +1084,7 @@ mod tests {
                 .unwrap()
         }
 
-        async fn next_sweep(&mut self) -> Session {
+        async fn next_sweep(&mut self) -> (Session, Leftovers) {
             tokio::time::timeout(LONGEST_WAIT, self.sweeps.recv())
                 .await
                 .expect("a sweep")
@@ -1406,46 +1450,80 @@ mod tests {
     async fn nothing_is_removed_from_the_engine_while_another_daemon_holds_the_listen_port() {
         let (engine, fake, _another_daemons_bridge) = engine_with_leftovers();
 
-        engine.remove_leftovers(Session(1)).await;
+        engine
+            .remove_leftovers(Session(1), SetupContainerAndNetwork)
+            .await;
 
         assert_eq!(fake.calls(), [] as [&str; 0]);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_leftovers_are_removed_while_the_listen_port_is_free() {
-        let (engine, fake, port_holder) = engine_with_leftovers();
-        drop(port_holder);
+    async fn with_the_listen_port_free_the_network_goes_only_when_it_is_asked_for() {
+        let container = "/containers/portman-netbridge-setup";
+        let cases = [
+            (SetupContainer, vec![container]),
+            (SetupContainerAndNetwork, vec![container, NETWORK]),
+        ];
+        for (leftovers, gone) in cases {
+            let (engine, fake, port_holder) = engine_with_leftovers();
+            drop(port_holder);
 
-        engine.remove_leftovers(Session(1)).await;
+            engine.remove_leftovers(Session(1), leftovers).await;
 
-        let removed: Vec<_> = fake
-            .calls()
-            .into_iter()
-            .filter(|call| call.starts_with("DELETE"))
-            .collect();
-        assert_eq!(
-            removed,
-            [
-                "DELETE /containers/portman-netbridge-setup",
-                "DELETE /networks/portman"
-            ]
-        );
+            let calls = fake.calls();
+            let removed: Vec<_> = calls
+                .iter()
+                .filter_map(|call| call.strip_prefix("DELETE "))
+                .collect();
+            assert_eq!(removed, gone, "{leftovers:?}");
+            assert_eq!(
+                calls.iter().any(|call| call.ends_with(NETWORK)),
+                leftovers == SetupContainerAndNetwork,
+                "{calls:?}"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn with_the_bridge_off_each_session_is_swept_once() {
+    async fn with_the_bridge_off_a_boot_and_a_new_session_remove_the_setup_container_only() {
         let mut rig = Rig::spawn(S1, true, false);
 
-        assert_eq!(Some(rig.next_sweep().await), S1);
+        assert_eq!(rig.next_sweep().await, (Session(1), SetupContainer));
         rig.no_sweep_follows().await;
 
         rig.engine_session(None);
         rig.no_sweep_follows().await;
 
         rig.engine_session(S2);
-        assert_eq!(Some(rig.next_sweep().await), S2);
+        assert_eq!(rig.next_sweep().await, (Session(2), SetupContainer));
         rig.no_sweep_follows().await;
         assert_eq!(rig.phase(), BridgePhase::Disabled);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_with_no_bridge_running_removes_the_network() {
+        let mut rig = Rig::start();
+        assert_eq!(rig.next_sweep().await, (Session(1), SetupContainer));
+
+        rig.send(Control::Disable).await;
+
+        assert_eq!(
+            rig.next_sweep().await,
+            (Session(1), SetupContainerAndNetwork)
+        );
+        rig.no_sweep_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_that_opens_after_a_disable_keeps_the_network() {
+        let mut rig = Rig::spawn(None, false, false);
+        rig.send(Control::Disable).await;
+        rig.no_sweep_follows().await;
+
+        rig.engine_session(S1);
+
+        assert_eq!(rig.next_sweep().await, (Session(1), SetupContainer));
+        rig.no_sweep_follows().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -1461,13 +1539,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_disable_after_a_failed_start_sweeps_the_session_again() {
         let mut rig = Rig::start();
-        assert_eq!(Some(rig.next_sweep().await), S1);
+        assert_eq!(rig.next_sweep().await, (Session(1), SetupContainer));
         rig.send(Control::Enable).await;
         rig.next_attempt().await;
 
         rig.send(Control::Disable).await;
 
-        assert_eq!(Some(rig.next_sweep().await), S1);
+        assert_eq!(
+            rig.next_sweep().await,
+            (Session(1), SetupContainerAndNetwork)
+        );
         rig.no_sweep_follows().await;
     }
 
@@ -1481,7 +1562,10 @@ mod tests {
         rig.send(Control::Disable).await;
         rig.end_stops();
 
-        assert_eq!(Some(rig.next_sweep().await), S1);
+        assert_eq!(
+            rig.next_sweep().await,
+            (Session(1), SetupContainerAndNetwork)
+        );
         assert_eq!(rig.phase(), BridgePhase::Disabled);
         rig.no_attempt_follows().await;
     }
