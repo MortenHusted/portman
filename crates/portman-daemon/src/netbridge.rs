@@ -350,11 +350,9 @@ async fn converge(
     }
 }
 
-/// What ends a wait of the control loop.
 enum Wake {
     Control(Control),
     RetryDue,
-    /// Every `Control` sender is gone.
     Closed,
 }
 
@@ -406,8 +404,8 @@ fn publish_ifindex(slot: &crate::upstream::BridgeIfIndex, runtime: Option<&Runti
     *slot.write().expect("bridge ifindex lock poisoned") = resolved;
 }
 
-/// Builds a bridge. The control loop starts one only through this, so that
-/// a test can run the loop with no container engine.
+/// The control loop starts a bridge only through this, so that a test can
+/// run the loop with no container engine.
 pub(crate) trait BridgeStarter {
     async fn start_bridge(&self, mode: NetbridgeMode, host_kp: &Keypair) -> Result<Runtime>;
 }
@@ -418,7 +416,6 @@ impl BridgeStarter for Docker {
     }
 }
 
-/// One start attempt, recorded on `attempts`.
 async fn try_start(
     engine: &impl BridgeStarter,
     mode: NetbridgeMode,
@@ -601,7 +598,6 @@ mod tests {
         assert_eq!(attempts.retry_after, Some(RETRY_BASE));
     }
 
-    /// One start attempt, as the engine saw it.
     struct Attempt {
         at: Instant,
         host_key: String,
@@ -609,8 +605,8 @@ mod tests {
         saved: NetbridgeState,
     }
 
-    /// An engine on which no start succeeds. It does no I/O, so the paused
-    /// clock moves only when the control loop waits.
+    /// Fails every start with no I/O, so that the paused clock moves only
+    /// when the control loop waits.
     struct NoEngine {
         state_path: PathBuf,
         seen: mpsc::UnboundedSender<Attempt>,
