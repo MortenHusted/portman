@@ -13,12 +13,15 @@
 //!     while the engine is unreachable is still an enable after a restart.
 //!   - [`plan`] compares the intent and the engine session with the running
 //!     bridge and names the next step. The loop applies steps until none is
-//!     left, then waits for a control message or a retry timer. Before each
-//!     step it takes the messages that are in the channel. A message that
-//!     arrives later waits for the step to end: the loop does not cancel a
-//!     step in flight.
+//!     left, then waits for a control message, a change of engine session,
+//!     or a retry timer. Before each step it takes the messages that are in
+//!     the channel. A message that arrives later waits for the step to end:
+//!     the loop does not cancel a step in flight.
+//!   - a bridge is built on one engine session. When that session is gone
+//!     the loop drops the bridge and asks the engine nothing, and it builds
+//!     a new bridge when a session exists again.
 //!   - a failed start is retried with a growing delay. The wait does not
-//!     hold up control messages.
+//!     hold up control messages, and a new session starts the delay over.
 //!   - [`publish`] tells the rest of the daemon what the bridge is doing:
 //!     the [`phase`], the mode, and the interface index of the utun.
 
@@ -27,12 +30,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use bollard::Docker;
 use portman_core::netbridge_state::{self, NetbridgeState};
 use portman_core::NetbridgeMode;
 use portman_netbridge::runtime::{Runtime, RuntimeOptions};
 use portman_netbridge::tunnel::Keypair;
 use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{info, warn};
+
+use crate::engine::{Engine, Link, Session};
 
 /// Env var override. Useful for the first-run path where the user's
 /// `netbridge.json` doesn't exist yet and they want to flip the bridge
@@ -138,13 +144,9 @@ pub(crate) fn handle_pair() -> (Handle, mpsc::Receiver<Control>, watch::Sender<B
     )
 }
 
-/// One connection to the container engine. A bridge is built on a session
-/// and is stale once that session is gone, because the VM behind a new
-/// session may not hold the peer the old bridge talks to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Session(u64);
-
-/// What a running bridge was built from.
+/// What a running bridge was built from. It is stale once its session is
+/// gone, because the VM behind a new session may not hold the peer the
+/// bridge talks to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Built {
     session: Session,
@@ -300,18 +302,18 @@ impl Wanted {
 /// channel closes, and `handle` holds a sender, so it runs for as long as
 /// the daemon polls it.
 pub(crate) async fn run(
-    engine: impl BridgeStarter,
+    engine: Engine,
     handle: Handle,
     rx: mpsc::Receiver<Control>,
     phase_tx: watch::Sender<BridgePhase>,
     state_path: PathBuf,
 ) -> Result<()> {
     let forced_on = env_forces_enabled();
-    converge(engine, handle, rx, phase_tx, state_path, forced_on).await
+    converge(engine.watch(), handle, rx, phase_tx, state_path, forced_on).await
 }
 
-async fn converge<E: BridgeStarter>(
-    engine: E,
+async fn converge<E: BridgeEngine>(
+    mut engine: E,
     handle: Handle,
     mut rx: mpsc::Receiver<Control>,
     phase_tx: watch::Sender<BridgePhase>,
@@ -329,8 +331,7 @@ async fn converge<E: BridgeStarter>(
         "netbridge subsystem starting"
     );
 
-    // The boot-time Docker handle is the only engine session there is.
-    let session = Some(Session(0));
+    let mut session = None;
     let mut running: Option<Running<E::Bridge>> = None;
     let mut attempts = Attempts::new();
     let mut epoch = 0;
@@ -338,6 +339,11 @@ async fn converge<E: BridgeStarter>(
     loop {
         while let Ok(msg) = rx.try_recv() {
             take(msg, &mut wanted, &mut attempts, &state_path);
+        }
+        // A start sequence serves one session, as it serves one intent.
+        if session != engine.session() {
+            session = engine.session();
+            attempts = Attempts::new();
         }
         let intent = wanted.intent();
         let built = running.as_ref().map(|r| r.built);
@@ -350,13 +356,15 @@ async fn converge<E: BridgeStarter>(
         )
         .await;
         match plan(&intent, session, built, attempts.retry_after.is_none()) {
-            Step::Keep => match next_wake(&mut rx, attempts.retry_after).await {
+            Step::Keep => match next_wake(&mut rx, &mut engine, attempts.retry_after).await {
                 Wake::Control(msg) => take(msg, &mut wanted, &mut attempts, &state_path),
                 Wake::RetryDue => attempts.retry_after = None,
+                Wake::SessionChanged => {}
                 Wake::Closed => return Ok(()),
             },
             Step::Start(session) => {
-                if let Some(bridge) = try_start(&engine, intent.mode, &mut attempts).await {
+                let started = try_start(&engine, session, intent.mode, &mut attempts).await;
+                if let Some(bridge) = started {
                     epoch += 1;
                     running = Some(Running {
                         bridge,
@@ -393,16 +401,22 @@ fn take(msg: Control, wanted: &mut Wanted, attempts: &mut Attempts, state_path: 
 
 enum Wake {
     Control(Control),
+    SessionChanged,
     RetryDue,
     Closed,
 }
 
 /// A message that is ready goes before a retry that is due, so that no
 /// start runs ahead of a `Disable` that is already in the channel.
-async fn next_wake(rx: &mut mpsc::Receiver<Control>, retry_after: Option<Duration>) -> Wake {
+async fn next_wake(
+    rx: &mut mpsc::Receiver<Control>,
+    engine: &mut impl BridgeEngine,
+    retry_after: Option<Duration>,
+) -> Wake {
     tokio::select! {
         biased;
         msg = rx.recv() => msg.map_or(Wake::Closed, Wake::Control),
+        () = engine.session_changed() => Wake::SessionChanged,
         () = tokio::time::sleep(retry_after.unwrap_or_default()), if retry_after.is_some() => {
             Wake::RetryDue
         }
@@ -445,12 +459,24 @@ fn publish_ifindex(slot: &crate::upstream::BridgeIfIndex, bridge: Option<&impl B
     *slot.write().expect("bridge ifindex lock poisoned") = resolved;
 }
 
-/// The control loop starts a bridge only through this, so that a test can
-/// run the loop with no container engine.
-pub(crate) trait BridgeStarter {
+/// The container engine as the control loop uses it, so that a test can
+/// run the loop with no engine.
+pub(crate) trait BridgeEngine {
     type Bridge: Bridge;
 
-    async fn start_bridge(&self, mode: NetbridgeMode, host_kp: &Keypair) -> Result<Self::Bridge>;
+    fn session(&self) -> Option<Session>;
+
+    /// Returns when the session may differ from the one last returned. A
+    /// caller that drops the wait loses no change.
+    async fn session_changed(&mut self);
+
+    /// Fails when `session` is no longer the one that exists.
+    async fn start_bridge(
+        &self,
+        session: Session,
+        mode: NetbridgeMode,
+        host_kp: &Keypair,
+    ) -> Result<Self::Bridge>;
 }
 
 /// A bridge that is up. The control loop holds it only through this, so
@@ -462,11 +488,34 @@ pub(crate) trait Bridge {
     async fn shutdown_and_remove_network(self);
 }
 
-impl BridgeStarter for crate::engine::Engine {
+impl BridgeEngine for watch::Receiver<Link> {
     type Bridge = Runtime;
 
-    async fn start_bridge(&self, mode: NetbridgeMode, host_kp: &Keypair) -> Result<Runtime> {
-        Runtime::start_with_keypair(self.docker()?, RuntimeOptions { mode }, host_kp).await
+    fn session(&self) -> Option<Session> {
+        self.borrow().session()
+    }
+
+    async fn session_changed(&mut self) {
+        if self.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    async fn start_bridge(
+        &self,
+        session: Session,
+        mode: NetbridgeMode,
+        host_kp: &Keypair,
+    ) -> Result<Runtime> {
+        let docker = docker_of(self, session)?;
+        Runtime::start_with_keypair(docker, RuntimeOptions { mode }, host_kp).await
+    }
+}
+
+fn docker_of(link: &watch::Receiver<Link>, wanted: Session) -> Result<Docker> {
+    match &*link.borrow() {
+        Link::Connected { session, docker } if *session == wanted => Ok(docker.clone()),
+        _ => anyhow::bail!("the engine session that the bridge was planned on has ended"),
     }
 }
 
@@ -484,12 +533,13 @@ impl Bridge for Runtime {
     }
 }
 
-async fn try_start<E: BridgeStarter>(
+async fn try_start<E: BridgeEngine>(
     engine: &E,
+    session: Session,
     mode: NetbridgeMode,
     attempts: &mut Attempts,
 ) -> Option<E::Bridge> {
-    let started = engine.start_bridge(mode, &attempts.host_kp).await;
+    let started = engine.start_bridge(session, mode, &attempts.host_kp).await;
     let bridge = attempts.settle(started)?;
     info!(
         mode = mode.as_str(),
@@ -516,6 +566,7 @@ fn forces_enabled(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tempfile::{tempdir, TempDir};
     use tokio::time::Instant;
@@ -683,6 +734,7 @@ mod tests {
 
     struct Attempt {
         at: Instant,
+        session: Session,
         mode: NetbridgeMode,
         host_key: String,
         /// What `netbridge.json` held while the attempt was in flight.
@@ -699,6 +751,7 @@ mod tests {
     /// their stops.
     #[derive(Clone)]
     struct Probe {
+        held: Arc<AtomicUsize>,
         phase: watch::Receiver<BridgePhase>,
         phase_at_utun_ask: Arc<Mutex<Vec<BridgePhase>>>,
         stops: mpsc::UnboundedSender<Stop>,
@@ -712,33 +765,58 @@ mod tests {
         }
     }
 
-    /// Awaits nothing but a stop that a test holds open, so that the paused
-    /// clock moves only when the control loop waits.
+    /// Awaits nothing but a session change and a stop that a test holds
+    /// open, so that the paused clock moves only when the control loop
+    /// waits.
     struct TestEngine {
+        sessions: watch::Receiver<Option<Session>>,
         state_path: PathBuf,
         seen: mpsc::UnboundedSender<Attempt>,
-        /// `None` fails every start, as an engine that is not there does.
+        /// `None` fails every start.
         probe: Option<Probe>,
     }
 
-    impl BridgeStarter for TestEngine {
+    impl BridgeEngine for TestEngine {
         type Bridge = TestBridge;
 
-        async fn start_bridge(&self, mode: NetbridgeMode, host_kp: &Keypair) -> Result<TestBridge> {
+        fn session(&self) -> Option<Session> {
+            *self.sessions.borrow()
+        }
+
+        async fn session_changed(&mut self) {
+            self.sessions.changed().await.unwrap();
+        }
+
+        async fn start_bridge(
+            &self,
+            session: Session,
+            mode: NetbridgeMode,
+            host_kp: &Keypair,
+        ) -> Result<TestBridge> {
             let _ = self.seen.send(Attempt {
                 at: Instant::now(),
+                session,
                 mode,
                 host_key: host_kp.public_base64(),
                 saved: netbridge_state::load(&self.state_path),
             });
             match &self.probe {
-                Some(probe) => Ok(TestBridge(probe.clone())),
-                None => anyhow::bail!("no container engine"),
+                Some(probe) => {
+                    probe.held.fetch_add(1, Ordering::SeqCst);
+                    Ok(TestBridge(probe.clone()))
+                }
+                None => anyhow::bail!("the start failed"),
             }
         }
     }
 
     struct TestBridge(Probe);
+
+    impl Drop for TestBridge {
+        fn drop(&mut self) {
+            self.0.held.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 
     /// The loopback interface stands in for the utun: its name resolves to
     /// an index on every Mac.
@@ -752,16 +830,18 @@ mod tests {
         }
 
         async fn shutdown(self) {
-            self.0.stop(Stop::KeepsNetwork).await;
+            self.0.clone().stop(Stop::KeepsNetwork).await;
         }
 
         async fn shutdown_and_remove_network(self) {
-            self.0.stop(Stop::RemovesNetwork).await;
+            self.0.clone().stop(Stop::RemovesNetwork).await;
         }
     }
 
     struct Rig {
         handle: Handle,
+        sessions: watch::Sender<Option<Session>>,
+        bridges_held: Arc<AtomicUsize>,
         state_path: PathBuf,
         attempts: mpsc::UnboundedReceiver<Attempt>,
         stops: mpsc::UnboundedReceiver<Stop>,
@@ -773,25 +853,29 @@ mod tests {
     const LONGEST_WAIT: Duration = Duration::from_secs(3600);
 
     impl Rig {
+        /// A rig whose engine is in its first session and fails every
+        /// start.
         fn start() -> Self {
-            Self::spawn(false, false)
+            Self::spawn(S1, false, false)
         }
 
         fn start_with_env_override(forced_on: bool) -> Self {
-            Self::spawn(false, forced_on)
+            Self::spawn(S1, false, forced_on)
         }
 
         /// A rig whose engine starts every bridge, with the first one up.
         async fn up() -> Self {
-            let mut rig = Self::spawn(true, false);
+            let mut rig = Self::spawn(S1, true, false);
             rig.send(Control::Enable).await;
             rig.reaches(BridgePhase::Up { epoch: 1 }).await;
             assert_eq!(rig.next_attempt().await.mode, OptIn);
             rig
         }
 
-        fn spawn(engine_starts_bridges: bool, forced_on: bool) -> Self {
+        fn spawn(session: Option<Session>, engine_starts_bridges: bool, forced_on: bool) -> Self {
             let dir = tempdir().unwrap();
+            let (sessions, session_seen) = watch::channel(session);
+            let bridges_held = Arc::new(AtomicUsize::new(0));
             let state_path = dir.path().join("netbridge.json");
             let (seen, attempts) = mpsc::unbounded_channel();
             let (stop_seen, stops) = mpsc::unbounded_channel();
@@ -799,9 +883,11 @@ mod tests {
             let phase_at_utun_ask = Arc::new(Mutex::new(Vec::new()));
             let (handle, rx, phase_tx) = handle_pair();
             let engine = TestEngine {
+                sessions: session_seen,
                 state_path: state_path.clone(),
                 seen,
                 probe: engine_starts_bridges.then(|| Probe {
+                    held: bridges_held.clone(),
                     phase: handle.phase.clone(),
                     phase_at_utun_ask: phase_at_utun_ask.clone(),
                     stops: stop_seen,
@@ -818,6 +904,8 @@ mod tests {
             ));
             Rig {
                 handle,
+                sessions,
+                bridges_held,
                 state_path,
                 attempts,
                 stops,
@@ -846,6 +934,18 @@ mod tests {
 
         fn phase(&self) -> BridgePhase {
             *self.handle.phase.borrow()
+        }
+
+        fn engine_session(&self, session: Option<Session>) {
+            self.sessions.send_replace(session);
+        }
+
+        fn bridges_held(&self) -> usize {
+            self.bridges_held.load(Ordering::SeqCst)
+        }
+
+        fn no_stop_began(&mut self) -> bool {
+            self.stops.try_recv().is_err()
         }
 
         async fn mode(&self) -> NetbridgeMode {
@@ -1068,24 +1168,123 @@ mod tests {
         rig.no_attempt_follows().await;
     }
 
+    /// An engine with no probe, and the sender that changes its session.
+    fn bare_engine() -> (TestEngine, watch::Sender<Option<Session>>) {
+        let (sessions, session_seen) = watch::channel(S1);
+        let (seen, _) = mpsc::unbounded_channel();
+        let engine = TestEngine {
+            sessions: session_seen,
+            state_path: PathBuf::new(),
+            seen,
+            probe: None,
+        };
+        (engine, sessions)
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn a_control_message_goes_before_a_retry_that_is_due() {
-        // An unbiased wait picks one of two ready branches at random, so
-        // one round would pass half the time.
+    async fn a_control_message_goes_before_a_session_change_and_a_retry_that_are_due() {
+        // An unbiased wait picks one of the ready branches at random, so
+        // one round would pass a third of the time.
+        let (mut engine, sessions) = bare_engine();
         for _ in 0..64 {
             let (tx, mut rx) = mpsc::channel(1);
             tx.send(Control::Disable).await.unwrap();
-            let wake = next_wake(&mut rx, Some(Duration::ZERO)).await;
+            sessions.send_replace(S2);
+            let wake = next_wake(&mut rx, &mut engine, Some(Duration::ZERO)).await;
             assert!(matches!(wake, Wake::Control(Control::Disable)));
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_retry_that_is_due_ends_the_wait_when_no_message_is_ready() {
+    async fn a_retry_that_is_due_ends_the_wait_when_nothing_else_is_ready() {
         let (_tx, mut rx) = mpsc::channel(1);
-        let wake = tokio::time::timeout(LONGEST_WAIT, next_wake(&mut rx, Some(Duration::ZERO)))
+        let (mut engine, _sessions) = bare_engine();
+        let wait = next_wake(&mut rx, &mut engine, Some(Duration::ZERO));
+        let wake = tokio::time::timeout(LONGEST_WAIT, wait)
             .await
             .expect("the retry timer ends the wait");
         assert!(matches!(wake, Wake::RetryDue));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_session_drops_the_bridge_without_a_stop_and_waits_for_docker() {
+        let mut rig = Rig::up().await;
+        assert_eq!(rig.bridges_held(), 1);
+
+        rig.engine_session(None);
+        rig.reaches(BridgePhase::WaitingForDocker).await;
+
+        assert_eq!(rig.bridges_held(), 0);
+        assert!(rig.no_stop_began(), "a stop asks an engine that is gone");
+        assert_eq!(rig.ifindex(), None);
+        assert!(netbridge_state::load(&rig.state_path).enabled);
+        rig.no_attempt_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_session_replaces_the_bridge_without_a_stop() {
+        let mut rig = Rig::spawn(S1, true, false);
+        rig.send(Control::Enable).await;
+        let first_key = rig.next_attempt().await.host_key;
+        rig.reaches(BridgePhase::Up { epoch: 1 }).await;
+
+        rig.engine_session(S2);
+        rig.reaches(BridgePhase::Up { epoch: 2 }).await;
+
+        let rebuilt = rig.next_attempt().await;
+        assert_eq!(Some(rebuilt.session), S2);
+        assert_ne!(rebuilt.host_key, first_key);
+        assert_eq!(rig.bridges_held(), 1);
+        assert!(rig.no_stop_began(), "a stop asks an engine that is gone");
+        assert!(rig.ifindex().is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wanted_bridge_waits_for_docker_and_starts_when_a_session_opens() {
+        let mut rig = Rig::spawn(None, true, false);
+        rig.send(Control::Enable).await;
+        rig.reaches(BridgePhase::WaitingForDocker).await;
+        assert!(netbridge_state::load(&rig.state_path).enabled);
+        tokio::time::sleep(LONGEST_WAIT).await;
+        assert!(rig.attempts.try_recv().is_err(), "a start with no session");
+
+        let opened = Instant::now();
+        rig.engine_session(S1);
+        rig.reaches(BridgePhase::Up { epoch: 1 }).await;
+
+        let started = rig.next_attempt().await;
+        assert_eq!(Some(started.session), S1);
+        assert_eq!(started.at - opened, Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_session_starts_at_once_with_a_new_key_and_the_first_retry_delay() {
+        let mut rig = Rig::start();
+        rig.send(Control::Enable).await;
+        let first_key = rig.next_attempt().await.host_key;
+        rig.next_attempt().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let opened = Instant::now();
+        rig.engine_session(S2);
+        let at_once = rig.next_attempt().await;
+        let retry = rig.next_attempt().await;
+
+        assert_eq!(Some(at_once.session), S2);
+        assert_eq!(at_once.at - opened, Duration::ZERO);
+        assert_ne!(at_once.host_key, first_key);
+        assert_eq!(retry.at - at_once.at, RETRY_BASE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_session_ends_the_retries_of_a_failed_start() {
+        let mut rig = Rig::start();
+        rig.send(Control::Enable).await;
+        rig.next_attempt().await;
+
+        rig.engine_session(None);
+
+        rig.reaches(BridgePhase::WaitingForDocker).await;
+        rig.no_attempt_follows().await;
     }
 }

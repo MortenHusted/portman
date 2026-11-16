@@ -99,6 +99,13 @@ impl Engine {
     pub(crate) fn session(&self) -> Option<Session> {
         self.link.borrow().session()
     }
+
+    /// The link itself, for a task that acts when the session changes.
+    /// Only the macOS bridge does.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn watch(&self) -> watch::Receiver<Link> {
+        self.link.clone()
+    }
 }
 
 /// How long one candidate socket has to answer a connect attempt.
