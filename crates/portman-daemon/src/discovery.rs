@@ -588,6 +588,36 @@ mod tests {
     }
 
     #[test]
+    fn each_network_mode_that_gives_no_address_is_skipped_by_name_and_never_waits() {
+        let listings: [(&str, &[(&str, &str)]); 3] = [
+            ("host", &[("host", "")]),
+            ("none", &[("none", "")]),
+            ("container:cccccccccccc3333", &[]),
+        ];
+        for (mode, networks) in listings {
+            let mut listed = summary(&[("dev.portman.host", "web.demo.test")], networks);
+            listed.host_config = Some(ContainerSummaryHostConfig {
+                network_mode: Some(mode.into()),
+                ..Default::default()
+            });
+            let unaddressed = observe(listed).expect("labelled container");
+
+            let plan = plan(&[unaddressed], managed);
+
+            assert_eq!(
+                plan.skipped,
+                vec![Skipped {
+                    id: "aaaaaaaaaaaa".into(),
+                    host: "web.demo.test".into(),
+                    reason: Skip::NoAddress(mode.into()),
+                }]
+            );
+            assert!(plan.waiting.is_empty(), "{mode}");
+            assert!(plan.entries.is_empty(), "{mode}");
+        }
+    }
+
+    #[test]
     fn a_none_mode_container_routes_at_the_address_a_later_connect_gave_it() {
         let mut listed = summary(
             &[("dev.portman.host", "web.demo.test")],
