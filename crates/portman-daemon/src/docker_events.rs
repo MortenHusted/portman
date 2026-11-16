@@ -29,9 +29,10 @@ const RELIST_DELAYS: [Duration; 5] = [
     Duration::from_secs(4),
 ];
 
-/// Timed lists that a network event owes. The engine writes two small files
-/// between the event and its list update, so the first step is long enough
-/// unless the disk stalls. The second step covers a stall.
+/// Timed lists that a network event owes. Docker Engine 28 writes the
+/// container's two config files between the event and its list update, so the
+/// list lags the event by a disk write. Two steps put a list 250 ms and 750 ms
+/// after the event.
 const NETWORK_EVENT_RELISTS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -130,8 +131,7 @@ pub(crate) async fn run(docker: Docker, state: DaemonState) -> Result<()> {
     }
 }
 
-/// Lists the labelled running containers once and applies the list. Returns
-/// what [`apply`] returns.
+/// Lists the labelled running containers once and passes them to [`apply`].
 async fn reconcile(
     docker: &Docker,
     state: &DaemonState,

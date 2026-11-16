@@ -1,8 +1,4 @@
 //! portman daemon entry point.
-//!
-//! Phase 3: in-memory registry fed by (1) a reconcile against the running
-//! containers on every docker event and (2) persisted static rules.
-//! IPC server answers list/status/add/remove.
 
 mod certs;
 mod dashboard;
