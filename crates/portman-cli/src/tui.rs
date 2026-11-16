@@ -30,7 +30,7 @@ use crossterm::terminal::{
 };
 use futures_util::StreamExt;
 use portman_protocol::{
-    ContainerResourceUsage, Entry, LogLineInfo, Mode, NetbridgeMode, Request,
+    BridgePhase, ContainerResourceUsage, Entry, LogLineInfo, Mode, NetbridgeMode, Request,
     ResourceUsageSnapshot, Response, ServiceStatusInfo, Source, TldInfo,
 };
 use ratatui::backend::CrosstermBackend;
@@ -164,8 +164,13 @@ struct StatusSnapshot {
     data_dir: String,
     cert_dir: String,
     bridge_assessment: portman_protocol::BridgeAssessment,
-    bridge_enabled: bool,
+    bridge_phase: BridgePhase,
     bridge_mode: NetbridgeMode,
+}
+
+/// A bridge the user wants can be turned off whether or not it is up.
+fn bridge_toggle_disables(phase: BridgePhase) -> bool {
+    phase != BridgePhase::Disabled
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -441,6 +446,7 @@ async fn fetch_status() -> Result<StatusSnapshot> {
             cert_dir,
             bridge_assessment,
             bridge_enabled,
+            bridge_phase,
             bridge_mode,
             ..
         } => Ok(StatusSnapshot {
@@ -453,7 +459,7 @@ async fn fetch_status() -> Result<StatusSnapshot> {
             data_dir,
             cert_dir,
             bridge_assessment,
-            bridge_enabled,
+            bridge_phase: bridge_phase.or_from_enabled(bridge_enabled),
             bridge_mode,
         }),
         _ => anyhow::bail!("unexpected Status response"),
@@ -614,8 +620,7 @@ async fn handle_key(
             if state
                 .status
                 .as_ref()
-                .map(|status| status.bridge_enabled)
-                .unwrap_or(false)
+                .is_some_and(|status| bridge_toggle_disables(status.bridge_phase))
             {
                 state.modal = Modal::ConfirmBridgeDisable;
             } else {
@@ -1020,12 +1025,12 @@ fn render_status_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
             Line::from(vec![
                 Span::styled("  netbridge ", Style::default().fg(Color::Gray)),
                 Span::styled(
-                    if s.bridge_enabled { "on" } else { "off" },
+                    s.bridge_phase.display_word(),
                     Style::default()
-                        .fg(if s.bridge_enabled {
-                            Color::Green
-                        } else {
-                            Color::Gray
+                        .fg(match s.bridge_phase {
+                            BridgePhase::Up => Color::Green,
+                            BridgePhase::Disabled => Color::Gray,
+                            _ => Color::Yellow,
                         })
                         .bold(),
                 ),
@@ -1035,7 +1040,7 @@ fn render_status_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
                 ),
                 Span::styled(bridge_word, Style::default().fg(bridge_color)),
                 Span::styled(
-                    if s.bridge_enabled {
+                    if bridge_toggle_disables(s.bridge_phase) {
                         "  [b] disable..."
                     } else {
                         "  [b] enable"
@@ -1561,11 +1566,7 @@ fn detail_status(state: &State) -> (&'static str, Vec<Line<'static>>) {
                 "  netbridge ",
                 format!(
                     "{} ({})",
-                    if s.bridge_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    },
+                    s.bridge_phase.display_word(),
                     NetbridgeMode::display_word(s.bridge_mode)
                 ),
             ),
@@ -2155,6 +2156,21 @@ mod tests {
         };
 
         assert_eq!(activity_container_label(&row), "dev/web");
+    }
+
+    #[test]
+    fn bridge_toggle_enables_only_a_bridge_that_is_off() {
+        // phase → [b] disables
+        let table = [
+            (BridgePhase::Disabled, false),
+            (BridgePhase::WaitingForDocker, true),
+            (BridgePhase::Starting, true),
+            (BridgePhase::Up, true),
+            (BridgePhase::Stopping, true),
+        ];
+        for (phase, disables) in table {
+            assert_eq!(bridge_toggle_disables(phase), disables, "phase={phase:?}");
+        }
     }
 
     #[test]
