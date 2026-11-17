@@ -671,7 +671,6 @@ mod tests {
     async fn an_uninstall_asks_the_engine_that_the_daemon_is_connected_to() {
         let connected = r#"{"state":"connected","socket":"/run/demo/docker.sock"}"#;
         let no_socket = r#"{"state":"disconnected","socket":"/run/demo/docker.sock"}"#;
-        // the daemon's answer → the socket of the engine to ask
         let table = [
             (status(connected), Some("/run/demo/docker.sock")),
             (status(no_socket), None),

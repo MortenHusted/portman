@@ -140,7 +140,6 @@ mod tests {
             "DELETE /containers/dddd2222",
             "DELETE /networks/portman",
         ];
-        // (the labels are portman's, the listen port) → (the removals, how it ends)
         let table = [
             ((true, FREE_PORT), (everything, none_left.clone())),
             ((false, FREE_PORT), (vec![], none_left)),

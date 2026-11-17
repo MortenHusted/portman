@@ -1068,7 +1068,7 @@ fn docker_removal_already_underway(err: &DockerError) -> bool {
 /// which dnsmasq reads itself. It keeps no answer: portman can register a
 /// moment later the name that the VM's resolver just answered or denied,
 /// and a cached answer would hide the registration for as long as that
-/// resolver's TTL says. Docker's own resolver keeps no answer either.
+/// resolver's TTL says.
 /// It logs to stderr, where `docker logs` finds what it wrote.
 pub fn dns_forwarder_args(managed_tlds: &BTreeSet<String>) -> Vec<String> {
     let mut args = vec![
