@@ -1410,8 +1410,8 @@ impl From<CleanupEnd> for Cleanup {
 /// The labels name portman and not one daemon, so the removal also needs
 /// UDP port `listen_port`. Pass [`HOST_WG_LISTEN_PORT`], the one that every
 /// bridge listens on: holding any other port shows nothing about a running
-/// bridge. When the port is taken, nothing is removed and the engine is not
-/// asked.
+/// bridge. When the claim on the port fails, nothing is removed and the
+/// engine is not asked.
 ///
 /// The engine has [`ENGINE_STEP_BUDGET`] for all the removals. A cleanup
 /// that is cut there ends owed.
@@ -1425,12 +1425,21 @@ pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Left
     }
 }
 
+/// Only an address in use says that the port has a holder.
 fn say_why_leftovers_stay(listen_port: u16, err: &std::io::Error) {
-    info!(
-        listen_port,
-        %err,
-        "netbridge leftovers stay in the engine: the listen port is taken, and its holder may run a bridge on them"
-    );
+    if err.kind() == std::io::ErrorKind::AddrInUse {
+        info!(
+            listen_port,
+            %err,
+            "netbridge leftovers stay in the engine: the listen port is taken, and its holder may run a bridge on them"
+        );
+    } else {
+        warn!(
+            listen_port,
+            %err,
+            "netbridge leftovers stay in the engine: the claim on the listen port failed"
+        );
+    }
 }
 
 /// As [`remove_leftovers`], for a caller that acts on why a cleanup did not
