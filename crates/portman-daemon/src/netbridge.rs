@@ -2901,6 +2901,28 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_setup_container_that_the_engine_keeps_fails_its_cleanup_before_the_budget_is_spent()
+    {
+        let (engine, fake) = engine_with_leftovers(FREE_PORT);
+        fake.be_slow(crate::engine::tests::Slow {
+            stop: Duration::ZERO,
+            removal: LONGEST_WAIT,
+        });
+        let (logged, _capture) = Logged::capture();
+
+        let asked = Instant::now();
+        let cleanup = engine.remove_leftovers(Session(1), SetupContainer).await;
+
+        assert_eq!(cleanup, Swept::Ended(CleanupEnd::Failed));
+        let waited = asked.elapsed();
+        assert!(waited < ENGINE_STEP_BUDGET, "{waited:?}");
+        let warnings = logged.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let stays = "still present 10s after removal";
+        assert!(warnings[0].contains(stays), "{}", warnings[0]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn with_the_listen_port_free_the_forwarder_and_the_network_go_only_when_asked_for() {
         let container = "/containers/portman-netbridge-setup";
         let cases = [
