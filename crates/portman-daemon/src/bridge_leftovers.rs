@@ -127,71 +127,39 @@ mod tests {
         (engine, fake)
     }
 
-    async fn uninstall(engine: &crate::engine::Engine, listen_port: u16) -> BridgeLeftovers {
-        let sockets = Sockets::Configured(SOCKET.into());
-        remove_from(&sockets, &|_| engine.docker().ok(), listen_port).await
-    }
-
-    fn removals(fake: &FakeEngine) -> Vec<String> {
-        let calls = fake.calls();
-        calls
-            .into_iter()
-            .filter(|call| call.starts_with("DELETE"))
-            .collect()
-    }
-
     #[tokio::test(start_paused = true)]
-    async fn an_uninstall_removes_what_a_disable_removes() {
-        let (engine, fake) = engine_with_leftovers(true);
-
-        let ended = uninstall(&engine, FREE_PORT).await;
-
-        assert_eq!(
-            removals(&fake),
-            [
-                "DELETE /containers/portman-netbridge-setup",
-                "DELETE /containers/dddd2222",
-                "DELETE /networks/portman",
-            ]
-        );
-        assert_eq!(
-            ended,
-            BridgeLeftovers::NoneLeft {
-                socket: SOCKET.into()
-            }
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn an_uninstall_leaves_what_does_not_carry_portmans_labels() {
-        let (engine, fake) = engine_with_leftovers(false);
-
-        let ended = uninstall(&engine, FREE_PORT).await;
-
-        assert_eq!(removals(&fake), [] as [&str; 0]);
-        assert_eq!(
-            ended,
-            BridgeLeftovers::NoneLeft {
-                socket: SOCKET.into()
-            }
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn an_uninstall_removes_nothing_while_a_bridge_holds_the_listen_port() {
+    async fn an_uninstall_removes_what_a_disable_removes_and_only_that() {
         let another_daemons_bridge = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let taken = another_daemons_bridge.local_addr().unwrap().port();
-        let (engine, fake) = engine_with_leftovers(true);
+        let socket = PathBuf::from(SOCKET);
+        let none_left = BridgeLeftovers::NoneLeft {
+            socket: socket.clone(),
+        };
+        let everything = vec![
+            "DELETE /containers/portman-netbridge-setup",
+            "DELETE /containers/dddd2222",
+            "DELETE /networks/portman",
+        ];
+        // (the labels are portman's, the listen port) → (the removals, how it ends)
+        let table = [
+            ((true, FREE_PORT), (everything, none_left.clone())),
+            ((false, FREE_PORT), (vec![], none_left)),
+            ((true, taken), (vec![], BridgeLeftovers::Owed { socket })),
+        ];
+        for ((own, listen_port), (removed, ended)) in table {
+            let (engine, fake) = engine_with_leftovers(own);
+            let sockets = Sockets::Configured(SOCKET.into());
 
-        let ended = uninstall(&engine, taken).await;
+            let uninstalled = remove_from(&sockets, &|_| engine.docker().ok(), listen_port).await;
 
-        assert_eq!(removals(&fake), [] as [&str; 0]);
-        assert_eq!(
-            ended,
-            BridgeLeftovers::Owed {
-                socket: SOCKET.into()
-            }
-        );
+            let removals: Vec<String> = fake
+                .calls()
+                .into_iter()
+                .filter(|call| call.starts_with("DELETE"))
+                .collect();
+            assert_eq!(removals, removed, "own={own} listen_port={listen_port}");
+            assert_eq!(uninstalled, ended, "own={own} listen_port={listen_port}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

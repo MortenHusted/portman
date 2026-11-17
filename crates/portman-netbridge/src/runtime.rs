@@ -2875,17 +2875,15 @@ destination: 172.18.0.0
             .await;
 
         assert_eq!(ensured.unwrap(), DnsForwarder::Started);
-        let requests = engine.requests();
-        let asked: Vec<&str> = requests.iter().map(|(asked, _)| asked.as_str()).collect();
         assert_eq!(
-            asked,
+            engine.asked_for(),
             [
                 "DELETE /containers/dddd2222",
                 "POST /containers/create",
                 "POST /containers/portman-netbridge-dns/start",
             ]
         );
-        let created = &requests[1].1;
+        let created = &engine.requests()[1].1;
         assert!(created.contains(r#""--cache-size=0""#), "{created}");
     }
 
