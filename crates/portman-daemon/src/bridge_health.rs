@@ -22,6 +22,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use bollard::models::ContainerSummary;
 use bollard::query_parameters::{ListContainersOptionsBuilder, ListNetworksOptionsBuilder};
 use bollard::Docker;
 use tracing::{debug, warn};
@@ -128,26 +129,7 @@ async fn subnets_with_portman_containers(docker: &Docker) -> anyhow::Result<BTre
     let opts = ListContainersOptionsBuilder::default().all(false).build();
     let containers = docker.list_containers(Some(opts)).await?;
 
-    // Collect the distinct network names in use.
-    let mut networks_in_use: BTreeSet<String> = BTreeSet::new();
-    for c in &containers {
-        if !has_portman_host_label(c.labels.as_ref()) {
-            continue;
-        }
-        if let Some(nets) = c
-            .network_settings
-            .as_ref()
-            .and_then(|s| s.networks.as_ref())
-        {
-            for name in nets.keys() {
-                // Skip virtual networks that don't have routed subnets.
-                if matches!(name.as_str(), "host" | "none") {
-                    continue;
-                }
-                networks_in_use.insert(name.clone());
-            }
-        }
-    }
+    let networks_in_use = networks_in_use(&containers);
     if networks_in_use.is_empty() {
         return Ok(BTreeSet::new());
     }
@@ -174,6 +156,31 @@ async fn subnets_with_portman_containers(docker: &Docker) -> anyhow::Result<BTre
         }
     }
     Ok(out)
+}
+
+/// The names of the networks that the Portman-labelled containers of
+/// `containers` are attached to.
+fn networks_in_use(containers: &[ContainerSummary]) -> BTreeSet<String> {
+    let mut networks_in_use: BTreeSet<String> = BTreeSet::new();
+    for c in containers {
+        if !has_portman_host_label(c.labels.as_ref()) {
+            continue;
+        }
+        if let Some(nets) = c
+            .network_settings
+            .as_ref()
+            .and_then(|s| s.networks.as_ref())
+        {
+            for name in nets.keys() {
+                // Skip virtual networks that don't have routed subnets.
+                if matches!(name.as_str(), "host" | "none") {
+                    continue;
+                }
+                networks_in_use.insert(name.clone());
+            }
+        }
+    }
+    networks_in_use
 }
 
 fn has_portman_host_label(labels: Option<&std::collections::HashMap<String, String>>) -> bool {
@@ -298,6 +305,85 @@ mod tests {
         let ifindex = crate::upstream::new_bridge_ifindex();
 
         assert_eq!(assess(&engine, &ifindex).await, BridgeAssessment::Offline);
+    }
+
+    /// A running container on `networks`, each given as a name and an
+    /// address. `host` is its `dev.portman.host` label.
+    fn container(host: Option<&str>, networks: &[(&str, &str)]) -> ContainerSummary {
+        use bollard::models::{ContainerSummaryNetworkSettings, EndpointSettings};
+        let endpoint = |address: &str| EndpointSettings {
+            ip_address: Some(address.to_string()),
+            ..Default::default()
+        };
+        ContainerSummary {
+            id: Some("0a1b2c3d4e5f".to_string()),
+            labels: host.map(|host| HashMap::from([(LABEL_HOST.to_string(), host.to_string())])),
+            network_settings: Some(ContainerSummaryNetworkSettings {
+                networks: Some(
+                    networks
+                        .iter()
+                        .map(|&(name, address)| (name.to_string(), endpoint(address)))
+                        .collect(),
+                ),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_labelled_container_on_the_portman_network_counts_through_that_network_only() {
+        let web = Some("web.demo.test");
+        let compose = ("demo_default", "172.18.0.2");
+        let backend = ("acme_backend", "172.19.0.2");
+        let portman = ("portman", "192.168.99.130");
+        let names = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|name| name.to_string()).collect()
+        };
+        // the containers → the networks whose routes the health needs
+        let table = [
+            (vec![container(web, &[compose])], names(&["demo_default"])),
+            (vec![container(web, &[portman])], names(&["portman"])),
+            (
+                vec![container(web, &[compose, portman])],
+                names(&["portman"]),
+            ),
+            (
+                vec![container(web, &[backend, compose])],
+                names(&["acme_backend", "demo_default"]),
+            ),
+            (
+                vec![
+                    container(web, &[compose, portman]),
+                    container(Some("api.demo.test"), &[compose]),
+                ],
+                names(&["demo_default", "portman"]),
+            ),
+            (vec![container(web, &[("host", "")])], names(&[])),
+            (vec![container(None, &[compose])], names(&[])),
+        ];
+        for (containers, networks) in table {
+            assert_eq!(networks_in_use(&containers), networks, "{containers:?}");
+        }
+    }
+
+    #[test]
+    fn the_health_network_of_a_container_on_portman_holds_the_address_the_registry_routes_to() {
+        let both = container(
+            Some("web.demo.test"),
+            &[
+                ("demo_default", "172.18.0.2"),
+                ("portman", "192.168.99.130"),
+            ],
+        );
+
+        let routed_to = crate::discovery::observe(both.clone())
+            .and_then(|container| crate::discovery::pick_address(&container.addresses));
+
+        assert_eq!(routed_to, Some([192, 168, 99, 130].into()));
+        assert_eq!(
+            networks_in_use(&[both]),
+            BTreeSet::from(["portman".to_string()])
+        );
     }
 
     #[test]
