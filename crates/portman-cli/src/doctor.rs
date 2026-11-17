@@ -1029,6 +1029,33 @@ mod tests {
     }
 
     #[test]
+    fn doctor_reads_the_setup_image_check_as_one_of_the_two_that_ask_the_docker_cli() {
+        let no_answer = || DockerCliError::NoAnswer("no answer in 3 s".to_string());
+        let lines = "the setup image and labelled docker networks lines below";
+
+        let mut image_got_no_answer = with_docker(Some(connected_docker()));
+        image_got_no_answer.setup_image = SetupImageStatus::Unavailable(no_answer());
+        let rendered = render_report(&image_got_no_answer);
+        assert!(
+            rendered.contains("docker CLI: a check got no answer"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(lines), "{rendered}");
+        assert!(
+            rendered.contains("\nsetup image: unavailable (no answer in 3 s)\n"),
+            "{rendered}"
+        );
+
+        let mut only_the_image_answered = with_docker(Some(disconnected_docker()));
+        only_the_image_answered.docker_routes = DockerRouteStatus::Unavailable(no_answer());
+        let rendered = render_report(&only_the_image_answered);
+        assert!(
+            rendered.contains("docker CLI: a check reached an engine"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn doctor_prints_no_note_for_an_engine_that_answered_with_an_error_or_a_cli_that_did_not_run() {
         let gone = "Error response from daemon: No such container: 0a1b2c";
         let errors = [
