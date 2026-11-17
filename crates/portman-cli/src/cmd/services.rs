@@ -312,7 +312,6 @@ impl InterruptedServices {
         recorded
     }
 
-    /// `None` when the daemon took the connection and gave no answer in time.
     async fn record_from<F, Fut>(mut send: F) -> Option<Self>
     where
         F: FnMut(Request) -> Fut,
@@ -536,7 +535,6 @@ fn why_not_ready(row: &ServiceStatusInfo) -> String {
     }
 }
 
-/// The answer to the last status request, or `None` when that request got none.
 async fn poll_services<F, Fut>(
     send: &mut F,
     limit: Duration,
@@ -553,10 +551,8 @@ where
             Ok(Ok(Response::ServiceStatuses { services })) => Some(services),
             _ => None,
         };
-        // A request after this pause must have one more pause before the
-        // limit, or a daemon that answers could miss it.
-        let no_time_for_another = Instant::now() + POLL_PAUSE * 2 > deadline;
-        if rows.as_deref().is_some_and(&done) || no_time_for_another {
+        let next_request_gets_a_full_pause = Instant::now() + POLL_PAUSE * 2 <= deadline;
+        if rows.as_deref().is_some_and(&done) || !next_request_gets_a_full_pause {
             return rows;
         }
         sleep(POLL_PAUSE).await;
