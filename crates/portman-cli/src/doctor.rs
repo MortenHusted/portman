@@ -445,9 +445,10 @@ fn targets_the_portman_network(target: &str) -> bool {
 /// Looks `name` up from a container on the default bridge network that has
 /// the forwarder as its only resolver, as a container started with `--dns
 /// 192.168.99.129` has. The container is the setup image's `getent`, and
-/// the engine removes it when the lookup ends. The resolver options set
-/// one attempt with a timeout of [`LOOKUP_RESOLVER_SECS`], so that a lookup
-/// with no answer ends.
+/// the engine removes it when the lookup ends. `--pull never` keeps the CLI
+/// from asking a registry for an image that went away since the inspect.
+/// The resolver options set one attempt with a timeout of
+/// [`LOOKUP_RESOLVER_SECS`], so that a lookup with no answer ends.
 ///
 /// `docker` is the command that stands for the `docker` CLI. A run that has
 /// not ended after `bound` is killed. The engine can then still hold the
@@ -464,7 +465,8 @@ async fn look_up_through_forwarder(
     let (program, first_args) = docker.split_first().expect("a command has a program");
     let run = [
         first_args,
-        &["run", "--rm", "--name", &container, "--dns", &forwarder],
+        &["run", "--rm", "--pull", "never", "--name", &container],
+        &["--dns", &forwarder],
         &["--dns-opt", &resolver_wait, "--dns-opt", "attempts:1"],
         &["--entrypoint", "getent", SETUP_IMAGE, "hosts", &name],
     ]
@@ -1746,7 +1748,7 @@ mod tests {
             };
             assert_eq!(query, unanswered, "{rm}");
             assert_eq!(calls.len(), 2, "{calls:?}");
-            let named = format!("run --rm --name {container} --dns 192.168.99.129 ");
+            let named = format!("run --rm --pull never --name {container} --dns 192.168.99.129 ");
             assert!(calls[0].starts_with(&named), "{calls:?}");
             assert_eq!(calls[1], format!("rm --force {container}"), "{rm}");
         }
