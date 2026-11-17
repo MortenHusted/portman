@@ -2624,6 +2624,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_disable_that_left_the_forwarder_does_not_say_that_portman_removes_it() {
+        let left = Ok(Settled::LeftoversStay(
+            portman_protocol::BridgeCleanup::Failed,
+        ));
+
+        assert!(matches!(after_disable(&left), Modal::None));
+    }
+
     /// The status bar, on a terminal of `columns` columns.
     fn status_bar(columns: u16, state: &State) -> String {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(columns, 40)).unwrap();
