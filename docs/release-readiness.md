@@ -167,6 +167,14 @@ the compose line `dns: [192.168.99.129]`.
   forwarder. The bridge then works as before, the daemon log and `portman
   doctor` name `portman bridge prepare` as the fix, and the daemon looks at
   the image again every minute while the bridge is up.
+- The setup image carries a revision in the label
+  `dev.portman.setup-image-revision`. `portman doctor` reports an image with
+  a lower revision than its own, or with none, as `setup image: older than
+  this portman` and names `portman bridge prepare`. That line does not gate
+  readiness. The daemon does not read the revision and runs the forwarder
+  from an older image. A forwarder that is in place from an older image
+  stays until the next bridge start or the next change of the managed TLD
+  set.
 
 Manual gates, on an installed build with the bridge up and a registered HTTP
 route `web.demo.test` and a TCP route `db.demo.test` to a container on the

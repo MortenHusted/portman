@@ -449,7 +449,11 @@ The two `docker` commands go by name. portman itself removes a forwarder or a ne
 
 `portman doctor` prints one `dns forwarder` line. For a forwarder that runs while the bridge is up, it starts a short-lived container that looks one registered hostname up through `192.168.99.129`, and prints the answer. It looks no name up when every registered hostname is a wildcard or is under `.localhost`.
 
-The forwarder needs a setup image that has `dnsmasq`. An install from before this feature has an older image. The bridge then works as before, and `portman doctor` reports the forwarder as unavailable. Run `portman bridge prepare` to build the current image. A bridge that is up gets the forwarder within a minute. The image that portman 0.1.7 built has `dnsmasq` 2.90. Through it, a query that carries a DNS cookie, as `dig` sends it, gets `REFUSED` for a name under a managed TLD that portman does not hold. `portman install` builds the current image, and the daemon then replaces the forwarder.
+The forwarder needs a setup image that has `dnsmasq`. An install from before this feature has an image without it. The bridge then works as before, and `portman doctor` reports the forwarder as unavailable. Run `portman bridge prepare` to build the current image. A bridge that is up then gets the forwarder within a minute.
+
+The image that portman 0.1.7 built has `dnsmasq` 2.90. Through it, a query that carries a DNS cookie, as `dig` sends it, gets `REFUSED` for a name under a managed TLD that portman does not hold. `portman doctor` reports such an image as `setup image: older than this portman`. `portman install` builds the current image and restarts the daemon, and the daemon replaces the forwarder when the bridge comes up. `portman bridge prepare` builds the current image too, and leaves a forwarder that runs from the older image in place. The daemon replaces that forwarder at the next bridge start, or at the next `portman tld add` or `portman tld remove`.
+
+`portman doctor` and `portman bridge prepare` use the engine that the `docker` command talks to. When the daemon is connected to another engine, `portman status` prints that engine's socket path on its `docker` line. Run `portman bridge prepare` again with `DOCKER_HOST` set to `unix://` and that path.
 
 ## Status
 
