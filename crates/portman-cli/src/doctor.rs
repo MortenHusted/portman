@@ -6,7 +6,7 @@ use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
 
 use portman_protocol::{
-    BridgePhase, DockerState, DockerStatus, Entry, Mode, NetbridgeMode, Response,
+    BridgeAssessment, BridgePhase, DockerState, DockerStatus, Entry, Mode, NetbridgeMode, Response,
 };
 use serde_json::Value;
 
@@ -654,7 +654,10 @@ pub(crate) fn render_report(report: &DoctorReport) -> String {
         check_container_facing(&report.container_facing),
     ]);
     outcomes.extend(report.dns_forwarder.as_ref().map(check_dns_forwarder));
-    outcomes.push(check_docker_routes(&report.docker_routes));
+    outcomes.push(check_docker_routes(
+        &report.docker_routes,
+        report.daemon.bridge_assessment,
+    ));
     let ready = replacement_ready(&outcomes);
 
     let mut lines = Vec::new();
@@ -762,24 +765,17 @@ pub(crate) fn docker_cli_note(
     ))
 }
 
-fn check_docker_routes(status: &DockerRouteStatus) -> CheckOutcome {
+/// The verdict on the routes is the daemon's health, which knows the network
+/// that the registry routes each container through and the interface of the
+/// bridge. The lines show what the `docker` CLI and the routing table say.
+fn check_docker_routes(
+    status: &DockerRouteStatus,
+    health: Option<BridgeAssessment>,
+) -> CheckOutcome {
     let state = match status {
-        DockerRouteStatus::Routes(routes) => {
-            let all_utun = !routes.is_empty()
-                && routes.iter().all(|route| {
-                    route
-                        .route_iface
-                        .as_deref()
-                        .is_some_and(|iface| iface.starts_with("utun"))
-                });
-            if all_utun {
-                CheckState::Ok
-            } else {
-                CheckState::Warn
-            }
-        }
-        DockerRouteStatus::NoLabelledContainers => CheckState::Ok,
         DockerRouteStatus::Unavailable(_) => CheckState::Fail,
+        _ if health == Some(BridgeAssessment::Healthy) => CheckState::Ok,
+        _ => CheckState::Warn,
     };
     CheckOutcome {
         state,

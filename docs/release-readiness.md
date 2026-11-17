@@ -66,7 +66,10 @@ interface existence alone does not prove the route reaches Portman's bridge.
 `portman doctor` is the default-driver check. It reports daemon
 reachability, bridge health/mode, setup-image status, docker-mac-net-connect
 presence/service status, labelled Docker networks, route interfaces for their
-subnets, and explicit commands for stopping the legacy bridge. It does not stop
+subnets, and explicit commands for stopping the legacy bridge. Its verdict on
+the routes is the bridge health that the daemon reports, so `replacement:
+ready` needs `bridge: healthy`. The labelled-network lines show what the
+`docker` CLI and the routing table say. It does not stop
 or uninstall any legacy service. On macOS it also reports the DNS forwarder. For a
 forwarder that runs while the bridge is up, it starts one short-lived
 container that looks a registered hostname up through `192.168.99.129`. The
