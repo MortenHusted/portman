@@ -443,6 +443,8 @@ When Docker is not running at the time of the disable, portman removes the forwa
 
 `portman uninstall` stops the daemon and then removes what `portman bridge disable` removes: the forwarder, the bridge's setup container, and the `portman` network unless a running container is attached to it. It removes only what carries portman's labels, and it does not change whether the bridge is on for the next install. As after a disable, a container that still has `192.168.99.129` as its only resolver then resolves no name, until portman is installed again. When Docker is not running at that time, the uninstall still completes and prints the commands that remove the forwarder and the network, `docker rm -f portman-netbridge-dns` and `docker network rm portman`.
 
+The two `docker` commands go by name. portman itself removes a forwarder or a network only when it carries portman's labels and no other process holds the bridge's UDP port. The commands check neither. Do not run them while another portman daemon runs a bridge on the same engine, because they would remove that bridge's forwarder and network.
+
 ### Check the forwarder
 
 `portman doctor` prints one `dns forwarder` line. For a forwarder that runs while the bridge is up, it starts a short-lived container that looks one registered hostname up through `192.168.99.129`, and prints the answer. It looks no name up when every registered hostname is a wildcard or is under `.localhost`.

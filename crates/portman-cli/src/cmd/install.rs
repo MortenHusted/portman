@@ -254,9 +254,23 @@ async fn uninstall(mac: &impl Uninstall) {
 #[cfg(target_os = "macos")]
 const REMOVAL_BUDGET: Duration = Duration::from_secs(35);
 
+/// The commands that remove the forwarder and its network by hand, and
+/// when not to run them. They go by name. Neither portman's labels nor the
+/// bridge's UDP port guard them, as both guard a removal by portman.
+#[cfg(target_os = "macos")]
+fn by_hand_lines() -> Vec<String> {
+    let mut lines: Vec<String> = portman_daemon::manual_removal_commands()
+        .map(|command| format!("    {command}"))
+        .into();
+    lines.push(
+        "bridge: do not run them while another portman daemon runs a bridge on this engine: they would remove its forwarder and network"
+            .to_string(),
+    );
+    lines
+}
+
 #[cfg(target_os = "macos")]
 fn stalled_removal_lines() -> Vec<String> {
-    let by_hand = portman_daemon::manual_removal_commands().map(|command| format!("    {command}"));
     [
         vec![
             format!(
@@ -266,7 +280,7 @@ fn stalled_removal_lines() -> Vec<String> {
             "bridge: when Docker answers again, remove the forwarder and its network with:"
                 .to_string(),
         ],
-        by_hand.to_vec(),
+        by_hand_lines(),
     ]
     .concat()
 }
@@ -348,7 +362,6 @@ async fn daemon_engine_socket(
 /// forwarder and the docker network that a bridge leaves in the engine.
 #[cfg(target_os = "macos")]
 fn bridge_leftover_lines(leftovers: &BridgeLeftovers) -> Vec<String> {
-    let by_hand = portman_daemon::manual_removal_commands().map(|command| format!("    {command}"));
     match leftovers {
         BridgeLeftovers::NoneLeft { socket } => vec![
             format!(
@@ -368,7 +381,7 @@ fn bridge_leftover_lines(leftovers: &BridgeLeftovers) -> Vec<String> {
                 ),
                 "bridge: to remove the forwarder and its network by hand, run:".to_string(),
             ],
-            by_hand.to_vec(),
+            by_hand_lines(),
         ]
         .concat(),
         BridgeLeftovers::NoEngine { reason } => [
@@ -376,7 +389,7 @@ fn bridge_leftover_lines(leftovers: &BridgeLeftovers) -> Vec<String> {
                 format!("bridge: found no Docker engine to ask ({reason})"),
                 "bridge: the Docker VM may still hold the dns forwarder. When Docker runs again, remove the forwarder and its network with:".to_string(),
             ],
-            by_hand.to_vec(),
+            by_hand_lines(),
         ]
         .concat(),
     }
