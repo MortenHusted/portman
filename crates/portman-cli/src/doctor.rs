@@ -191,7 +191,8 @@ pub(crate) struct DoctorReport {
     pub legacy_bridge: LegacyBridgeStatus,
     pub docker_routes: DockerRouteStatus,
     pub container_facing: ContainerFacingStatus,
-    pub dns_forwarder: DnsForwarderReport,
+    /// `None` on a platform that has no netbridge, and so no forwarder.
+    pub dns_forwarder: Option<DnsForwarderReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,15 +324,19 @@ pub(crate) fn inspect_container_facing() -> ContainerFacingStatus {
 }
 
 /// `routes` is the registry as the daemon lists it, and empty for a daemon
-/// that did not answer.
+/// that did not answer. Only macOS has the netbridge that runs a forwarder,
+/// so any other platform gets `None` and the `docker` CLI is not asked.
 pub(crate) async fn inspect_dns_forwarder(
     phase: Option<BridgePhase>,
     routes: &[Entry],
-) -> DnsForwarderReport {
-    DnsForwarderReport {
+) -> Option<DnsForwarderReport> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    Some(DnsForwarderReport {
         status: dns_forwarder_status(phase, routes).await,
         tcp_routes: tcp_routes_on_the_portman_network(routes),
-    }
+    })
 }
 
 async fn dns_forwarder_status(phase: Option<BridgePhase>, routes: &[Entry]) -> DnsForwarderStatus {
@@ -628,9 +633,9 @@ pub(crate) fn render_report(report: &DoctorReport) -> String {
         check_setup_image(&report.setup_image),
         legacy,
         check_container_facing(&report.container_facing),
-        check_dns_forwarder(&report.dns_forwarder),
-        check_docker_routes(&report.docker_routes),
     ]);
+    outcomes.extend(report.dns_forwarder.as_ref().map(check_dns_forwarder));
+    outcomes.push(check_docker_routes(&report.docker_routes));
     let ready = replacement_ready(&outcomes);
 
     let mut lines = Vec::new();
@@ -1145,7 +1150,7 @@ mod tests {
             legacy_bridge: LegacyBridgeStatus::NotDetected,
             docker_routes: DockerRouteStatus::NoLabelledContainers,
             container_facing: open_container_facing(),
-            dns_forwarder: forwarder(running(answered())),
+            dns_forwarder: Some(forwarder(running(answered()))),
         }
     }
 
@@ -1486,9 +1491,34 @@ mod tests {
 
     fn with_forwarder(dns_forwarder: DnsForwarderReport) -> DoctorReport {
         DoctorReport {
-            dns_forwarder,
+            dns_forwarder: Some(dns_forwarder),
             ..ready_but_for_the_bridge(BridgePhase::Up)
         }
+    }
+
+    #[test]
+    fn doctor_prints_no_forwarder_line_where_no_forwarder_can_run() {
+        let report = DoctorReport {
+            dns_forwarder: None,
+            ..ready_but_for_the_bridge(BridgePhase::Up)
+        };
+
+        let rendered = render_report(&report);
+
+        assert!(!rendered.contains("dns forwarder"), "{rendered}");
+        assert!(rendered.contains("container-facing:"), "{rendered}");
+        assert!(rendered.contains("labelled docker networks"), "{rendered}");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn only_macos_has_a_forwarder_for_doctor_to_look_at() {
+        let routes = [route("web.demo.test", Mode::Http)];
+
+        assert_eq!(
+            inspect_dns_forwarder(Some(BridgePhase::Up), &routes).await,
+            None
+        );
     }
 
     fn route(host: &str, mode: Mode) -> Entry {
@@ -1872,7 +1902,7 @@ mod tests {
                 route_iface: Some("utun10".to_string()),
             }]),
             container_facing: open_container_facing(),
-            dns_forwarder: forwarder(running(answered())),
+            dns_forwarder: Some(forwarder(running(answered()))),
         };
 
         let rendered = render_report(&report);
@@ -1910,7 +1940,7 @@ mod tests {
                 route_iface: Some("utun8".to_string()),
             }]),
             container_facing: open_container_facing(),
-            dns_forwarder: forwarder(running(answered())),
+            dns_forwarder: Some(forwarder(running(answered()))),
         };
 
         let rendered = render_report(&report);
