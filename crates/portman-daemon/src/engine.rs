@@ -171,9 +171,11 @@ const RECONNECT_DELAYS: [Duration; 5] = [
 ];
 
 /// How soon a daemon that looks for an engine has a session on one that
-/// begins to answer, when that engine is behind the first socket that
-/// exists: a connect attempt in flight ends with no answer, the longest
-/// delay passes, and the next attempt is answered.
+/// begins to answer: a probe in flight gets no answer, the longest delay
+/// passes, and the next attempt is answered. [`connect`] gives each
+/// candidate socket its own [`PROBE_TIMEOUT`], so this holds only while no
+/// candidate is the socket of a second engine that takes a connection and
+/// answers nothing. Each such socket adds one timeout to an attempt.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) const SESSION_OPENS_WITHIN: Duration = Duration::from_secs(
     2 * PROBE_TIMEOUT.as_secs() + RECONNECT_DELAYS[RECONNECT_DELAYS.len() - 1].as_secs(),
