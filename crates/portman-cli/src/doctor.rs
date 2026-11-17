@@ -1448,6 +1448,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_docker_cli_that_is_not_there_is_named_as_not_found() {
+        let no_program = "/run/demo/no-such-docker";
+
+        let result = run_docker(no_program, &["ps"], Duration::from_secs(10)).await;
+
+        let not_found = format!("`{no_program}` not found");
+        assert_eq!(result, Err(DockerCliError::NotStarted(not_found)));
+    }
+
+    #[test]
+    fn doctor_counts_a_forwarder_check_that_got_no_answer_toward_the_docker_cli_note() {
+        let mut report = with_docker(Some(connected_docker()));
+        report.dns_forwarder = Some(forwarder(DnsForwarderStatus::DockerUnavailable {
+            message: "no answer in 3 s".to_string(),
+        }));
+
+        let rendered = render_report(&report);
+
+        let note = "\ndocker CLI: a check got no answer from an engine, and the daemon is \
+                    connected to one; the setup image, dns forwarder and labelled docker \
+                    networks lines below come from the `docker` CLI\n";
+        assert!(rendered.contains(note), "{rendered}");
+        assert!(
+            rendered.contains("\ndns forwarder: unavailable (no answer in 3 s)\n"),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_docker_cli_call_that_does_not_end_is_killed_at_its_bound() {
         let dir = tempfile::tempdir().unwrap();
         let outlived = dir.path().join("outlived");
