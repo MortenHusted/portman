@@ -3296,6 +3296,39 @@ destination: 172.18.0.0
         held.abort();
     }
 
+    #[tokio::test]
+    async fn a_route_pass_that_panics_does_not_end_the_reconciler_of_a_bridge_that_holds_its_utun()
+    {
+        static COMMANDS: AtomicU64 = AtomicU64::new(0);
+        let route = |_: &[&str]| {
+            if COMMANDS.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("the first route pass panics");
+            }
+            route_ended(0, "")
+        };
+        let utun = "utun-of-a-route-pass-that-panics";
+        remember_own_utun(utun);
+        let docker = FakeEngine::start().await.docker.clone();
+        let reconciler =
+            spawn_route_reconciler(docker, NetbridgeMode::OptIn, utun.to_string(), route);
+
+        let began = std::time::Instant::now();
+        while COMMANDS.load(Ordering::SeqCst) < 2 {
+            assert!(
+                !reconciler.is_finished(),
+                "the reconciler ended with the pass that panicked"
+            );
+            assert!(
+                began.elapsed() < ROUTE_RECONCILE_PERIOD + Duration::from_secs(60),
+                "no pass followed the one that panicked"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        forget_own_utun(utun);
+        reconciler.abort();
+    }
+
     #[derive(Clone, Default)]
     struct Logged(Shared<Vec<u8>>);
 
