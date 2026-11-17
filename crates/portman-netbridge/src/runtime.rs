@@ -426,13 +426,12 @@ fn prevent_child_inheritance(fd: RawFd) -> Result<()> {
 
 // ── Task spawners ──────────────────────────────────────────────────
 
-/// A pump's half of the bridge's utun device. A pump that ends drops its
-/// half, whatever ended it, and the device closes when both halves have
-/// dropped. The kernel can then give the name of the utun to the next one,
-/// so the bridge lets go of the name before the half drops. Rust runs the
-/// `drop` of a value before it drops the value's fields, and it moves no
-/// field out of a type that has a `drop`. So no change to a pump can put the
-/// half ahead of the let-go.
+/// A pump that ends drops its half of the utun device, whatever ended it,
+/// and the device closes when both halves have dropped. The kernel can then
+/// give the utun's name to the next utun, so the bridge lets go of the name
+/// before the half drops. No change to a pump can turn that order around,
+/// because Rust runs the `drop` of a value before it drops the value's
+/// fields, and it moves no field out of a type that has a `drop`.
 struct OwnHalf<D> {
     utun: String,
     half: D,
@@ -2955,8 +2954,6 @@ destination: 172.18.0.0
         );
     }
 
-    /// What a pump's half of a device does when the pump reads from it or
-    /// writes to it.
     #[derive(Clone, Copy)]
     enum Ends {
         Never,
@@ -2964,12 +2961,9 @@ destination: 172.18.0.0
         ByAPanic,
     }
 
-    /// What the halves of one device see of the bridge's claim on `utun`.
     #[derive(Clone)]
     struct Seen {
         utun: &'static str,
-        /// For each half that dropped, whether the bridge claimed the utun
-        /// at that moment.
         claimed_at_drop: Shared<Vec<bool>>,
         a_half_dropped: Arc<AtomicBool>,
     }
@@ -3055,9 +3049,6 @@ destination: 172.18.0.0
         }
     }
 
-    /// Route passes for one utun that run one after another on a thread,
-    /// with a stand-in for `route` that counts each command that starts or
-    /// still runs after a half of the device dropped.
     struct Passes {
         stop: Arc<AtomicBool>,
         ended: Arc<AtomicU64>,
@@ -3066,8 +3057,6 @@ destination: 172.18.0.0
     }
 
     impl Passes {
-        /// Returns once a pass has run its commands, so the stand-in does
-        /// run while the bridge holds the utun.
         fn start(seen: &Seen) -> Self {
             let stop = Arc::<AtomicBool>::default();
             let ended = Arc::<AtomicU64>::default();
@@ -3106,8 +3095,6 @@ destination: 172.18.0.0
             }
         }
 
-        /// Lets two more passes end and returns the number of commands that
-        /// started or still ran after a half of the device dropped.
         fn end(self) -> u64 {
             let ended = self.ended.load(Ordering::SeqCst);
             while self.ended.load(Ordering::SeqCst) < ended + 2 {
@@ -3126,14 +3113,11 @@ destination: 172.18.0.0
         spawn_tx(udp, peer, Arc::default(), half.seen.utun, half)
     }
 
-    /// An ICMP echo from the VM's end of the tunnel to the host's.
-    const PACKET: &[u8] = &[
+    const ECHO_FROM_THE_VM: &[u8] = &[
         0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 192, 168, 99, 2,
         192, 168, 99, 1, b'e', b'c', b'h', b'o', b'!', b'!', b'!', b'!',
     ];
 
-    /// An rx pump, and a packet from the VM's end of the tunnel that the
-    /// pump writes to `half`.
     async fn rx_pump_that_gets_a_packet(half: Half) -> JoinHandle<()> {
         let (host, vm) = (Keypair::generate(), Keypair::generate());
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -3144,7 +3128,8 @@ destination: 172.18.0.0
         let mut vm = Peer::new(&vm, host.public(), None);
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (mut frame, mut answer) = ([0u8; 2048], [0u8; 2048]);
-        let TunnResult::WriteToNetwork(initiation) = vm.encapsulate(PACKET, &mut frame) else {
+        let TunnResult::WriteToNetwork(initiation) = vm.encapsulate(ECHO_FROM_THE_VM, &mut frame)
+        else {
             panic!("no handshake initiation");
         };
         socket.send_to(initiation, to_host).await.unwrap();
@@ -3156,7 +3141,7 @@ destination: 172.18.0.0
         if let TunnResult::WriteToNetwork(keepalive) = vm.decapsulate(&answer[..n], &mut frame) {
             socket.send_to(keepalive, to_host).await.unwrap();
         }
-        let TunnResult::WriteToNetwork(data) = vm.encapsulate(PACKET, &mut frame) else {
+        let TunnResult::WriteToNetwork(data) = vm.encapsulate(ECHO_FROM_THE_VM, &mut frame) else {
             panic!("no data frame");
         };
         socket.send_to(data, to_host).await.unwrap();
@@ -3469,9 +3454,6 @@ destination: 172.18.0.0
             (b"out\n".into(), b"err\n".into())
         );
 
-        // The program that hangs writes its id first. Under load the limit
-        // can pass before it has, and such a run shows nothing, so the next
-        // one gets twice the limit.
         let pid_file = std::env::temp_dir().join(format!("portman-hangs-{}", std::process::id()));
         let hangs = format!("echo $$ > '{}'; exec sleep 60", pid_file.display());
         let mut limit = Duration::from_millis(100);
@@ -3484,7 +3466,7 @@ destination: 172.18.0.0
             assert!(took < limit + Duration::from_secs(10), "it took {took:?}");
             match std::fs::read_to_string(&pid_file) {
                 Ok(pid) if pid.ends_with('\n') => break pid.trim().to_string(),
-                _ => limit *= 2,
+                _killed_before_it_wrote_its_id => limit *= 2,
             }
         };
         std::fs::remove_file(&pid_file).unwrap();
@@ -3494,8 +3476,7 @@ destination: 172.18.0.0
         );
     }
 
-    /// Whether a process with this id exists. One that has ended and that
-    /// its parent has not waited for still exists.
+    /// A process that has ended exists until its parent has waited for it.
     fn exists(pid: &str) -> bool {
         let signal_none = StdCommand::new("kill").args(["-0", pid]).output().unwrap();
         signal_none.status.success()
