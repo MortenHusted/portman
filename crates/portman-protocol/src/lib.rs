@@ -1452,7 +1452,6 @@ mod tests {
     #[test]
     fn only_a_start_that_waits_for_its_retry_says_when_it_runs_again() {
         let failed = "starting, the last start failed, tries again in 12s";
-        // (phase, bridge_retry_in_secs) → the words
         let table = [
             (BridgePhase::Starting, Some(12), failed),
             (BridgePhase::Starting, None, "starting"),

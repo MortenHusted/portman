@@ -53,7 +53,6 @@ pub(crate) struct Handle {
 }
 
 impl Handle {
-    /// Linux starts no bridge, so no start waits for a retry.
     pub(crate) fn retry_in_secs(&self) -> Option<u64> {
         None
     }

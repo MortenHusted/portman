@@ -2401,8 +2401,6 @@ destination: 172.18.0.0
         /// The method and path of each request that is not an inspect, and
         /// its body.
         requests: Shared<Vec<(String, String)>>,
-        /// The removals that the engine refuses: the path, and the status
-        /// line and message of its answer.
         refusals: Shared<HashMap<String, Refusal>>,
     }
 
@@ -2462,8 +2460,6 @@ destination: 172.18.0.0
             self.holds.lock().unwrap().insert(path.into(), json.into());
         }
 
-        /// Makes the engine refuse a removal of `path` and keep what it
-        /// holds there.
         fn refuse_delete(&self, path: &str, refusal: Refusal) {
             self.refusals.lock().unwrap().insert(path.into(), refusal);
         }
@@ -2489,8 +2485,6 @@ destination: 172.18.0.0
             }
         }
 
-        /// A bridge whose pump tasks hold the listen port, as those of a
-        /// running bridge do.
         async fn bridge_with_pumps(&self) -> Runtime {
             let mut bridge = self.bridge().await;
             let udp = &bridge.listen_port.0;
@@ -2753,7 +2747,6 @@ destination: 172.18.0.0
         assert_eq!(engine.asked_for(), [] as [&str; 0]);
     }
 
-    /// What this thread logs at info and above while a [`Capture`] lives.
     #[derive(Clone, Default)]
     struct Logged(Shared<Vec<u8>>);
 
@@ -2791,7 +2784,6 @@ destination: 172.18.0.0
             (logged, capture)
         }
 
-        /// Takes the warnings that were logged since the last call.
         fn warnings(&self) -> Vec<String> {
             let bytes = std::mem::take(&mut *self.0.lock().unwrap());
             let text = String::from_utf8(bytes).unwrap();
@@ -2805,12 +2797,11 @@ destination: 172.18.0.0
     #[cfg(target_os = "macos")]
     #[test]
     fn a_route_that_fails_is_a_warning_only_while_the_bridge_holds_its_utun() {
-        // No interface has this name, so no route command for it succeeds.
-        let utun = "utun-of-no-bridge";
-        let pass = [RouteCommand::add("192.0.2.0/24", utun)];
+        let no_such_interface = "utun-of-no-bridge";
+        let pass = [RouteCommand::add("192.0.2.0/24", no_such_interface)];
         let (logged, _capture) = Logged::capture();
 
-        remember_own_utun(utun);
+        remember_own_utun(no_such_interface);
         reconcile_routes(&pass);
         let warnings = logged.warnings();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
@@ -2819,7 +2810,7 @@ destination: 172.18.0.0
             "{warnings:?}"
         );
 
-        forget_own_utun(utun);
+        forget_own_utun(no_such_interface);
         reconcile_routes(&pass);
         assert_eq!(logged.warnings(), [] as [&str; 0]);
     }
@@ -2846,7 +2837,6 @@ destination: 172.18.0.0
     #[tokio::test]
     async fn a_shutdown_for_a_disable_says_whether_a_later_cleanup_has_anything_left_to_try() {
         let forwarder = dns_forwarder_args(&tlds(&["test"]));
-        // the removal that fails, and how → how the shutdown ends
         let cases = [
             (None, Cleanup::Complete),
             (Some((NETWORK_INSPECT, IN_USE)), Cleanup::Complete),

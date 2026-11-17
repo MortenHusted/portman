@@ -97,8 +97,6 @@ fn docker_line(docker: Option<&portman_protocol::DockerStatus>) -> Option<String
     docker.map(|docker| format!("docker:          {}", docker.summary()))
 }
 
-/// The `netbridge` line of `portman status`. A bridge whose last start
-/// failed also says when the daemon starts it again.
 #[cfg(any(target_os = "macos", test))]
 fn netbridge_line(phase: portman_protocol::BridgePhase, retry_in_secs: Option<u64>) -> String {
     format!("netbridge:       {}", phase.status_words(retry_in_secs))

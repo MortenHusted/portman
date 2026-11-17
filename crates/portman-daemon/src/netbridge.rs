@@ -33,12 +33,13 @@
 //!     stays owed until a cleanup has done it: with no session it waits for
 //!     one, and a cleanup that was skipped or that failed is tried again on
 //!     the next session. The stop of a bridge that the user turned off is
-//!     such a cleanup, so no second one follows it on its session. A network that the engine refuses to remove
-//!     because it is in use is not owed. It stays until the next `Disable`,
-//!     so that no later session removes it under containers that have
-//!     stopped. The debt is not saved, so a daemon restart ends it. Each
-//!     removal needs the UDP port that a bridge listens on, so that it
-//!     cannot take what another daemon's bridge runs on.
+//!     such a cleanup, so no second one follows it on its session. A
+//!     network that the engine refuses to remove because it is in use is
+//!     not owed. It stays until the next `Disable`, so that no later
+//!     session removes it under containers that have stopped. The debt is
+//!     not saved, so a daemon restart ends it. Each removal needs the UDP
+//!     port that a bridge listens on, so that it cannot take what another
+//!     daemon's bridge runs on.
 //!   - a failed start is retried with a growing delay. The wait does not
 //!     hold up control messages, and a new session starts the delay over.
 //!   - a bridge that is up gets the DNS forwarder in the VM: the loop makes
@@ -337,7 +338,6 @@ fn reported_mode(intent: &NetbridgeState, running: Option<Built>) -> NetbridgeMo
 struct Attempts {
     host_kp: Keypair,
     failures: u32,
-    /// When the next attempt is due, while a failed one waits for it.
     retry_at: Option<Instant>,
 }
 
@@ -704,7 +704,7 @@ async fn next_wake(
 /// doing. The ifindex goes first, so that a reader woken by `Up` finds it
 /// set. The mode goes last, so that a reader that takes the mode first and
 /// the phase second never gets a new mode with a phase that is older than
-/// it. `retry_at` is when a start that failed runs again.
+/// it.
 async fn publish(
     handle: &Handle,
     phase_tx: &watch::Sender<BridgePhase>,
@@ -1268,10 +1268,7 @@ mod tests {
         forwards: mpsc::UnboundedSender<Forwarding>,
         /// How the next ensure ends.
         ensure: Arc<Mutex<Ensure>>,
-        /// Whether a bridge holds the listen port. A start fails while one
-        /// does.
         port_held: Arc<AtomicBool>,
-        /// How the removals of a stop for a disable end.
         cleanups_end: Arc<Mutex<Cleanup>>,
     }
 
@@ -2051,9 +2048,8 @@ mod tests {
         rig.engine_runs(None);
         rig.engine_session(S2);
         rig.reaches(BridgePhase::Up { epoch: 2 }).await;
-        // The engine restarts once more. The link stays on a session that
-        // ended until the next one opens, so the loop sees session 3 follow
-        // session 2.
+        // The link stays on a session that ended until the next one opens,
+        // so the loop sees session 3 follow session 2.
         rig.engine_runs(None);
         let reopened = Instant::now();
         rig.engine_session(Some(Session(3)));
