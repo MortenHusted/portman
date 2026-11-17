@@ -14,7 +14,7 @@ const LABEL_MODE: &str = "dev.portman.mode";
 const LABEL_PROJECT: &str = "dev.portman.project";
 
 /// The one network whose addresses portman's own bridge always routes.
-const PORTMAN_NETWORK: &str = "portman";
+pub(crate) const PORTMAN_NETWORK: &str = "portman";
 
 /// A running container that carries `dev.portman.host`, parsed once from the
 /// Docker list response.

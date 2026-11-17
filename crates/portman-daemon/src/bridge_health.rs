@@ -10,6 +10,13 @@
 //!   3. Reduce to a single [`BridgeAssessment`] and publish it to the
 //!      [`Shared`] lock that the IPC Status handler reads.
 //!
+//! The check does not know the netbridge mode, and it reports
+//! `routes_missing` in `opt-in` mode for a labelled container that is not on
+//! the `portman` network. That report is true: `opt-in` routes the `portman`
+//! network only, the registry holds the container's address on another
+//! network, and the host has no route to that address. The container joins
+//! `portman`, or the mode becomes `docker`, to end it.
+//!
 //! This is the first daemon-side consumer of the Phase-A primitives. It
 //! deliberately doesn't depend on the Phase-A example code in
 //! `portman-netbridge`; those examples exist to prototype shapes before
@@ -27,6 +34,7 @@ use bollard::query_parameters::{ListContainersOptionsBuilder, ListNetworksOption
 use bollard::Docker;
 use tracing::{debug, warn};
 
+use crate::discovery::PORTMAN_NETWORK;
 use crate::engine::Engine;
 
 /// How often to re-assess. 5s matches the menubar's own refresh cadence;
@@ -158,8 +166,11 @@ async fn subnets_with_portman_containers(docker: &Docker) -> anyhow::Result<BTre
     Ok(out)
 }
 
-/// The names of the networks that the Portman-labelled containers of
-/// `containers` are attached to.
+/// The names of the networks through which the host reaches the
+/// Portman-labelled containers of `containers`. A container on the `portman`
+/// network counts through that network only: the registry routes it to its
+/// address there, and the bridge routes that network in every mode. Any
+/// other labelled container counts through every network it is on.
 fn networks_in_use(containers: &[ContainerSummary]) -> BTreeSet<String> {
     let mut networks_in_use: BTreeSet<String> = BTreeSet::new();
     for c in containers {
@@ -171,6 +182,10 @@ fn networks_in_use(containers: &[ContainerSummary]) -> BTreeSet<String> {
             .as_ref()
             .and_then(|s| s.networks.as_ref())
         {
+            if nets.contains_key(PORTMAN_NETWORK) {
+                networks_in_use.insert(PORTMAN_NETWORK.to_string());
+                continue;
+            }
             for name in nets.keys() {
                 // Skip virtual networks that don't have routed subnets.
                 if matches!(name.as_str(), "host" | "none") {
