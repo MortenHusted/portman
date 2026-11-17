@@ -399,4 +399,31 @@ mod tests {
         clock.roll_wall_back_to(START + 10);
         assert!(!store.permits("qwen.localhost", "route-v1", &headers()));
     }
+    struct ClockThatTicksAfterEachWallReading {
+        started: Instant,
+        secs: AtomicU64,
+        ticking: AtomicBool,
+    }
+    impl Clock for ClockThatTicksAfterEachWallReading {
+        fn unix_secs(&self) -> u64 {
+            let tick = u64::from(self.ticking.load(Ordering::Relaxed));
+            START + self.secs.fetch_add(tick, Ordering::Relaxed)
+        }
+        fn monotonic(&self) -> Instant {
+            self.started + Duration::from_secs(self.secs.load(Ordering::Relaxed))
+        }
+    }
+    #[test]
+    fn second_that_passes_between_the_two_clock_readings_is_not_a_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(ClockThatTicksAfterEachWallReading {
+            started: Instant::now(),
+            secs: AtomicU64::new(0),
+            ticking: AtomicBool::new(false),
+        });
+        let store = GrantStore::with_clock(dir.path().join("grants.json"), clock.clone());
+        clock.ticking.store(true, Ordering::Relaxed);
+        issue(&store, "run-1", START + 3600).unwrap();
+        assert!(store.permits("qwen.localhost", "route-v1", &headers()));
+    }
 }
