@@ -204,8 +204,9 @@ pub enum BridgeCleanup {
         #[serde(default)]
         within_secs: u64,
     },
-    /// A removal failed, and the daemon log says why. The daemon tries
-    /// again when it next connects to an engine.
+    /// The setup container, the DNS forwarder or the docker network was not
+    /// removed, and the daemon log says which one stays and why. The daemon
+    /// tries again when it next connects to an engine.
     Failed,
     /// Another process held the UDP port of the bridge, and can run a
     /// bridge on them. The daemon removed nothing and does not try again
@@ -233,7 +234,7 @@ impl BridgeCleanup {
                 "portman could not remove {leftovers}: the container engine gave no answer within {within_secs} s. {again}"
             ),
             BridgeCleanup::Failed => format!(
-                "portman could not remove {leftovers}: a removal failed, and the daemon log says why. {again}"
+                "portman could not remove everything that the bridge left in Docker: the daemon log says what stays and why. {again}"
             ),
             BridgeCleanup::PortTaken => format!(
                 "portman has not removed {leftovers}: another program holds the UDP port of the bridge and can run a bridge on them. It does not try again until the next `portman bridge disable`"
