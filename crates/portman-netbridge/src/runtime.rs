@@ -1877,7 +1877,7 @@ fn while_bridge_holds<T>(utun: &str, command: impl FnOnce() -> T) -> Result<T, R
 
 fn ensure_route_command(route: &RunRoute, cmd: &RouteCommand) -> Result<(), RouteError> {
     if cmd.verb == "add" {
-        if let Some(existing) = specific_route_utun_interface(route, &cmd.iface, &cmd.cidr)? {
+        if let Some(existing) = exact_route_utun_interface(route, &cmd.iface, &cmd.cidr)? {
             match classify_existing_route(&cmd.cidr, &existing, &cmd.iface) {
                 ExistingRoute::Correct => return Ok(()),
                 // The dedicated subnet belongs to this runtime even if its
@@ -1912,7 +1912,7 @@ fn ensure_route_command(route: &RunRoute, cmd: &RouteCommand) -> Result<(), Rout
 
     match run_route(route, cmd.verb, &cmd.cidr, &cmd.iface) {
         Err(RouteError::Failed(err)) if cmd.verb == "add" => {
-            match specific_route_utun_interface(route, &cmd.iface, &cmd.cidr)? {
+            match exact_route_utun_interface(route, &cmd.iface, &cmd.cidr)? {
                 Some(existing)
                     if classify_existing_route(&cmd.cidr, &existing, &cmd.iface)
                         != ExistingRoute::Repair =>
@@ -2004,9 +2004,12 @@ fn route_result(verb: &str, output: std::io::Result<Output>) -> Result<()> {
     Ok(())
 }
 
-/// The utun of the specific route to `cidr`, asked for while the bridge
-/// holds `iface`.
-fn specific_route_utun_interface(
+/// Asks while the bridge holds `iface`. `-net` with the prefix length makes
+/// the kernel look for that prefix alone. A route to a wider prefix that
+/// covers the subnet, such as the one of a VPN, does not answer for it. The
+/// kernel answers with the default route when the subnet has no route of
+/// its own, and the `destination:` line tells the two answers apart.
+fn exact_route_utun_interface(
     route: &RunRoute,
     iface: &str,
     cidr: &str,
@@ -2014,17 +2017,17 @@ fn specific_route_utun_interface(
     let Some(addr) = cidr.split('/').next() else {
         return Ok(None);
     };
-    let Ok(output) = while_bridge_holds(iface, || route(&["-n", "get", addr]))? else {
+    let Ok(output) = while_bridge_holds(iface, || route(&["-n", "get", "-net", cidr]))? else {
         return Ok(None);
     };
     if !output.status.success() {
         return Ok(None);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(route_get_specific_utun_interface(&stdout, addr))
+    Ok(route_get_exact_utun_interface(&stdout, addr))
 }
 
-fn route_get_specific_utun_interface(stdout: &str, addr: &str) -> Option<String> {
+fn route_get_exact_utun_interface(stdout: &str, addr: &str) -> Option<String> {
     let mut destination_matches = false;
     let mut interface = None;
     for line in stdout.lines() {
@@ -2147,15 +2150,15 @@ destination: default
 ";
 
         assert_eq!(
-            route_get_specific_utun_interface(routed, "172.18.0.0"),
+            route_get_exact_utun_interface(routed, "172.18.0.0"),
             Some("utun0".to_string())
         );
         assert_eq!(
-            route_get_specific_utun_interface(default_route, "172.19.0.0"),
+            route_get_exact_utun_interface(default_route, "172.19.0.0"),
             None
         );
         assert_eq!(
-            route_get_specific_utun_interface(utun_default, "172.19.0.0"),
+            route_get_exact_utun_interface(utun_default, "172.19.0.0"),
             None
         );
     }
@@ -2169,10 +2172,7 @@ destination: 172.18.0.0
   interface: en0
 ";
 
-        assert_eq!(
-            route_get_specific_utun_interface(routed, "172.18.0.0"),
-            None
-        );
+        assert_eq!(route_get_exact_utun_interface(routed, "172.18.0.0"), None);
     }
 
     #[test]
@@ -3616,9 +3616,9 @@ destination: 172.18.0.0
         assert_eq!(
             ran.take(),
             [
-                "-n get 192.0.2.0",
+                "-n get -net 192.0.2.0/24",
                 "-n add -net 192.0.2.0/24 -interface utun-let-go-before-the-pass",
-                "-n get 198.51.100.0",
+                "-n get -net 198.51.100.0/24",
                 "-n add -net 198.51.100.0/24 -interface utun-let-go-before-the-pass",
             ]
         );
@@ -3632,6 +3632,58 @@ destination: 172.18.0.0
         assert!(
             said[0].contains(" INFO ") && said[0].ends_with(ended),
             "{said:?}"
+        );
+    }
+
+    fn route_printed(stdout: &str) -> std::io::Result<std::process::Output> {
+        let mut printed = route_ended(0, "")?;
+        printed.stdout = stdout.into();
+        Ok(printed)
+    }
+
+    #[test]
+    fn a_route_pass_adds_a_route_only_to_a_subnet_that_has_none_of_its_own() {
+        let utun = "utun-with-a-route-to-a-slash-20";
+        let its_own_route = format!(
+            "\
+   route to: 192.168.16.0
+destination: 192.168.16.0
+       mask: 255.255.240.0
+  interface: {utun}
+"
+        );
+        let default_route = "\
+   route to: 192.168.32.0
+destination: default
+       mask: default
+    gateway: 192.0.2.1
+  interface: en0
+";
+        let ran = std::cell::RefCell::new(Vec::new());
+        let table_with_the_slash_20_route_and_a_default_route = |args: &[&str]| {
+            ran.borrow_mut().push(args.join(" "));
+            match args {
+                ["-n", "get", "-net", "192.168.16.0/20"] => route_printed(&its_own_route),
+                ["-n", "get", ..] => route_printed(default_route),
+                _ => route_ended(0, ""),
+            }
+        };
+        let pass = [
+            RouteCommand::add("192.168.16.0/20", utun),
+            RouteCommand::add("192.168.32.0/20", utun),
+        ];
+
+        remember_own_utun(utun);
+        reconcile_routes(&table_with_the_slash_20_route_and_a_default_route, &pass);
+        forget_own_utun(utun);
+
+        assert_eq!(
+            ran.take(),
+            [
+                "-n get -net 192.168.16.0/20",
+                "-n get -net 192.168.32.0/20",
+                "-n add -net 192.168.32.0/20 -interface utun-with-a-route-to-a-slash-20",
+            ]
         );
     }
 

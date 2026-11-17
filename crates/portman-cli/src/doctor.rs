@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
 
+use portman_core::route_query::carrying_route_query;
 use portman_protocol::{
     BridgeAssessment, BridgePhase, DockerState, DockerStatus, Entry, Mode, NetbridgeMode, Response,
 };
@@ -1130,9 +1131,8 @@ fn hosts_by_network(containers: &[LabelledContainer]) -> BTreeMap<String, Vec<St
 }
 
 fn route_interface_for_cidr(cidr: &str) -> Option<String> {
-    let addr = cidr.split('/').next()?;
     let output = StdCommand::new("/sbin/route")
-        .args(["-n", "get", addr])
+        .args(carrying_route_query(cidr))
         .output()
         .ok()?;
     if !output.status.success() {
