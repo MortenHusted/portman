@@ -431,6 +431,16 @@ impl InterruptedServices {
         report
     }
 
+    pub(crate) fn say_how_to_start(&self) {
+        for line in self.start_lines() {
+            eprintln!("{line}");
+        }
+    }
+
+    fn start_lines(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     fn names(&self) -> Vec<String> {
         self.0.iter().map(|service| service.name.clone()).collect()
     }
@@ -1164,6 +1174,28 @@ mod tests {
         assert_eq!(
             line(r#"{"kind":"status","version":"0.1.5","bridge_enabled":true}"#),
             "netbridge:       up"
+        );
+    }
+
+    #[test]
+    fn an_install_that_cannot_start_the_daemon_gives_the_command_for_each_service() {
+        let no_root = UpService {
+            name: "jobs".into(),
+            root: None,
+        };
+
+        assert_eq!(
+            InterruptedServices(vec![up("web"), no_root]).start_lines(),
+            [
+                "the daemon did not start, so these services stay down. \
+                 When the daemon runs again, start each one:",
+                "  `portman up web` in /Users/dev/acme/web",
+                "  `portman up jobs` in its repository",
+            ]
+        );
+        assert_eq!(
+            InterruptedServices(Vec::new()).start_lines(),
+            Vec::<String>::new()
         );
     }
 

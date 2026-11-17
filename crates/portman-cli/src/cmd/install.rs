@@ -114,7 +114,8 @@ pub(crate) async fn cmd_install_macos() -> Result<()> {
     // this wait existed. The sweep above can't help: killing the root-owned
     // daemon by pid has no safe passwordless sudoers form.
     wait_for_old_daemon_exit();
-    run_sudo(&["launchctl", "bootstrap", "system", DAEMON_PLIST_PATH])?;
+    run_sudo(&["launchctl", "bootstrap", "system", DAEMON_PLIST_PATH])
+        .inspect_err(|_| interrupted.say_how_to_start())?;
     interrupted.restore().await;
 
     print_install_success(&log_dir);
@@ -145,7 +146,8 @@ pub(crate) async fn cmd_install_linux() -> Result<()> {
     run_sudo(&["systemctl", "enable", "--now", "portman-daemon"])?;
     // `enable --now` is a no-op when the unit is already active — an
     // upgrade must actually swap onto the new binary.
-    run_sudo(&["systemctl", "restart", "portman-daemon"])?;
+    run_sudo(&["systemctl", "restart", "portman-daemon"])
+        .inspect_err(|_| interrupted.say_how_to_start())?;
     interrupted.restore().await;
 
     print_install_success(log_dir);
