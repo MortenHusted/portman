@@ -997,7 +997,8 @@ mod tests {
             bridge_leftover_lines(&BridgeLeftovers::Owed { socket }),
             [
                 "bridge: Docker at /run/demo/docker.sock may still hold the dns forwarder. \
-                 Another process holds the bridge's UDP port, or Docker refused a removal",
+                 Another process holds the bridge's UDP port, or Docker refused a removal or \
+                 gave no answer",
                 "bridge: to remove the forwarder and its network by hand, run:",
                 by_hand[0],
                 by_hand[1],
