@@ -68,33 +68,21 @@ impl DaemonSnapshot {
             },
         }
     }
-}
 
-impl DaemonSnapshot {
-    /// A bridge that is up beside a health that is not `healthy` can be a
-    /// health from before that bridge. A daemon up to 0.1.7 assesses on its
-    /// period only, and a later one needs the time of one assessment after
-    /// the bridge comes up.
+    /// A daemon up to 0.1.7 assesses on its period only, and a later one
+    /// needs the time of one assessment after the bridge comes up.
     fn health_can_be_behind_the_bridge(&self) -> bool {
         self.bridge_phase == Some(BridgePhase::Up)
             && self.bridge_assessment != Some(BridgeAssessment::Healthy)
     }
 }
 
-/// How long doctor reads the status again while
-/// [`DaemonSnapshot::health_can_be_behind_the_bridge`]. One period brings an
-/// assessment from after the first read, and the margin is for the time
-/// that the assessment takes, which was 6 to 22 ms on a dev rig with one
-/// labelled network.
+/// One period brings an assessment from after the first read. The second
+/// on top is for the time that an assessment takes, which was 6 to 22 ms on
+/// a dev rig with one labelled network.
 const HEALTH_BOUND: Duration = BridgeAssessment::PERIOD.saturating_add(Duration::from_secs(1));
 const HEALTH_PAUSE: Duration = Duration::from_millis(100);
 
-/// The status that doctor gives its verdict on. `read` asks the daemon for
-/// its status, and gives `None` for a daemon that did not answer. Doctor
-/// reads again while the health can be behind the bridge, for at most
-/// [`HEALTH_BOUND`], and takes the last reading. So a bridge whose health
-/// stays as it is costs that wait, and doctor's verdict is not from before
-/// the bridge.
 pub(crate) async fn settled_daemon<F>(mut read: impl FnMut() -> F) -> DaemonSnapshot
 where
     F: Future<Output = Option<Response>>,
@@ -737,9 +725,7 @@ pub(crate) fn render_report(report: &DoctorReport) -> String {
 }
 
 /// `portman bridge enable` helps only a bridge that is off. For a bridge
-/// that is enabled and not up, it restarts the retry delay and waits. A
-/// bridge that is up in `docker` mode is where both commands lead, so the
-/// advice for it is what the health found.
+/// that is enabled and not up, it restarts the retry delay and waits.
 fn bridge_guidance(daemon: &DaemonSnapshot) -> &'static [&'static str] {
     match (daemon.bridge_phase, daemon.bridge_mode) {
         (Some(BridgePhase::Up), Some(NetbridgeMode::Docker)) => {
@@ -749,10 +735,6 @@ fn bridge_guidance(daemon: &DaemonSnapshot) -> &'static [&'static str] {
     }
 }
 
-/// For a bridge that is up in `docker` mode. That bridge adds a missing
-/// route within seconds and leaves one that another live `utun` holds, so a
-/// route that stays missing is one that the bridge does not own or does not
-/// make.
 fn health_guidance(health: BridgeAssessment) -> &'static [&'static str] {
     const LOOK_AT: &str =
         "`portman bridge status` names each labelled network and the interface of its route";
@@ -1311,7 +1293,6 @@ mod tests {
     fn doctor_names_what_the_health_found_for_a_bridge_that_is_up_in_docker_mode() {
         use BridgeAssessment::{Offline, RoutesMissing, TunnelDead, Unknown};
         let status = "`portman bridge status` names each labelled network";
-        // health → what the guidance names
         let table = [
             (RoutesMissing, "has no route through the bridge"),
             (RoutesMissing, status),
@@ -1380,8 +1361,6 @@ mod tests {
         }
     }
 
-    /// Answers each status read with the next of `healths`, and with the
-    /// last one from then on. `None` is a daemon that does not answer.
     fn daemon_that_reports(
         phase: &'static str,
         healths: &[Option<&'static str>],
@@ -1454,7 +1433,6 @@ mod tests {
     async fn doctor_reads_the_status_once_where_the_health_is_not_behind_an_up_bridge() {
         use BridgeAssessment::{Healthy, RoutesMissing};
         let turns_healthy = [Some("routes_missing"), Some("healthy")];
-        // (the phase, the healths that the daemon reports in turn) → the health doctor takes
         let table = [
             (
                 "up",

@@ -109,9 +109,9 @@ pub enum BridgeAssessment {
 }
 
 impl BridgeAssessment {
-    /// The daemon assesses the bridge at least this often. A client that
-    /// reads the status for one period after a change of the routes has
-    /// read an assessment from after that change.
+    /// The daemon starts an assessment at least this often. So the health
+    /// in a status is from before a change of the routes for at most one
+    /// period and the time that an assessment takes.
     pub const PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
     pub fn as_str(self) -> &'static str {

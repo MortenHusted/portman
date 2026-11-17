@@ -60,8 +60,6 @@ pub(crate) async fn run(
     bridge_ifindex: crate::upstream::BridgeIfIndex,
     mut phase: watch::Receiver<BridgePhase>,
 ) -> anyhow::Result<()> {
-    // 5s matches the menubar's own refresh cadence; a bridge flap surfaces
-    // in the UI within the next poll cycle.
     let mut ticker = tokio::time::interval(BridgeAssessment::PERIOD);
     let mut link = engine.watch();
     // First tick fires immediately, which is what we want — establish an
@@ -69,10 +67,8 @@ pub(crate) async fn run(
     // "unknown" for 5s. A change of the engine link is assessed at once, so
     // that the assessment does not stay `offline` for a period after the
     // engine connects. So is each phase that the netbridge task publishes,
-    // because a bridge that comes up or goes away changes the routes, and a
-    // status that says `up` beside the health of the routes from before reads
-    // as a fault. A mode change of a running bridge replaces that bridge, so
-    // it shows here as its phases.
+    // because the routes change with the bridge. A mode change replaces a
+    // running bridge, so it arrives here as the phases of both bridges.
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
