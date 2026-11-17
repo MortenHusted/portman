@@ -3929,9 +3929,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_disable_on_an_open_session_is_paid_at_once_also_inside_a_head_start() {
-        let mut rig = Rig::boot_on(Some(OWES_A_CLEANUP));
-        tokio::time::sleep(HEAD_START / 2).await;
+    async fn a_disable_is_paid_at_once_on_a_session_that_has_been_open_for_the_head_start() {
+        let mut rig = Rig::start();
+        let opened = Instant::now();
+        assert_eq!(rig.next_sweep().await, (Session(1), SetupContainer));
+        assert_eq!(opened.elapsed(), HEAD_START);
 
         let disabled = Instant::now();
         rig.send(Control::Disable).await;
@@ -3941,6 +3943,26 @@ mod tests {
             (Session(1), SetupContainerAndNetwork)
         );
         assert_eq!(disabled.elapsed(), Duration::ZERO);
+        rig.no_sweep_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_on_a_younger_session_is_taken_at_once_and_paid_when_the_head_start_is_over()
+    {
+        let mut rig = Rig::start();
+        let opened = Instant::now();
+        tokio::time::sleep(HEAD_START / 5).await;
+
+        rig.send(Control::Disable).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        assert_eq!(saved_debt(&rig.state_path), true);
+        assert_eq!(
+            rig.next_sweep().await,
+            (Session(1), SetupContainerAndNetwork),
+            "a cleanup before the disable"
+        );
+        assert_eq!(opened.elapsed(), HEAD_START);
         rig.no_sweep_follows().await;
     }
 
@@ -3964,35 +3986,56 @@ mod tests {
     ];
 
     #[tokio::test(start_paused = true)]
-    async fn the_engine_is_asked_nothing_during_the_head_start_and_for_every_leftover_after_it() {
-        let daemon = OnFakeEngine::boot(FREE_PORT, &LEFTOVERS, Some(OWES_A_CLEANUP));
-        let client = Client::of(&daemon.handle);
-        let moment = Duration::from_millis(1);
+    async fn the_engine_is_asked_nothing_during_the_head_start_and_for_what_is_owed_after_it() {
+        use serde_json::json;
+        #[derive(Debug, PartialEq)]
+        enum Owed {
+            ADebtFromBeforeTheBoot,
+            ADisableTwoSecondsIn,
+            TheSetupContainerOnly,
+        }
+        let container = "/containers/portman-netbridge-setup";
+        let everything = vec![container, FORWARDER_BY_ID, NETWORK];
+        let waits = json!({"state": "waits_for_bridges", "for_secs": 10});
+        let (moment, two_seconds) = (Duration::from_millis(1), Duration::from_secs(2));
+        // what the session owes
+        //     → (what status says during the head start, what goes after it)
+        let table = [
+            (
+                Owed::ADebtFromBeforeTheBoot,
+                waits.clone(),
+                everything.clone(),
+            ),
+            (Owed::ADisableTwoSecondsIn, waits, everything),
+            (Owed::TheSetupContainerOnly, json!(null), vec![container]),
+        ];
+        for (owed, says, goes) in table {
+            let saved = (owed == Owed::ADebtFromBeforeTheBoot).then_some(OWES_A_CLEANUP);
+            let daemon = OnFakeEngine::boot(FREE_PORT, &LEFTOVERS, saved);
+            let client = Client::of(&daemon.handle);
+            tokio::time::sleep(two_seconds).await;
+            if owed == Owed::ADisableTwoSecondsIn {
+                client.disable().await;
+            }
 
-        tokio::time::sleep(HEAD_START - moment).await;
+            tokio::time::sleep(HEAD_START - two_seconds - moment).await;
 
-        assert_eq!(daemon.fake.calls(), [] as [&str; 0]);
-        let waits = serde_json::json!({"state": "waits_for_bridges", "for_secs": 10});
-        assert_eq!(client.bridge_cleanup().await, waits);
+            assert_eq!(daemon.fake.calls(), [] as [&str; 0], "{owed:?}");
+            assert_eq!(client.bridge_cleanup().await, says, "{owed:?}");
 
-        tokio::time::sleep(moment * 2).await;
+            tokio::time::sleep(moment * 2).await;
 
-        let calls = daemon.fake.calls();
-        let removed: Vec<_> = calls
-            .iter()
-            .filter_map(|call| call.strip_prefix("DELETE "))
-            .collect();
-        assert_eq!(
-            removed,
-            [
-                "/containers/portman-netbridge-setup",
-                FORWARDER_BY_ID,
-                NETWORK
-            ],
-            "{calls:?}"
-        );
-        assert_eq!(client.bridge_cleanup().await, serde_json::json!(null));
-        assert_eq!(saved_debt(&daemon.state_path), false);
+            let calls = daemon.fake.calls();
+            let removed: Vec<_> = calls
+                .iter()
+                .filter_map(|call| call.strip_prefix("DELETE "))
+                .collect();
+            assert_eq!(removed, goes, "{owed:?} {calls:?}");
+            assert_eq!(client.bridge_cleanup().await, json!(null), "{owed:?}");
+            if owed != Owed::TheSetupContainerOnly {
+                assert_eq!(saved_debt(&daemon.state_path), false, "{owed:?}");
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
