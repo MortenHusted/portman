@@ -269,6 +269,11 @@ enum Recorded {
     NoAnswerInTime,
 }
 
+enum LastPoll {
+    Answered(Vec<ServiceStatusInfo>),
+    Unanswered,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UpService {
     name: String,
@@ -366,7 +371,7 @@ impl InterruptedServices {
                 .all(|name| rows.iter().any(|row| row.name == *name))
         })
         .await;
-        let Some(listed) = listed else {
+        let LastPoll::Answered(listed) = listed else {
             report.fail(self.0, "the new daemon did not answer within 30s");
             return report;
         };
@@ -414,7 +419,7 @@ impl InterruptedServices {
                 .all(start_ended)
         })
         .await;
-        let Some(rows) = rows else {
+        let LastPoll::Answered(rows) = rows else {
             report.unconfirmed = names;
             return report;
         };
@@ -545,7 +550,7 @@ async fn poll_services<F, Fut>(
     send: &mut F,
     limit: Duration,
     done: impl Fn(&[ServiceStatusInfo]) -> bool,
-) -> Option<Vec<ServiceStatusInfo>>
+) -> LastPoll
 where
     F: FnMut(Request) -> Fut,
     Fut: Future<Output = Result<Response>>,
@@ -553,14 +558,15 @@ where
     let deadline = Instant::now() + limit;
     loop {
         let answer = timeout_at(deadline, send(Request::ServiceStatus)).await;
-        let rows = match answer {
-            Ok(Ok(Response::ServiceStatuses { services })) => Some(services),
-            _ => None,
+        let last = match answer {
+            Ok(Ok(Response::ServiceStatuses { services })) => LastPoll::Answered(services),
+            _ => LastPoll::Unanswered,
         };
+        let finished = matches!(&last, LastPoll::Answered(rows) if done(rows));
         let next_request_starts = Instant::now() + POLL_PAUSE;
         let next_request_can_be_answered = next_request_starts + POLL_PAUSE <= deadline;
-        if rows.as_deref().is_some_and(&done) || !next_request_can_be_answered {
-            return rows;
+        if finished || !next_request_can_be_answered {
+            return last;
         }
         sleep(POLL_PAUSE).await;
     }
