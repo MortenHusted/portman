@@ -228,11 +228,22 @@ trait Uninstall {
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SavedBridge {
+    /// Also a bridge that is off while a disable still owes the removal of
+    /// its forwarder.
     On,
     /// Also a file that is absent or cannot be read as JSON.
     Off,
     /// The path of the file could not be built.
     Unknown,
+}
+
+#[cfg(target_os = "macos")]
+fn saved_bridge(saved: &portman_core::netbridge_state::NetbridgeState) -> SavedBridge {
+    if saved.enabled || saved.cleanup_owed {
+        SavedBridge::On
+    } else {
+        SavedBridge::Off
+    }
 }
 
 /// The plist goes before the engine is asked. An uninstall that is
@@ -331,8 +342,7 @@ impl Uninstall for ThisMac {
 
     fn saved_bridge_state(&self) -> SavedBridge {
         match portman_core::paths::netbridge_state_path() {
-            Ok(path) if portman_core::netbridge_state::load(&path).enabled => SavedBridge::On,
-            Ok(_) => SavedBridge::Off,
+            Ok(path) => saved_bridge(&portman_core::netbridge_state::load(&path)),
             Err(_) => SavedBridge::Unknown,
         }
     }
@@ -386,7 +396,7 @@ fn bridge_leftover_lines(leftovers: &BridgeLeftovers) -> Vec<String> {
         BridgeLeftovers::Owed { socket } => [
             vec![
                 format!(
-                    "bridge: Docker at {} may still hold the dns forwarder. Another process holds the bridge's UDP port, or Docker refused a removal",
+                    "bridge: Docker at {} may still hold the dns forwarder. Another process holds the bridge's UDP port, or Docker refused a removal or gave no answer",
                     socket.display()
                 ),
                 "bridge: to remove the forwarder and its network by hand, run:".to_string(),
@@ -942,6 +952,21 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bridge_is_saved_as_off_only_when_no_disable_still_owes_its_removal() {
+        use portman_core::netbridge_state::NetbridgeState;
+        let saved = |enabled, cleanup_owed| NetbridgeState {
+            enabled,
+            cleanup_owed,
+            ..NetbridgeState::default()
+        };
+
+        assert_eq!(saved_bridge(&saved(false, false)), SavedBridge::Off);
+        assert_eq!(saved_bridge(&saved(true, false)), SavedBridge::On);
+        assert_eq!(saved_bridge(&saved(false, true)), SavedBridge::On);
+    }
+
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn an_uninstall_that_finds_no_engine_is_silent_only_for_a_bridge_that_is_saved_as_off() {
         let no_engine = BridgeLeftovers::NoEngine {
@@ -997,7 +1022,8 @@ mod tests {
             bridge_leftover_lines(&BridgeLeftovers::Owed { socket }),
             [
                 "bridge: Docker at /run/demo/docker.sock may still hold the dns forwarder. \
-                 Another process holds the bridge's UDP port, or Docker refused a removal",
+                 Another process holds the bridge's UDP port, or Docker refused a removal or \
+                 gave no answer",
                 "bridge: to remove the forwarder and its network by hand, run:",
                 by_hand[0],
                 by_hand[1],

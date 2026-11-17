@@ -25,6 +25,7 @@
 //! forwarder asks. The daemon keeps those separate.
 
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::process::{Command as StdCommand, Output, Stdio};
@@ -92,6 +93,8 @@ const SETUP_STOP_TIMEOUT_SECS: i32 = 5;
 /// How long to wait for docker to finish removing the setup container before
 /// giving up and saying so.
 const SETUP_REMOVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a new setup container has to print the VM's public key.
+const SETUP_KEY_TIMEOUT: Duration = Duration::from_secs(10);
 const LABEL_HOST: &str = "dev.portman.host";
 const ROUTE_RECONCILE_PERIOD: Duration = Duration::from_secs(5);
 /// A `route` command takes milliseconds. A bridge that ends waits for the
@@ -99,6 +102,45 @@ const ROUTE_RECONCILE_PERIOD: Duration = Duration::from_secs(5);
 const ROUTE_LIMIT: Duration = Duration::from_secs(3);
 /// How long a command that was killed gets to go away.
 const KILL_GRACE: Duration = Duration::from_millis(500);
+/// The waits inside one removal of the setup container: the engine's stop
+/// of it, and the wait until the engine has let go of it.
+const SETUP_REMOVAL_WAITS_SECS: u64 =
+    SETUP_STOP_TIMEOUT_SECS as u64 + SETUP_REMOVE_TIMEOUT.as_secs();
+/// What the requests of one step get on top of the waits inside it. On an
+/// engine that answers they take under a second together.
+const REQUESTS_MARGIN_SECS: u64 = 5;
+
+/// How long the engine has to answer all that a stop, a cleanup of
+/// leftovers or an ensure of the DNS forwarder asks it. The limit of the
+/// caller's client is for one request and ends at the head of the response,
+/// so a VM that froze with its socket open held a step for a multiple of
+/// that limit, or without end once a head was in. Each of these steps
+/// removes the setup container at most once, and the budget is the waits of
+/// that removal and `REQUESTS_MARGIN_SECS`, so that it cuts no step on an
+/// engine that answers.
+pub const ENGINE_STEP_BUDGET: Duration =
+    Duration::from_secs(SETUP_REMOVAL_WAITS_SECS + REQUESTS_MARGIN_SECS);
+
+/// As [`ENGINE_STEP_BUDGET`], for a start. A start removes the setup
+/// container of an earlier bridge, waits `SETUP_KEY_TIMEOUT` for the key
+/// of the new one, and removes that one when no key came. The budget is
+/// those waits and `REQUESTS_MARGIN_SECS`, so that a start that uses up
+/// every wait still ends with its own error and with its setup container
+/// gone.
+pub const ENGINE_START_BUDGET: Duration = Duration::from_secs(
+    2 * SETUP_REMOVAL_WAITS_SECS + SETUP_KEY_TIMEOUT.as_secs() + REQUESTS_MARGIN_SECS,
+);
+
+/// A step that is cut leaves in the engine what it had done by then.
+async fn within<T>(budget: Duration, step: impl Future<Output = T>) -> Result<T> {
+    let cut = tokio::time::timeout(budget, step).await;
+    cut.map_err(|_| {
+        anyhow!(
+            "the container engine gave no answer within {} s",
+            budget.as_secs()
+        )
+    })
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeOptions {
@@ -165,11 +207,22 @@ impl Runtime {
     /// As [`Runtime::start_with_options`], with the host keypair supplied by
     /// the caller. A caller that retries a failed start passes the same
     /// keypair, and the key is then logged once and not for every retry.
+    /// A start that the engine does not answer fails when
+    /// [`ENGINE_START_BUDGET`] is spent. It can leave a setup container,
+    /// which the next start or cleanup removes.
     pub async fn start_with_keypair(
         docker: Docker,
         options: RuntimeOptions,
         host_kp: &Keypair,
     ) -> Result<Self> {
+        within(
+            ENGINE_START_BUDGET,
+            Self::bring_up(docker, options, host_kp),
+        )
+        .await?
+    }
+
+    async fn bring_up(docker: Docker, options: RuntimeOptions, host_kp: &Keypair) -> Result<Self> {
         let host_pub = host_kp.public_base64();
         if is_new_host_key(&host_pub) {
             info!(
@@ -284,11 +337,16 @@ impl Runtime {
     /// because a new one would end the same way. A container of that name
     /// without portman's labels is an error and stays as it is. The bridge
     /// holds the listen port, so no other daemon has a bridge up whose
-    /// forwarder this could replace.
+    /// forwarder this could replace. An ensure that the engine does not
+    /// answer fails when [`ENGINE_STEP_BUDGET`] is spent.
     pub async fn ensure_dns_forwarder(
         &self,
         managed_tlds: &BTreeSet<String>,
     ) -> Result<DnsForwarder> {
+        within(ENGINE_STEP_BUDGET, self.ensure_forwarder(managed_tlds)).await?
+    }
+
+    async fn ensure_forwarder(&self, managed_tlds: &BTreeSet<String>) -> Result<DnsForwarder> {
         let Some(image) = setup_image_with_dns_mode(&self.docker).await? else {
             return Ok(DnsForwarder::ImageWithoutDnsMode);
         };
@@ -316,9 +374,13 @@ impl Runtime {
     /// resolving every name that is not portman's.
     /// `portman bridge disable` (user intent) still wants the network
     /// gone; call [`Runtime::shutdown_and_remove_network`] for that.
+    /// The engine has [`ENGINE_STEP_BUDGET`] to remove the setup container.
+    /// On an engine that does not answer in that time the bridge is still
+    /// down when this returns, and the container can still be there.
     pub async fn shutdown(mut self) {
         self.end_tasks().await;
-        best_effort_remove_setup_container(&self.docker, &self.listen_port).await;
+        let container = Leftovers::SetupContainer;
+        remove_with_port_held(&self.docker, &self.listen_port, container).await;
         info!(utun = %self.utun_name, "netbridge shut down (network retained)");
     }
 
@@ -329,8 +391,9 @@ impl Runtime {
     /// only while a running container is attached, and that is logged. A
     /// stopped container that refers to the network fails to start
     /// afterwards. The return value says whether a later cleanup has
-    /// anything left to try, as [`remove_leftovers`] does.
-    pub async fn shutdown_and_remove_network(mut self) -> Cleanup {
+    /// anything left to try, as [`try_remove_leftovers`] does. The engine
+    /// has [`ENGINE_STEP_BUDGET`] for all of it.
+    pub async fn shutdown_and_remove_network(mut self) -> CleanupEnd {
         self.end_tasks().await;
         let everything = Leftovers::SetupContainerAndNetwork;
         let cleanup = remove_with_port_held(&self.docker, &self.listen_port, everything).await;
@@ -714,7 +777,7 @@ async fn spawn_setup_container(
     }
     // Poll until the setup container is running and has printed `VM_PUBKEY=`,
     // instead of a fixed 2s sleep that slows normal starts and fails under load.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + SETUP_KEY_TIMEOUT;
     loop {
         if let Err(err) = ensure_setup_container_running(docker).await {
             best_effort_remove_setup_container(docker, held).await;
@@ -891,12 +954,12 @@ async fn remove_existing_setup_container(docker: &Docker, _held: &ListenPort) ->
 /// Poll until the setup container no longer exists. Bounded: if docker is wedged
 /// we want a named error, not a hung daemon start.
 async fn wait_for_setup_container_gone(docker: &Docker) -> Result<()> {
-    let deadline = std::time::Instant::now() + SETUP_REMOVE_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + SETUP_REMOVE_TIMEOUT;
     loop {
         if setup_container_snapshot(docker).await?.is_none() {
             return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "netbridge setup container `{SETUP_CONTAINER}` still present {}s after removal",
                 SETUP_REMOVE_TIMEOUT.as_secs()
@@ -937,7 +1000,7 @@ async fn best_effort_remove_setup_container(docker: &Docker, held: &ListenPort) 
         Err(err) => {
             warn!(
                 container = SETUP_CONTAINER,
-                error = %err,
+                error = %format_args!("{err:#}"),
                 "could not remove netbridge setup container"
             );
             false
@@ -1280,7 +1343,7 @@ async fn best_effort_remove_dns_forwarder(docker: &Docker, held: &ListenPort) ->
         Err(err) => {
             warn!(
                 container = DNS_CONTAINER,
-                error = %err,
+                error = %format_args!("{err:#}"),
                 "could not remove the dns forwarder container"
             );
             false
@@ -1316,6 +1379,29 @@ pub enum Cleanup {
     Owed,
 }
 
+/// How a cleanup of [`Leftovers`] ended, for a caller that acts on why one
+/// did not finish. [`Cleanup`] folds the two reasons into `Owed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupEnd {
+    /// As [`Cleanup::Complete`].
+    Complete,
+    /// A removal failed for a reason that says nothing about what it was to
+    /// remove. What was asked for can still be in the engine.
+    Failed,
+    /// The engine gave no answer within [`ENGINE_STEP_BUDGET`]. What was
+    /// asked for can still be in the engine.
+    NoAnswer,
+}
+
+impl From<CleanupEnd> for Cleanup {
+    fn from(end: CleanupEnd) -> Self {
+        match end {
+            CleanupEnd::Complete => Cleanup::Complete,
+            CleanupEnd::Failed | CleanupEnd::NoAnswer => Cleanup::Owed,
+        }
+    }
+}
+
 /// Removes `leftovers` from the engine. Each is removed only when it carries
 /// portman's labels, and one that is absent is passed over. The engine
 /// refuses to remove the network only while a running container is attached
@@ -1324,28 +1410,67 @@ pub enum Cleanup {
 /// The labels name portman and not one daemon, so the removal also needs
 /// UDP port `listen_port`. Pass [`HOST_WG_LISTEN_PORT`], the one that every
 /// bridge listens on: holding any other port shows nothing about a running
-/// bridge. When the port is taken, nothing is removed and the engine is not
-/// asked.
+/// bridge. When the claim on the port fails, nothing is removed and the
+/// engine is not asked.
+///
+/// The engine has [`ENGINE_STEP_BUDGET`] for all the removals. A cleanup
+/// that is cut there ends owed.
 pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Leftovers) -> Cleanup {
-    let held = match ListenPort::claim(listen_port).await {
-        Ok(held) => held,
+    match try_remove_leftovers(docker, listen_port, leftovers).await {
+        Ok(end) => end.into(),
         Err(err) => {
-            info!(
-                listen_port,
-                %err,
-                "netbridge leftovers stay in the engine: the listen port is taken, and its holder may run a bridge on them"
-            );
-            return Cleanup::Owed;
+            say_why_leftovers_stay(listen_port, &err);
+            Cleanup::Owed
         }
-    };
-    remove_with_port_held(docker, &held, leftovers).await
+    }
+}
+
+/// Only an address in use says that the port has a holder.
+fn say_why_leftovers_stay(listen_port: u16, err: &std::io::Error) {
+    if err.kind() == std::io::ErrorKind::AddrInUse {
+        info!(
+            listen_port,
+            %err,
+            "netbridge leftovers stay in the engine: the listen port is taken, and its holder may run a bridge on them"
+        );
+    } else {
+        warn!(
+            listen_port,
+            %err,
+            "netbridge leftovers stay in the engine: the claim on the listen port failed"
+        );
+    }
+}
+
+/// As [`remove_leftovers`], for a caller that acts on why a cleanup did not
+/// finish. The error is that of the claim on `listen_port`: nothing was
+/// removed and the engine was not asked. Only an address in use says that
+/// the port is taken. This function does not log the error.
+pub async fn try_remove_leftovers(
+    docker: &Docker,
+    listen_port: u16,
+    leftovers: Leftovers,
+) -> std::io::Result<CleanupEnd> {
+    let held = ListenPort::claim(listen_port).await?;
+    Ok(remove_with_port_held(docker, &held, leftovers).await)
 }
 
 async fn remove_with_port_held(
     docker: &Docker,
     held: &ListenPort,
     leftovers: Leftovers,
-) -> Cleanup {
+) -> CleanupEnd {
+    let removals = remove_each(docker, held, leftovers);
+    within(ENGINE_STEP_BUDGET, removals).await.unwrap_or_else(|error| {
+        warn!(
+            %error,
+            "netbridge cleanup ended early, and what it was to remove can still be in the engine"
+        );
+        CleanupEnd::NoAnswer
+    })
+}
+
+async fn remove_each(docker: &Docker, held: &ListenPort, leftovers: Leftovers) -> CleanupEnd {
     let container_gone = best_effort_remove_setup_container(docker, held).await;
     let (forwarder_gone, network) = match leftovers {
         Leftovers::SetupContainer => (true, None),
@@ -1356,10 +1481,10 @@ async fn remove_with_port_held(
         }
     };
     match network {
-        Some(NetworkCleanup::InUse) => Cleanup::Complete,
-        _ if !forwarder_gone => Cleanup::Owed,
-        None | Some(NetworkCleanup::NoneLeft) if container_gone => Cleanup::Complete,
-        None | Some(NetworkCleanup::NoneLeft | NetworkCleanup::Owed) => Cleanup::Owed,
+        Some(NetworkCleanup::InUse) => CleanupEnd::Complete,
+        _ if !forwarder_gone => CleanupEnd::Failed,
+        None | Some(NetworkCleanup::NoneLeft) if container_gone => CleanupEnd::Complete,
+        None | Some(NetworkCleanup::NoneLeft | NetworkCleanup::Owed) => CleanupEnd::Failed,
     }
 }
 
@@ -2575,6 +2700,9 @@ destination: 172.18.0.0
         /// its body.
         requests: Shared<Vec<(String, String)>>,
         refusals: Shared<HashMap<String, Refusal>>,
+        /// While true, the engine takes each connection and answers
+        /// nothing on it, as a VM does that froze with its socket open.
+        frozen: Shared<bool>,
     }
 
     type Refusal = (&'static str, &'static str);
@@ -2610,9 +2738,16 @@ destination: 172.18.0.0
             let holds = Shared::<HashMap<String, String>>::default();
             let requests = Shared::<Vec<(String, String)>>::default();
             let refusals = Shared::<HashMap<String, Refusal>>::default();
+            let frozen = Shared::<bool>::default();
             let (held, asked, refused) = (holds.clone(), requests.clone(), refusals.clone());
+            let silent = frozen.clone();
             tokio::spawn(async move {
+                let mut unanswered = Vec::new();
                 while let Ok((stream, _)) = listener.accept().await {
+                    if *silent.lock().unwrap() {
+                        unanswered.push(stream);
+                        continue;
+                    }
                     let (held, asked, refused) = (held.clone(), asked.clone(), refused.clone());
                     tokio::spawn(Self::answer(stream, held, asked, refused));
                 }
@@ -2623,6 +2758,7 @@ destination: 172.18.0.0
                 holds,
                 requests,
                 refusals,
+                frozen,
             };
             engine.hold(IMAGE_INSPECT, IMAGE_WITH_DNS_MODE);
             engine.hold(NETWORK_INSPECT, OWN_NETWORK);
@@ -2635,6 +2771,10 @@ destination: 172.18.0.0
 
         fn refuse_delete(&self, path: &str, refusal: Refusal) {
             self.refusals.lock().unwrap().insert(path.into(), refusal);
+        }
+
+        fn freeze(&self) {
+            *self.frozen.lock().unwrap() = true;
         }
 
         fn requests(&self) -> Vec<(String, String)> {
@@ -3619,7 +3759,7 @@ destination: 172.18.0.0
 
         let cleanup = bridge.shutdown_and_remove_network().await;
 
-        assert_eq!(cleanup, Cleanup::Complete);
+        assert_eq!(cleanup, CleanupEnd::Complete);
         let mut asked = engine.asked_for();
         asked.retain(|asked| asked.ends_with(NETWORK_INSPECT));
         assert_eq!(asked, ["DELETE /networks/portman"]);
@@ -3633,10 +3773,13 @@ destination: 172.18.0.0
         let forwarder = dns_forwarder_args(&tlds(&["test"]));
         // the removal that fails, and how → how the shutdown ends
         let cases = [
-            (None, Cleanup::Complete),
-            (Some((NETWORK_INSPECT, IN_USE)), Cleanup::Complete),
-            (Some((NETWORK_INSPECT, ENGINE_FAILED)), Cleanup::Owed),
-            (Some(("/containers/dddd2222", ENGINE_FAILED)), Cleanup::Owed),
+            (None, CleanupEnd::Complete),
+            (Some((NETWORK_INSPECT, IN_USE)), CleanupEnd::Complete),
+            (Some((NETWORK_INSPECT, ENGINE_FAILED)), CleanupEnd::Failed),
+            (
+                Some(("/containers/dddd2222", ENGINE_FAILED)),
+                CleanupEnd::Failed,
+            ),
         ];
         for (fails, want) in cases {
             let engine = FakeEngine::start().await;
@@ -3649,6 +3792,94 @@ destination: 172.18.0.0
             let cleanup = engine.bridge().await.shutdown_and_remove_network().await;
 
             assert_eq!(cleanup, want, "{fails:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cleanup_on_a_taken_port_stays_owed_and_asks_the_engine_nothing() {
+        let engine = FakeEngine::start().await;
+        engine.hold(SETUP_INSPECT, OWN_SETUP_CONTAINER);
+        let another_daemons_bridge = ListenPort::claim(0).await.unwrap();
+        let taken = another_daemons_bridge.0.local_addr().unwrap().port();
+        let everything = Leftovers::SetupContainerAndNetwork;
+
+        let cleanup = remove_leftovers(&engine.docker, taken, everything).await;
+        assert_eq!(cleanup, Cleanup::Owed);
+        let claim = try_remove_leftovers(&engine.docker, taken, everything).await;
+        assert_eq!(claim.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(engine.asked_for(), [] as [&str; 0]);
+
+        let cleanup = remove_leftovers(&engine.docker, 0, everything).await;
+        assert_eq!(cleanup, Cleanup::Complete);
+    }
+
+    #[test]
+    fn a_cleanup_that_did_not_get_the_port_blames_a_holder_only_for_an_address_in_use() {
+        let (logged, _capture) = Logged::capture();
+
+        let taken = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        say_why_leftovers_stay(HOST_WG_LISTEN_PORT, &taken);
+
+        let lines = logged.take_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("the listen port is taken"), "{lines:?}");
+
+        let out_of_descriptors = std::io::Error::from_raw_os_error(libc::EMFILE);
+        say_why_leftovers_stay(HOST_WG_LISTEN_PORT, &out_of_descriptors);
+
+        let warnings = logged.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("Too many open files"), "{warnings:?}");
+        assert!(!warnings[0].contains("is taken"), "{warnings:?}");
+    }
+
+    /// How long the daemon's client waits for the head of an answer.
+    const DAEMONS_CLIENT_LIMIT: Duration = Duration::from_secs(120);
+
+    #[derive(Debug, Clone, Copy)]
+    enum Step {
+        Stop,
+        StopForADisable,
+        EnsureTheForwarder,
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_step_of_a_bridge_on_an_engine_that_froze_ends_when_its_budget_is_spent() {
+        for step in [Step::Stop, Step::StopForADisable, Step::EnsureTheForwarder] {
+            let engine = FakeEngine::start().await;
+            let mut bridge = engine.bridge().await;
+            bridge.docker = bridge.docker.clone().with_timeout(DAEMONS_CLIENT_LIMIT);
+            engine.freeze();
+
+            let asked = tokio::time::Instant::now();
+            match step {
+                Step::Stop => bridge.shutdown().await,
+                Step::StopForADisable => {
+                    let cleanup = bridge.shutdown_and_remove_network().await;
+                    assert_eq!(cleanup, CleanupEnd::NoAnswer);
+                }
+                Step::EnsureTheForwarder => {
+                    let ensured = bridge.ensure_dns_forwarder(&tlds(&["test"])).await;
+                    let said = format!("{:#}", ensured.unwrap_err());
+                    let no_answer = "the container engine gave no answer within 20 s";
+                    assert!(said.contains(no_answer), "{said}");
+                }
+            }
+
+            assert_eq!(asked.elapsed(), ENGINE_STEP_BUDGET, "{step:?}");
+        }
+    }
+
+    #[test]
+    fn the_readme_states_the_budgets_that_a_bridge_gives_the_engine() {
+        let readme = include_str!("../../../README.md");
+        let (step, start) = (ENGINE_STEP_BUDGET.as_secs(), ENGINE_START_BUDGET.as_secs());
+        let stated = [
+            format!("waits {step} s for the engine in each step of the bridge, and {start} s in a start"),
+            format!("`the container engine gave no answer within {step} s`"),
+        ];
+        for sentence in stated {
+            assert!(readme.contains(&sentence), "the README lacks: {sentence}");
         }
     }
 

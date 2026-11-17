@@ -170,6 +170,17 @@ const RECONNECT_DELAYS: [Duration; 5] = [
     Duration::from_secs(2),
 ];
 
+/// How soon a daemon that looks for an engine has a session on one that
+/// begins to answer: a probe in flight gets no answer, the longest delay
+/// passes, and the next attempt is answered. [`connect`] gives each
+/// candidate socket its own [`PROBE_TIMEOUT`], so this holds only while no
+/// candidate is the socket of a second engine that takes a connection and
+/// answers nothing. Each such socket adds one timeout to an attempt.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const SESSION_OPENS_WITHIN: Duration = Duration::from_secs(
+    2 * PROBE_TIMEOUT.as_secs() + RECONNECT_DELAYS[RECONNECT_DELAYS.len() - 1].as_secs(),
+);
+
 /// A connect attempt that lasts this long, the session it opens included,
 /// starts the delays over. A shorter one moves to the next delay, so an
 /// engine whose sessions end at once is not asked in a tight loop.
@@ -801,11 +812,28 @@ pub(crate) mod tests {
         failed_deletes: Mutex<HashMap<String, Option<(&'static str, &'static str)>>>,
         /// The method and path of each [`Asked::Other`].
         calls: Mutex<Vec<String>>,
+        slow: Mutex<Slow>,
+        /// When the engine lets go of what a delete named, by its inspect
+        /// path.
+        leaving: Mutex<HashMap<String, tokio::time::Instant>>,
+        /// The inspect path and the body that the engine holds for a
+        /// container once a request has created one.
+        created: Mutex<Option<(String, String)>>,
         stream_ends: watch::Sender<u64>,
         probed: Mutex<Vec<u128>>,
         asked: Mutex<Vec<(u128, Asked)>>,
         /// Runs when a request arrives, before the engine answers it.
         on_request: Mutex<Option<Box<dyn Fn() + Send>>>,
+    }
+
+    /// How long the engine takes over a container.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub(crate) struct Slow {
+        /// Until it answers a stop.
+        pub(crate) stop: Duration,
+        /// Until it lets go of a container that it was told to remove. It
+        /// answers the delete at once.
+        pub(crate) removal: Duration,
     }
 
     /// How the fake engine answers a list.
@@ -850,6 +878,9 @@ pub(crate) mod tests {
                 hangs: Default::default(),
                 failed_deletes: Default::default(),
                 calls: Default::default(),
+                slow: Default::default(),
+                leaving: Default::default(),
+                created: Default::default(),
                 stream_ends: watch::Sender::new(0),
                 probed: Default::default(),
                 asked: Default::default(),
@@ -981,11 +1012,38 @@ pub(crate) mod tests {
                     None => {}
                 }
             }
+            let slow = *self.slow.lock().unwrap();
+            if method == "POST" && path.ends_with("/stop") {
+                tokio::time::sleep(slow.stop).await;
+            }
+            let created = self.created.lock().unwrap().clone();
+            if let (Some((inspect_path, json)), "POST /containers/create") =
+                (created, format!("{method} {path}").as_str())
+            {
+                self.hold(&inspect_path, &json);
+                return respond(pipe, "201 Created", r#"{"Id":"eeee3333","Warnings":[]}"#).await;
+            }
+            let inspect_path = format!("{path}/json");
             let held = match method {
-                "GET" => self.holds.lock().unwrap().get(path).cloned(),
+                "GET" => {
+                    let mut leaving = self.leaving.lock().unwrap();
+                    let mut holds = self.holds.lock().unwrap();
+                    if leaving
+                        .get(path)
+                        .is_some_and(|gone_at| *gone_at <= tokio::time::Instant::now())
+                    {
+                        leaving.remove(path);
+                        holds.remove(path);
+                    }
+                    holds.get(path).cloned()
+                }
+                "DELETE" if !slow.removal.is_zero() => {
+                    let gone_at = tokio::time::Instant::now() + slow.removal;
+                    self.leaving.lock().unwrap().insert(inspect_path, gone_at);
+                    Some(String::new())
+                }
                 "DELETE" => {
                     let mut holds = self.holds.lock().unwrap();
-                    let inspect_path = format!("{path}/json");
                     holds.remove(path).or_else(|| holds.remove(&inspect_path))
                 }
                 _ => Some(String::new()),
@@ -1012,6 +1070,18 @@ pub(crate) mod tests {
         #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
         pub(crate) fn hang(&self, path: &str) {
             self.hangs.lock().unwrap().push(path.into());
+        }
+
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        pub(crate) fn be_slow(&self, slow: Slow) {
+            *self.slow.lock().unwrap() = slow;
+        }
+
+        /// Makes the engine answer a create of a container with an id, and
+        /// answer an inspect of `inspect_path` with `json` from then on.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        pub(crate) fn hold_what_it_creates(&self, inspect_path: &str, json: &str) {
+            *self.created.lock().unwrap() = Some((inspect_path.into(), json.into()));
         }
 
         /// Makes the engine keep what it holds at `path`. It answers a

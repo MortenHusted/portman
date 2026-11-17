@@ -4,46 +4,52 @@ use crate::client::{bridge_status, wait_for_bridge_mode, wait_for_bridge_state, 
 use crate::cmd::run_setup_image_build;
 use crate::doctor;
 use anyhow::{bail, Result};
-use portman_protocol::{BridgeAssessment, BridgePhase, DockerStatus, NetbridgeMode};
+use portman_protocol::{BridgeAssessment, BridgeCleanup, BridgePhase, DockerStatus, NetbridgeMode};
 
 use crate::client::request;
 use portman_protocol::{Request, Response};
 
 pub(crate) async fn cmd_bridge_status() -> Result<()> {
-    match request(Request::Status).await? {
+    let status = request(Request::Status).await?;
+    let routes = doctor::collect_docker_routes().await;
+    for line in lines_of_status(status, &routes)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn lines_of_status(status: Response, routes: &doctor::DockerRouteStatus) -> Result<Vec<String>> {
+    match status {
         Response::Status {
             bridge_assessment,
             bridge_enabled,
             bridge_phase,
             bridge_retry_in_secs,
+            bridge_cleanup,
             bridge_mode,
             docker,
             ..
-        } => {
-            let routes = doctor::collect_docker_routes().await;
-            let lines = bridge_status_lines(
-                bridge_assessment,
-                bridge_phase.or_from_enabled(bridge_enabled),
-                bridge_retry_in_secs,
-                bridge_mode,
-                docker.as_ref(),
-                &routes,
-            );
-            for line in lines {
-                println!("{line}");
-            }
-            Ok(())
-        }
+        } => Ok(bridge_status_lines(
+            bridge_assessment,
+            bridge_phase.or_from_enabled(bridge_enabled),
+            bridge_retry_in_secs,
+            bridge_cleanup,
+            bridge_mode,
+            docker.as_ref(),
+            routes,
+        )),
         other => other.unexpected(),
     }
 }
 
 /// What `portman bridge status` prints. `routes` is what the `docker` CLI
-/// found. A daemon that reports no engine state gets no `docker` line.
+/// found. A daemon that reports no engine state gets no `docker` line, and
+/// one that reports no cleanup state gets no `cleanup` line.
 fn bridge_status_lines(
     assessment: BridgeAssessment,
     phase: BridgePhase,
     retry_in_secs: Option<u64>,
+    cleanup: Option<BridgeCleanup>,
     mode: NetbridgeMode,
     docker: Option<&DockerStatus>,
     routes: &doctor::DockerRouteStatus,
@@ -51,8 +57,9 @@ fn bridge_status_lines(
     let mut lines = vec![
         format!("bridge:    {assessment}"),
         format!("netbridge: {}", phase.status_words(retry_in_secs)),
-        format!("mode:      {}", NetbridgeMode::display_word(mode)),
     ];
+    lines.extend(cleanup.map(|held| format!("cleanup:   {}", held.in_words())));
+    lines.push(format!("mode:      {}", NetbridgeMode::display_word(mode)));
     lines.extend(docker.map(|docker| format!("docker:    {}", docker.summary())));
     lines.extend(doctor::docker_cli_note(
         docker,
@@ -89,11 +96,23 @@ pub(crate) async fn cmd_doctor() -> Result<()> {
     Ok(())
 }
 
+/// What `portman bridge enable` and `portman bridge disable` print. A
+/// disable whose cleanup did not remove the DNS forwarder says so in its
+/// one line, and does not add the note that portman removes it.
+fn settled_lines(settled: Settled, desired_enabled: bool, verb: &str) -> Vec<String> {
+    match settled {
+        Settled::LeftoversStay(_) => vec![settled.line(&format!("netbridge {verb}"))],
+        Settled::Reached | Settled::WaitsForDocker => {
+            bridge_command_lines(settled, desired_enabled, verb)
+        }
+    }
+}
+
 pub(crate) async fn cmd_bridge(req: Request, desired_enabled: bool, verb: &str) -> Result<()> {
     match request(req).await? {
         Response::Ok => {
             let settled = wait_for_bridge_state(desired_enabled).await?;
-            for line in bridge_command_lines(settled, desired_enabled, verb) {
+            for line in settled_lines(settled, desired_enabled, verb) {
                 println!("{line}");
             }
             Ok(())
@@ -201,6 +220,7 @@ mod tests {
             BridgeAssessment::Offline,
             phase,
             None,
+            None,
             NetbridgeMode::OptIn,
             docker,
             routes,
@@ -240,6 +260,7 @@ mod tests {
             BridgeAssessment::Offline,
             BridgePhase::Starting,
             Some(12),
+            None,
             NetbridgeMode::OptIn,
             None,
             &DockerRouteStatus::NoLabelledContainers,
@@ -248,6 +269,45 @@ mod tests {
         assert_eq!(
             waits[1],
             "netbridge: starting, the last start failed, tries again in 12s"
+        );
+    }
+
+    #[test]
+    fn bridge_status_says_what_holds_up_the_cleanup_of_a_disable_after_the_bridge_line() {
+        let held = bridge_status_lines(
+            BridgeAssessment::Offline,
+            BridgePhase::Disabled,
+            None,
+            Some(BridgeCleanup::NoAnswer { within_secs: 20 }),
+            NetbridgeMode::OptIn,
+            None,
+            &DockerRouteStatus::NoLabelledContainers,
+        );
+
+        assert_eq!(
+            held[1..4],
+            [
+                "netbridge: disabled",
+                "cleanup:   portman could not remove the dns forwarder and the `portman` \
+                 network: the container engine gave no answer within 20 s. It tries again \
+                 when it next connects to Docker, or at the next `portman bridge disable`",
+                "mode:      opt-in",
+            ]
+        );
+    }
+
+    #[test]
+    fn bridge_status_prints_the_cleanup_state_that_the_daemon_sends() {
+        let sent =
+            r#"{"kind":"status","bridge_phase":"disabled","bridge_cleanup":{"state":"failed"}}"#;
+        let status: Response = serde_json::from_str(sent).unwrap();
+
+        let lines = lines_of_status(status, &DockerRouteStatus::NoLabelledContainers).unwrap();
+
+        assert_eq!(lines[1], "netbridge: disabled");
+        assert!(
+            lines[2].starts_with("cleanup:   portman could not"),
+            "{lines:?}"
         );
     }
 
@@ -324,5 +384,32 @@ mod tests {
                 "labelled docker networks: unavailable (no answer in 3 s)",
             ]
         );
+    }
+
+    #[test]
+    fn a_disable_that_left_the_forwarder_says_why_and_not_that_portman_removes_it() {
+        let no_answer = portman_protocol::BridgeCleanup::NoAnswer { within_secs: 20 };
+
+        let lines = settled_lines(Settled::LeftoversStay(no_answer), false, "disabled");
+
+        assert_eq!(
+            lines,
+            [
+                "netbridge disabled; portman could not remove the dns forwarder and the \
+              `portman` network: the container engine gave no answer within 20 s. It tries \
+              again when it next connects to Docker, or at the next `portman bridge disable`"
+            ]
+        );
+        for (settled, enable, verb) in [
+            (Settled::Reached, false, "disabled"),
+            (Settled::Reached, true, "enabled"),
+            (Settled::WaitsForDocker, true, "enabled"),
+        ] {
+            assert_eq!(
+                settled_lines(settled, enable, verb),
+                bridge_command_lines(settled, enable, verb),
+                "{settled:?}"
+            );
+        }
     }
 }

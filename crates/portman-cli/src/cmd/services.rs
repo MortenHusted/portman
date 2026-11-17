@@ -31,6 +31,7 @@ pub(crate) async fn cmd_status(repo: bool) -> Result<()> {
             bridge_enabled: _bridge_enabled,
             bridge_phase: _bridge_phase,
             bridge_retry_in_secs: _bridge_retry_in_secs,
+            bridge_cleanup: _bridge_cleanup,
             bridge_mode: _bridge_mode,
             dashboard_port: _,
             managed_broker,
@@ -62,19 +63,14 @@ pub(crate) async fn cmd_status(repo: bool) -> Result<()> {
                 println!("{line}");
             }
             #[cfg(target_os = "macos")]
-            {
-                println!("bridge:          {_bridge_assessment}");
-                println!(
-                    "{}",
-                    netbridge_line(
-                        _bridge_phase.or_from_enabled(_bridge_enabled),
-                        _bridge_retry_in_secs
-                    )
-                );
-                println!(
-                    "netbridge mode:  {}",
-                    portman_protocol::NetbridgeMode::display_word(_bridge_mode)
-                );
+            for line in bridge_lines(
+                _bridge_assessment,
+                _bridge_phase.or_from_enabled(_bridge_enabled),
+                _bridge_retry_in_secs,
+                _bridge_cleanup,
+                _bridge_mode,
+            ) {
+                println!("{line}");
             }
         }
         other => return other.unexpected(),
@@ -100,9 +96,37 @@ fn docker_line(docker: Option<&portman_protocol::DockerStatus>) -> Option<String
     docker.map(|docker| format!("docker:          {}", docker.summary()))
 }
 
+/// The lines of `portman status` about the bridge, which only macOS has.
+#[cfg(any(target_os = "macos", test))]
+fn bridge_lines(
+    assessment: portman_protocol::BridgeAssessment,
+    phase: portman_protocol::BridgePhase,
+    retry_in_secs: Option<u64>,
+    cleanup: Option<portman_protocol::BridgeCleanup>,
+    mode: portman_protocol::NetbridgeMode,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!("bridge:          {assessment}"),
+        netbridge_line(phase, retry_in_secs),
+    ];
+    lines.extend(bridge_cleanup_line(cleanup));
+    lines.push(format!(
+        "netbridge mode:  {}",
+        portman_protocol::NetbridgeMode::display_word(mode)
+    ));
+    lines
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn netbridge_line(phase: portman_protocol::BridgePhase, retry_in_secs: Option<u64>) -> String {
     format!("netbridge:       {}", phase.status_words(retry_in_secs))
+}
+
+/// The `bridge cleanup` line of `portman status`. A daemon that reports no
+/// cleanup state gets no line.
+#[cfg(any(target_os = "macos", test))]
+fn bridge_cleanup_line(cleanup: Option<portman_protocol::BridgeCleanup>) -> Option<String> {
+    cleanup.map(|held| format!("bridge cleanup:  {}", held.in_words()))
 }
 
 /// Load and validate this repo's service config (walking up from the cwd).
@@ -1401,6 +1425,49 @@ mod tests {
             InterruptedServices(Vec::new()).start_lines(),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn status_says_what_holds_up_the_cleanup_of_a_disable_only_while_something_does() {
+        let line = |json: &str| match serde_json::from_str(json).unwrap() {
+            Response::Status { bridge_cleanup, .. } => bridge_cleanup_line(bridge_cleanup),
+            other => panic!("expected status response, got {other:?}"),
+        };
+
+        assert_eq!(line(r#"{"kind":"status","bridge_phase":"disabled"}"#), None);
+        assert_eq!(
+            line(
+                r#"{"kind":"status","bridge_phase":"disabled","bridge_cleanup":{"state":"port_taken"}}"#
+            )
+            .as_deref(),
+            Some(
+                "bridge cleanup:  portman has not removed the dns forwarder and the `portman` \
+                 network: another program held the UDP port of the bridge when portman came \
+                 to remove them, and may run a bridge on them. portman does not try again \
+                 until the next `portman bridge disable`"
+            )
+        );
+    }
+
+    #[test]
+    fn status_puts_the_cleanup_line_between_the_bridge_and_its_mode() {
+        use portman_protocol::{BridgeAssessment, BridgeCleanup, BridgePhase, NetbridgeMode};
+        let lines = bridge_lines(
+            BridgeAssessment::Offline,
+            BridgePhase::Disabled,
+            None,
+            Some(BridgeCleanup::Failed),
+            NetbridgeMode::OptIn,
+        );
+
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines[0], "bridge:          offline");
+        assert_eq!(lines[1], "netbridge:       disabled");
+        assert!(
+            lines[2].starts_with("bridge cleanup:  portman could not"),
+            "{lines:?}"
+        );
+        assert_eq!(lines[3], "netbridge mode:  opt-in");
     }
 
     #[test]

@@ -786,7 +786,7 @@ fn apply_result(state: &mut State, res: Result<()>) {
 
 fn after_disable(res: &Result<Settled>) -> Modal {
     match (res, disable_note()) {
-        (Ok(_), Some(note)) => Modal::BridgeDisabled { note },
+        (Ok(Settled::Reached), Some(note)) => Modal::BridgeDisabled { note },
         _ => Modal::None,
     }
 }
@@ -796,7 +796,9 @@ fn after_disable(res: &Result<Settled>) -> Modal {
 /// shows a bridge that is up or off.
 fn apply_bridge_result(state: &mut State, res: Result<Settled>, done: &str) {
     let notice = match &res {
-        Ok(Settled::WaitsForDocker) => Some(Settled::WaitsForDocker.line(done)),
+        Ok(settled @ (Settled::WaitsForDocker | Settled::LeftoversStay(_))) => {
+            Some(settled.line(done))
+        }
         _ => None,
     };
     apply_result(state, res.map(drop));
@@ -2620,6 +2622,15 @@ mod tests {
 
             assert_eq!(text, format!("{note} [Enter] close"), "columns={columns}");
         }
+    }
+
+    #[test]
+    fn a_disable_that_left_the_forwarder_does_not_say_that_portman_removes_it() {
+        let left = Ok(Settled::LeftoversStay(
+            portman_protocol::BridgeCleanup::Failed,
+        ));
+
+        assert!(matches!(after_disable(&left), Modal::None));
     }
 
     /// The status bar, on a terminal of `columns` columns.

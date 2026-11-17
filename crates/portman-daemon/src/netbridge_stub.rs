@@ -56,6 +56,11 @@ impl Handle {
     pub(crate) fn retry_in_secs(&self) -> Option<std::num::NonZeroU64> {
         None
     }
+
+    /// Linux runs no bridge, so no disable leaves anything in an engine.
+    pub(crate) fn cleanup(&self) -> Option<portman_protocol::BridgeCleanup> {
+        None
+    }
 }
 
 pub(crate) fn handle_pair() -> (Handle, mpsc::Receiver<Control>, watch::Sender<BridgePhase>) {

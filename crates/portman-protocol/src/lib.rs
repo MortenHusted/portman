@@ -184,6 +184,82 @@ impl BridgePhase {
     }
 }
 
+/// Why the DNS forwarder and the docker network of the bridge can still be
+/// in the engine after `portman bridge disable`. A `state` that this client
+/// does not know reads as `Unknown`, by the lossy-deserialize contract of
+/// [`ServiceState`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum BridgeCleanup {
+    /// The daemon has not acted on a disable yet, or the removal runs now.
+    /// A client that waits for a disable waits until this has passed.
+    Pending,
+    /// No container engine is connected. The daemon removes them once one
+    /// has been connected for 10 s, unless the UDP port of the bridge is
+    /// then taken. That also holds when the daemon restarted in between.
+    WaitsForDocker,
+    /// A container engine connected less than `for_secs` ago. The daemon
+    /// removes them once the engine has been connected for that long, so
+    /// that the bridge of another portman daemon on that engine can take
+    /// the UDP port of the bridge first. A client that waits for a disable
+    /// waits until this has passed, also when the disable itself came in
+    /// those seconds.
+    WaitsForBridges {
+        #[serde(default)]
+        for_secs: u64,
+    },
+    /// The engine gave no answer in the `within_secs` that the bridge gives
+    /// it for a step. The daemon tries again when it next connects to an
+    /// engine.
+    NoAnswer {
+        #[serde(default)]
+        within_secs: u64,
+    },
+    /// A removal failed, or the daemon could not claim the UDP port of the
+    /// bridge for another reason than a holder of it. The daemon log says
+    /// what stays and why. The daemon tries again when it next connects to
+    /// an engine.
+    Failed,
+    /// Another process held the UDP port of the bridge, and can run a
+    /// bridge on them. The daemon removed nothing and does not try again
+    /// until the next disable.
+    PortTaken,
+    #[serde(other)]
+    Unknown,
+}
+
+impl BridgeCleanup {
+    /// What the CLI and the TUI print for this state.
+    pub fn in_words(self) -> String {
+        let leftovers = "the dns forwarder and the `portman` network";
+        let again =
+            "It tries again when it next connects to Docker, or at the next `portman bridge disable`";
+        match self {
+            BridgeCleanup::Pending => {
+                format!("portman has not removed {leftovers} yet: the removal still runs")
+            }
+            BridgeCleanup::WaitsForDocker => format!(
+                "portman has not removed {leftovers}: Docker is not connected. It removes them 10 s after Docker connects, unless another program then holds the UDP port of the bridge"
+            ),
+            BridgeCleanup::WaitsForBridges { for_secs } => format!(
+                "portman has not removed {leftovers} yet: it waits until Docker has been connected for {for_secs} s, so that the bridge of another portman daemon can take the UDP port of the bridge first"
+            ),
+            BridgeCleanup::NoAnswer { within_secs } => format!(
+                "portman could not remove {leftovers}: the container engine gave no answer within {within_secs} s. {again}"
+            ),
+            BridgeCleanup::Failed => format!(
+                "portman could not remove everything that the bridge left in Docker: the daemon log says what stays and why. {again}"
+            ),
+            BridgeCleanup::PortTaken => format!(
+                "portman has not removed {leftovers}: another program held the UDP port of the bridge when portman came to remove them, and may run a bridge on them. portman does not try again until the next `portman bridge disable`"
+            ),
+            BridgeCleanup::Unknown => {
+                format!("portman could not remove {leftovers}; the daemon log says why")
+            }
+        }
+    }
+}
+
 /// Whether the daemon holds a connection to a container engine. Same
 /// lossy-deserialize contract as [`ServiceState`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -633,6 +709,12 @@ pub enum Response {
         /// field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bridge_retry_in_secs: Option<u64>,
+        /// What holds up the removal of the DNS forwarder and the docker
+        /// network that the last `portman bridge disable` asked for.
+        /// `None` when nothing holds it up, while the user wants the
+        /// bridge, and from a daemon that predates the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bridge_cleanup: Option<BridgeCleanup>,
         /// Route ownership mode for the native netbridge: the mode of the
         /// running bridge, or the mode the next one is built for.
         #[serde(default = "default_netbridge_mode")]
@@ -1392,6 +1474,7 @@ mod tests {
                 bridge_enabled,
                 bridge_phase,
                 bridge_retry_in_secs,
+                bridge_cleanup,
                 bridge_mode,
                 dashboard_port,
                 managed_broker,
@@ -1402,6 +1485,7 @@ mod tests {
                 assert_eq!(docker, None);
                 assert_eq!(bridge_phase, BridgePhase::Unknown);
                 assert_eq!(bridge_retry_in_secs, None);
+                assert_eq!(bridge_cleanup, None);
                 assert!(!managed_broker);
                 assert_eq!(egress_grants_version, 0);
                 assert_eq!(inference_provisioning_version, 0);
@@ -1513,6 +1597,101 @@ mod tests {
         }
         let sent = serde_json::to_value(&status).unwrap();
         assert_eq!(sent["bridge_retry_in_secs"], 12, "{sent}");
+    }
+
+    fn status_cleanup(json: &str) -> Option<BridgeCleanup> {
+        match serde_json::from_str(json).unwrap() {
+            Response::Status { bridge_cleanup, .. } => bridge_cleanup,
+            other => panic!("expected status response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn what_holds_a_cleanup_up_is_on_the_wire_only_while_something_does() {
+        let status = |cleanup: &str| format!(r#"{{"kind":"status","bridge_cleanup":{cleanup}}}"#);
+        // the field as a daemon sends it → what this client reads
+        let table = [
+            (r#"{"state":"pending"}"#, BridgeCleanup::Pending),
+            (
+                r#"{"state":"waits_for_docker"}"#,
+                BridgeCleanup::WaitsForDocker,
+            ),
+            (
+                r#"{"state":"waits_for_bridges","for_secs":10}"#,
+                BridgeCleanup::WaitsForBridges { for_secs: 10 },
+            ),
+            (
+                r#"{"state":"no_answer","within_secs":20}"#,
+                BridgeCleanup::NoAnswer { within_secs: 20 },
+            ),
+            (r#"{"state":"failed"}"#, BridgeCleanup::Failed),
+            (r#"{"state":"port_taken"}"#, BridgeCleanup::PortTaken),
+            (
+                r#"{"state":"no_answer"}"#,
+                BridgeCleanup::NoAnswer { within_secs: 0 },
+            ),
+            (
+                r#"{"state":"waits_for_the_moon","since_secs":3}"#,
+                BridgeCleanup::Unknown,
+            ),
+        ];
+        for (sent, read) in table {
+            assert_eq!(status_cleanup(&status(sent)), Some(read), "{sent}");
+        }
+        let from_an_older_daemon = r#"{"kind":"status","bridge_phase":"disabled"}"#;
+        assert_eq!(status_cleanup(from_an_older_daemon), None);
+
+        let mut status: Response = serde_json::from_str(from_an_older_daemon).unwrap();
+        let sent = serde_json::to_value(&status).unwrap();
+        assert_eq!(sent.get("bridge_cleanup"), None, "{sent}");
+
+        if let Response::Status { bridge_cleanup, .. } = &mut status {
+            *bridge_cleanup = Some(BridgeCleanup::NoAnswer { within_secs: 20 });
+        }
+        let sent = serde_json::to_value(&status).unwrap();
+        let no_answer = serde_json::json!({"state": "no_answer", "within_secs": 20});
+        assert_eq!(sent["bridge_cleanup"], no_answer, "{sent}");
+    }
+
+    #[test]
+    fn a_disable_says_in_plain_words_what_holds_its_cleanup_up() {
+        let no_answer = BridgeCleanup::NoAnswer { within_secs: 20 };
+        assert_eq!(
+            no_answer.in_words(),
+            "portman could not remove the dns forwarder and the `portman` network: the \
+             container engine gave no answer within 20 s. It tries again when it next \
+             connects to Docker, or at the next `portman bridge disable`"
+        );
+        assert_eq!(
+            BridgeCleanup::WaitsForDocker.in_words(),
+            "portman has not removed the dns forwarder and the `portman` network: Docker is \
+             not connected. It removes them 10 s after Docker connects, unless another program \
+             then holds the UDP port of the bridge"
+        );
+        assert_eq!(
+            BridgeCleanup::WaitsForBridges { for_secs: 10 }.in_words(),
+            "portman has not removed the dns forwarder and the `portman` network yet: it \
+             waits until Docker has been connected for 10 s, so that the bridge of another \
+             portman daemon can take the UDP port of the bridge first"
+        );
+        assert_eq!(
+            BridgeCleanup::PortTaken.in_words(),
+            "portman has not removed the dns forwarder and the `portman` network: another \
+             program held the UDP port of the bridge when portman came to remove them, and \
+             may run a bridge on them. portman does not try again until the next `portman \
+             bridge disable`"
+        );
+        assert_eq!(
+            BridgeCleanup::Failed.in_words(),
+            "portman could not remove everything that the bridge left in Docker: the daemon \
+             log says what stays and why. It tries again when it next connects to Docker, or \
+             at the next `portman bridge disable`"
+        );
+        for held in [BridgeCleanup::Pending, BridgeCleanup::Unknown] {
+            let words = held.in_words();
+            assert!(words.contains("the dns forwarder"), "{held:?}: {words}");
+            assert!(!words.contains("unknown"), "{held:?}: {words}");
+        }
     }
 
     #[test]

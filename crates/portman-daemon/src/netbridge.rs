@@ -9,14 +9,21 @@
 //! Control flow:
 //!
 //!   - a `Control` message from the IPC server changes the intent. The
-//!     intent is persisted before anything acts on it, so an enable issued
-//!     while the engine is unreachable is still an enable after a restart.
+//!     loop writes the intent to `netbridge.json` before it acts on it, so
+//!     an enable issued while the engine is unreachable is still an enable
+//!     after a restart. A write that fails does not hold the loop: it acts
+//!     on the intent that it has, and makes the write again each time it
+//!     wakes. A daemon that restarts before that boots on the older file.
 //!   - [`plan`] compares the intent and the engine session with the running
 //!     bridge and names the next step. The loop applies steps until none is
 //!     left, then waits for a control message, a change of engine session,
 //!     or a retry timer. Before each step it takes the messages that are in
 //!     the channel. A message that arrives later waits for the step to end:
-//!     the loop does not cancel a step in flight.
+//!     the loop does not cancel a step in flight. The bridge gives the
+//!     engine [`runtime::ENGINE_STEP_BUDGET`] for each step and
+//!     [`runtime::ENGINE_START_BUDGET`] for a start, so a message waits no
+//!     longer than that for an engine that froze. A start that is cut
+//!     there fails and is retried, and a cleanup stays owed.
 //!   - a bridge is built on one engine session. When no session exists the
 //!     loop ends the bridge and asks the engine nothing. When another
 //!     session opens, the loop keeps the bridge if that engine says within
@@ -36,10 +43,19 @@
 //!     such a cleanup, so no second one follows it on its session. A
 //!     network that the engine refuses to remove because it is in use is
 //!     not owed. It stays until the next `Disable`, so that no later
-//!     session removes it under containers that have stopped. The debt is
-//!     not saved, so a daemon restart ends it. Each removal needs the UDP
-//!     port that a bridge listens on, so that it cannot take what another
-//!     daemon's bridge runs on.
+//!     session removes it under containers that have stopped. Each removal
+//!     needs the UDP port that a bridge listens on, so that it cannot take
+//!     what another daemon's bridge runs on. A cleanup that finds the port
+//!     taken ends the debt as a network in use does: the holder may run a
+//!     bridge on the forwarder and the network, and a debt that waited for
+//!     the port would be paid the first time the port is free for a
+//!     moment. The debt is saved in `netbridge.json` with the flag, so a
+//!     daemon that restarts still owes it. An `Enable` ends it. A cleanup
+//!     that the loop plans while no bridge runs waits until the session
+//!     has been open for the [`HEAD_START`]. The stop of a running bridge
+//!     does not wait, and neither does a start, which removes the setup
+//!     container of an earlier bridge: the bridge holds the port through
+//!     both.
 //!   - a failed start is retried with a growing delay. The wait does not
 //!     hold up control messages, and a new session starts the delay over.
 //!   - a bridge that is up gets the DNS forwarder in the VM: the loop makes
@@ -54,11 +70,15 @@
 //!     beside such a network stays until the next `Disable`.
 //!   - [`publish`] tells the rest of the daemon what the bridge is doing:
 //!     the [`phase`], the mode, the interface index of the utun, and when a
-//!     start that failed runs again.
+//!     start that failed runs again. Before it, the loop publishes what
+//!     holds up the cleanup that a `Disable` asked for, so that a client
+//!     that reads the phase `Disabled` can say whether the DNS forwarder
+//!     and the docker network are gone.
 
 use std::collections::{BTreeSet, HashSet};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,13 +87,16 @@ use bollard::query_parameters::InspectContainerOptions;
 use bollard::Docker;
 use portman_core::netbridge_state::{self, NetbridgeState};
 use portman_core::NetbridgeMode;
-use portman_netbridge::runtime::{Cleanup, DnsForwarder, Leftovers, Runtime, RuntimeOptions};
+use portman_netbridge::runtime::{
+    self, CleanupEnd, DnsForwarder, Leftovers, Runtime, RuntimeOptions,
+};
 use portman_netbridge::tunnel::{Keypair, HOST_WG_LISTEN_PORT};
+use portman_protocol::BridgeCleanup;
 use tokio::sync::{mpsc, watch, Notify, RwLock};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use crate::engine::{Engine, Link, Session};
+use crate::engine::{Engine, Link, Session, SESSION_OPENS_WITHIN};
 
 /// Env var override. Useful for the first-run path where the user's
 /// `netbridge.json` doesn't exist yet and they want to flip the bridge
@@ -86,8 +109,33 @@ const ENABLE_ENV: &str = "PORTMAN_NETBRIDGE";
 /// bridge's setup container. bollard bounds only the wait for a response
 /// head, so a VM that froze with its socket open would never end this
 /// check. The budget bounds this check alone. A later step that asks the
-/// same engine can still hold the loop, and with it every control message.
+/// same engine holds the loop, and with it every control message, for the
+/// [`runtime::ENGINE_STEP_BUDGET`] that the bridge gives the engine for a
+/// step, or for the [`runtime::ENGINE_START_BUDGET`] of a start.
 const SETUP_CHECK_BUDGET: Duration = Duration::from_secs(3);
+
+/// How long the loop of another daemon has to go from a new session to the
+/// claim on the listen port that its start begins with.
+const START_CLAIMS_WITHIN: Duration = Duration::from_secs(2);
+
+/// How long a session is open before the loop cleans up on it with no
+/// bridge of its own running. The bridge of another portman daemon on the
+/// same engine runs on the DNS forwarder and the docker network, and it
+/// holds the listen port only once its start has begun. That daemon has a
+/// session within [`SESSION_OPENS_WITHIN`] of the moment the engine
+/// answers, and its start claims the port before it asks the engine
+/// anything. After the head start such a bridge holds the port, and the
+/// cleanup ends as a taken port does. Until then the loop asks the engine
+/// nothing and does not claim the port, also not for the setup container: a
+/// claim can fail the other daemon's start, and the retry of that start
+/// comes [`RETRY_BASE`] later, which can be after the head start. The
+/// bound holds for a daemon that was built with the same limits and that
+/// has ended the bridge of a lost session before its next start claims the
+/// port. A 0.1.7 daemon does not wait for that end, so its first start on a
+/// new session can fail on its own port and wait [`RETRY_BASE`] for the
+/// retry.
+const HEAD_START: Duration =
+    Duration::from_secs(SESSION_OPENS_WITHIN.as_secs() + START_CLAIMS_WITHIN.as_secs());
 
 const RETRY_BASE: Duration = Duration::from_secs(5);
 const RETRY_CAP: Duration = Duration::from_secs(60);
@@ -166,7 +214,7 @@ impl From<BridgePhase> for portman_protocol::BridgePhase {
 /// what the netbridge task last published.
 #[derive(Clone)]
 pub(crate) struct Handle {
-    pub tx: mpsc::Sender<Control>,
+    tx: mpsc::Sender<Control>,
     pub mode: Arc<RwLock<NetbridgeMode>>,
     pub phase: watch::Receiver<BridgePhase>,
     /// Interface index of the bridge's utun while it is up. The proxy /
@@ -179,9 +227,43 @@ pub(crate) struct Handle {
     /// When the next start is due, while a start that failed waits for its
     /// retry.
     pub retry_at: Arc<std::sync::RwLock<Option<Instant>>>,
+    /// What holds up the cleanup that the last `Disable` asked for, as the
+    /// loop last published it. Read it through [`Handle::cleanup`].
+    cleanup: Arc<std::sync::RwLock<Option<BridgeCleanup>>>,
+    /// The `Disable` messages that went to the loop, and those that the
+    /// loop had acted on when it last published.
+    disables_sent: Arc<AtomicU64>,
+    disables_published: Arc<AtomicU64>,
 }
 
 impl Handle {
+    pub(crate) async fn send(&self, msg: Control) -> Result<(), mpsc::error::SendError<Control>> {
+        if matches!(msg, Control::Disable) {
+            self.disables_sent.fetch_add(1, Ordering::SeqCst);
+        }
+        self.tx.send(msg).await
+    }
+
+    /// What holds up the cleanup that the last `Disable` asked for. It is
+    /// `Pending` from the moment a `Disable` is sent until the loop has
+    /// published what it made of it, so that a client that reads the status
+    /// right after its request does not act on the state from before it.
+    /// Read the phase first: the loop publishes this before the phase.
+    pub(crate) fn cleanup(&self) -> Option<BridgeCleanup> {
+        let published = self.disables_published.load(Ordering::SeqCst);
+        if published != self.disables_sent.load(Ordering::SeqCst) {
+            return Some(BridgeCleanup::Pending);
+        }
+        *self.cleanup.read().expect("cleanup lock poisoned")
+    }
+
+    /// The count goes last, so that a reader that finds it current also
+    /// finds the cleanup that belongs to it.
+    fn publish_cleanup(&self, cleanup: Option<BridgeCleanup>, disables: u64) {
+        *self.cleanup.write().expect("cleanup lock poisoned") = cleanup;
+        self.disables_published.store(disables, Ordering::SeqCst);
+    }
+
     pub(crate) fn retry_in_secs(&self) -> Option<NonZeroU64> {
         let at = (*self.retry_at.read().expect("retry lock poisoned"))?;
         let left = at.saturating_duration_since(Instant::now());
@@ -203,6 +285,9 @@ pub(crate) fn handle_pair() -> (Handle, mpsc::Receiver<Control>, watch::Sender<B
             ifindex: crate::upstream::new_bridge_ifindex(),
             tlds_changed: Arc::new(Notify::new()),
             retry_at: Arc::default(),
+            cleanup: Arc::default(),
+            disables_sent: Arc::default(),
+            disables_published: Arc::default(),
         },
         rx,
         phase_tx,
@@ -379,48 +464,172 @@ fn backoff(failures: u32) -> Duration {
     RETRY_BASE.saturating_mul(1 << doublings).min(RETRY_CAP)
 }
 
-/// What the loop has yet to remove from the engine. [`plan`] collects it only
-/// while the bridge is off and none runs, so a debt that an enable finds is
-/// not collected, and the disable that turns the bridge off again owes the
-/// network anew. The debt is not saved: after a daemon restart every session
-/// owes the setup container and no network.
+/// The sessions that the loop has yet to clean up on. [`plan`] collects a
+/// cleanup only while the bridge is off and none runs. Every session owes
+/// the setup container. Whether one also owes the DNS forwarder and the
+/// docker network is `cleanup_owed` of the saved state, which a `Disable`
+/// sets and which outlives the daemon.
 #[derive(Default)]
 struct Debt {
-    /// A `Disable` asked for the DNS forwarder and the docker network to go,
-    /// and no cleanup has run to its end since.
-    network: bool,
     /// The session that had its cleanup. Every other session is owed one.
     swept: Option<Session>,
+    /// How the cleanup that the last `Disable` asked for ended, when that
+    /// left the DNS forwarder and the docker network where they were.
+    /// `None` before that cleanup ran, and after one that ended complete.
+    held: Option<BridgeCleanup>,
+    /// The `Disable` messages that the loop has acted on.
+    disables: u64,
+}
+
+/// What the loop owes the engine of the open session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owes {
+    NoSession,
+    Cleanup {
+        leftovers: Leftovers,
+        /// When the session has been open for the [`HEAD_START`]. For the
+        /// stop of a running bridge, which holds the listen port, it is
+        /// when the session opened.
+        from: Instant,
+    },
+    /// The session had its cleanup.
+    Nothing,
+}
+
+impl Owes {
+    fn due(self, now: Instant) -> Option<Leftovers> {
+        match self {
+            Owes::Cleanup { leftovers, from } if from <= now => Some(leftovers),
+            _ => None,
+        }
+    }
+
+    fn waits_until(self, now: Instant) -> Option<Instant> {
+        match self {
+            Owes::Cleanup { from, .. } if from > now => Some(from),
+            _ => None,
+        }
+    }
 }
 
 impl Debt {
-    fn owed_on(&self, session: Option<Session>) -> Option<Leftovers> {
-        (self.swept != session).then_some(if self.network {
-            Leftovers::SetupContainerAndNetwork
-        } else {
-            Leftovers::SetupContainer
-        })
+    /// `opened` is when the loop saw `session` open.
+    fn owes(
+        &self,
+        session: Option<Session>,
+        opened: Instant,
+        network_owed: bool,
+        a_bridge_runs: bool,
+    ) -> Owes {
+        match session {
+            None => Owes::NoSession,
+            Some(session) if self.swept == Some(session) => Owes::Nothing,
+            Some(_) => Owes::Cleanup {
+                leftovers: if network_owed {
+                    Leftovers::SetupContainerAndNetwork
+                } else {
+                    Leftovers::SetupContainer
+                },
+                from: if a_bridge_runs {
+                    opened
+                } else {
+                    opened + HEAD_START
+                },
+            },
+        }
     }
 
     fn disabled(&mut self) {
-        self.network = true;
         self.swept = None;
+        self.held = None;
+        self.disables += 1;
     }
 
     /// A cleanup that did not finish is not tried again on its session.
-    fn settle(&mut self, session: Session, leftovers: Leftovers, cleanup: Cleanup) {
+    fn settle(&mut self, session: Session, asked_for: Leftovers, swept: Swept) {
         self.swept = Some(session);
-        if leftovers == Leftovers::SetupContainerAndNetwork && cleanup == Cleanup::Complete {
-            self.network = false;
+        if asked_for == Leftovers::SetupContainerAndNetwork {
+            self.held = swept.holds();
+        }
+    }
+
+    /// What status says about the cleanup that the last `Disable` asked
+    /// for. A port that was taken stays reported until the next `Disable`,
+    /// because no cleanup asks again before that.
+    fn status(&self, intent: &NetbridgeState, owes: Owes, now: Instant) -> Option<BridgeCleanup> {
+        if intent.enabled {
+            return None;
+        }
+        if self.held == Some(BridgeCleanup::PortTaken) {
+            return self.held;
+        }
+        if !intent.cleanup_owed {
+            return None;
+        }
+        match owes {
+            Owes::NoSession => Some(BridgeCleanup::WaitsForDocker),
+            Owes::Cleanup { from, .. } if from > now => Some(BridgeCleanup::WaitsForBridges {
+                for_secs: HEAD_START.as_secs(),
+            }),
+            Owes::Cleanup { .. } => Some(BridgeCleanup::Pending),
+            Owes::Nothing => self.held,
+        }
+    }
+}
+
+/// How a cleanup that the loop planned ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Swept {
+    Ended(CleanupEnd),
+    /// The UDP port that a bridge listens on was taken, so the engine was
+    /// not asked. Another daemon's bridge holds that port, and so can a
+    /// process that is not portman.
+    PortTaken,
+    /// The claim on that port failed for another reason, so the engine was
+    /// not asked.
+    ClaimFailed,
+    /// Another session existed at the call, so the engine was not asked.
+    SessionEnded,
+}
+
+impl Swept {
+    /// Whether no later cleanup asks for the DNS forwarder and the docker
+    /// network again until the next `Disable`. They are gone, or a later
+    /// cleanup could take them from under what uses them: the containers on
+    /// a network in use, or the bridge of the daemon that holds the port.
+    fn ends_the_debt(self) -> bool {
+        match self {
+            Swept::Ended(CleanupEnd::Complete) | Swept::PortTaken => true,
+            Swept::Ended(CleanupEnd::Failed | CleanupEnd::NoAnswer)
+            | Swept::ClaimFailed
+            | Swept::SessionEnded => false,
+        }
+    }
+
+    /// What a cleanup that ended so tells a client about the DNS forwarder
+    /// and the docker network. A session that ended holds nothing by
+    /// itself: the next session, or the lack of one, does.
+    fn holds(self) -> Option<BridgeCleanup> {
+        match self {
+            Swept::Ended(CleanupEnd::Complete) | Swept::SessionEnded => None,
+            Swept::Ended(CleanupEnd::Failed) | Swept::ClaimFailed => Some(BridgeCleanup::Failed),
+            Swept::Ended(CleanupEnd::NoAnswer) => Some(BridgeCleanup::NoAnswer {
+                within_secs: runtime::ENGINE_STEP_BUDGET.as_secs(),
+            }),
+            Swept::PortTaken => Some(BridgeCleanup::PortTaken),
         }
     }
 }
 
 /// What the bridge should be: the intent the user saved, with the
 /// `PORTMAN_NETBRIDGE` override on top. Only `saved` is written to
-/// `netbridge.json`.
+/// `netbridge.json`. It also holds whether a `Disable` still owes a
+/// cleanup, so that the debt is saved in the same write as the flag.
 struct Wanted {
     saved: NetbridgeState,
+    /// What a daemon that boots on `netbridge.json` now would load. It
+    /// differs from `saved` after a write that failed.
+    on_disk: NetbridgeState,
     forced_on: bool,
 }
 
@@ -428,15 +637,26 @@ impl Wanted {
     fn intent(&self) -> NetbridgeState {
         NetbridgeState {
             enabled: self.saved.enabled || self.forced_on,
-            mode: self.saved.mode,
+            ..self.saved
+        }
+    }
+
+    fn save(&mut self, state_path: &Path) {
+        match netbridge_state::save(state_path, &self.saved) {
+            Ok(()) => self.on_disk = self.saved.clone(),
+            Err(err) => warn!(err = %format_args!("{err:#}"), "persisting netbridge state"),
         }
     }
 
     fn apply(&mut self, msg: Control) {
         match msg {
-            Control::Enable => self.saved.enabled = true,
+            Control::Enable => {
+                self.saved.enabled = true;
+                self.saved.cleanup_owed = false;
+            }
             Control::Disable => {
                 self.saved.enabled = false;
+                self.saved.cleanup_owed = true;
                 self.forced_on = false;
             }
             Control::SetMode(mode) => {
@@ -477,8 +697,10 @@ async fn converge<E: BridgeEngine>(
     forced_on: bool,
     known_tlds: KnownTlds,
 ) -> Result<()> {
+    let saved = netbridge_state::load(&state_path);
     let mut wanted = Wanted {
-        saved: netbridge_state::load(&state_path),
+        on_disk: saved.clone(),
+        saved,
         forced_on,
     };
     info!(
@@ -489,6 +711,7 @@ async fn converge<E: BridgeEngine>(
     );
 
     let mut session = None;
+    let mut opened = Instant::now();
     let mut running: Option<Running<E::Bridge>> = None;
     let mut attempts = Attempts::new();
     let mut epoch = 0;
@@ -498,9 +721,13 @@ async fn converge<E: BridgeEngine>(
         while let Ok(msg) = rx.try_recv() {
             take(msg, &mut wanted, &mut attempts, &mut debt, &state_path);
         }
+        if wanted.saved != wanted.on_disk {
+            wanted.save(&state_path);
+        }
         // A start sequence serves one session, as it serves one intent.
         if session != engine.session() {
             session = engine.session();
+            opened = Instant::now();
             attempts = Attempts::new();
             if let (Some(session), Some(running)) = (session, running.as_mut()) {
                 let setup_container = running.bridge.setup_container_id();
@@ -515,6 +742,10 @@ async fn converge<E: BridgeEngine>(
         }
         let intent = wanted.intent();
         let built = running.as_ref().map(|r| r.built);
+        let now = Instant::now();
+        let network_owed = wanted.saved.cleanup_owed;
+        let owes = debt.owes(session, opened, network_owed, built.is_some());
+        handle.publish_cleanup(debt.status(&intent, owes, now), debt.disables);
         publish(
             &handle,
             &phase_tx,
@@ -526,25 +757,34 @@ async fn converge<E: BridgeEngine>(
         .await;
         let may_start = attempts.retry_at.is_none();
         let tlds = managed_tlds(&known_tlds);
-        let now = Instant::now();
         let forwarded = running.as_ref().map(|r| r.forwarded.as_ref());
         let forwarder_due = forwarded.is_some_and(|last| forwarder_due(last, &tlds, now));
-        let owed = debt.owed_on(session);
-        match plan(&intent, session, built, may_start, owed, forwarder_due) {
+        match plan(
+            &intent,
+            session,
+            built,
+            may_start,
+            owes.due(now),
+            forwarder_due,
+        ) {
             Step::Keep => {
-                // A start waits only while no bridge runs, and a forwarder
-                // only while one does, so one timer serves both.
                 let forwarder_retry = forwarded.flatten().and_then(|last| last.retry_at);
-                let retry_after = attempts
-                    .retry_at
-                    .or(forwarder_retry)
+                let head_start_over = owes.waits_until(now).filter(|_| !intent.enabled);
+                let timers = [attempts.retry_at, forwarder_retry, head_start_over];
+                let timer_after = timers
+                    .into_iter()
+                    .flatten()
+                    .min()
                     .map(|at| at.saturating_duration_since(now));
                 let tlds_changed = &handle.tlds_changed;
-                match next_wake(&mut rx, &mut engine, tlds_changed, retry_after).await {
+                match next_wake(&mut rx, &mut engine, tlds_changed, timer_after).await {
                     Wake::Control(msg) => {
                         take(msg, &mut wanted, &mut attempts, &mut debt, &state_path);
                     }
-                    Wake::RetryDue => attempts.retry_at = None,
+                    Wake::TimerDue => {
+                        let now = Instant::now();
+                        attempts.retry_at = attempts.retry_at.filter(|at| *at > now);
+                    }
                     Wake::SessionChanged | Wake::TldsChanged => {}
                     Wake::Closed => return Ok(()),
                 }
@@ -582,16 +822,28 @@ async fn converge<E: BridgeEngine>(
             }
             Step::Teardown => {
                 if let Some(old) = running.take() {
-                    let cleanup = old.bridge.shutdown_and_remove_network().await;
+                    let ended = Swept::Ended(old.bridge.shutdown_and_remove_network().await);
                     let asked_for = Leftovers::SetupContainerAndNetwork;
-                    debt.settle(old.built.session, asked_for, cleanup);
+                    debt.settle(old.built.session, asked_for, ended);
+                    settle(&mut wanted, &state_path, asked_for, ended);
                 }
             }
             Step::Sweep(session, leftovers) => {
-                let cleanup = engine.remove_leftovers(session, leftovers).await;
-                debt.settle(session, leftovers, cleanup);
+                let swept = engine.remove_leftovers(session, leftovers).await;
+                debt.settle(session, leftovers, swept);
+                settle(&mut wanted, &state_path, leftovers, swept);
             }
         }
+    }
+}
+
+/// Saves that the debt of a `Disable` is over, when a cleanup that asked
+/// for the DNS forwarder and the docker network ended it.
+fn settle(wanted: &mut Wanted, state_path: &Path, asked_for: Leftovers, swept: Swept) {
+    let network_asked_for = asked_for == Leftovers::SetupContainerAndNetwork;
+    if wanted.saved.cleanup_owed && network_asked_for && swept.ends_the_debt() {
+        wanted.saved.cleanup_owed = false;
+        wanted.save(state_path);
     }
 }
 
@@ -609,7 +861,7 @@ fn take(
         debt.disabled();
     }
     wanted.apply(msg);
-    persist(state_path, &wanted.saved);
+    wanted.save(state_path);
     *attempts = Attempts::new();
 }
 
@@ -676,31 +928,32 @@ enum Wake {
     Control(Control),
     SessionChanged,
     TldsChanged,
-    RetryDue,
+    TimerDue,
     Closed,
 }
 
-/// A message that is ready goes before a retry that is due, so that no
+/// A message that is ready goes before a timer that is due, so that no
 /// start runs ahead of a `Disable` that is already in the channel.
 async fn next_wake(
     rx: &mut mpsc::Receiver<Control>,
     engine: &mut impl BridgeEngine,
     tlds_changed: &Notify,
-    retry_after: Option<Duration>,
+    timer_after: Option<Duration>,
 ) -> Wake {
     tokio::select! {
         biased;
         msg = rx.recv() => msg.map_or(Wake::Closed, Wake::Control),
         () = engine.session_changed() => Wake::SessionChanged,
         () = tlds_changed.notified() => Wake::TldsChanged,
-        () = tokio::time::sleep(retry_after.unwrap_or_default()), if retry_after.is_some() => {
-            Wake::RetryDue
+        () = tokio::time::sleep(timer_after.unwrap_or_default()), if timer_after.is_some() => {
+            Wake::TimerDue
         }
     }
 }
 
 /// The one place that tells the rest of the daemon what the bridge is
-/// doing. The ifindex goes first, so that a reader woken by `Up` finds it
+/// doing, but for [`Handle::publish_cleanup`], which the loop calls before
+/// it. The ifindex goes first, so that a reader woken by `Up` finds it
 /// set. The mode goes last, so that a reader that takes the mode first and
 /// the phase second never gets a new mode with a phase that is older than
 /// it.
@@ -763,11 +1016,10 @@ pub(crate) trait BridgeEngine {
     async fn runs_container(&self, session: Session, id: &str) -> bool;
 
     /// Removes `leftovers` that carry portman's label from the engine of
-    /// `session`, and says whether any is still owed. Does nothing when another
-    /// session exists at the call, or when the UDP port that a bridge
-    /// listens on is taken. Another daemon's bridge holds that port, and so
-    /// can a process that is not portman.
-    async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) -> Cleanup;
+    /// `session`, and says how that ended. Does nothing when another
+    /// session exists at the call, or when it does not get the UDP port
+    /// that a bridge listens on.
+    async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) -> Swept;
 }
 
 /// A bridge that is up. The control loop holds it only through this, so
@@ -785,9 +1037,9 @@ pub(crate) trait Bridge {
     /// Stops the bridge and keeps the docker network and the DNS forwarder.
     async fn shutdown(self);
     /// Stops the bridge and removes the DNS forwarder and the docker
-    /// network. Says whether any of them is still owed, as
-    /// [`BridgeEngine::remove_leftovers`] does.
-    async fn shutdown_and_remove_network(self) -> Cleanup;
+    /// network, and says how that ended. The bridge holds the listen port,
+    /// so its engine is always asked.
+    async fn shutdown_and_remove_network(self) -> CleanupEnd;
 }
 
 /// The engine behind the daemon's link. Its bridges listen on UDP port
@@ -848,16 +1100,44 @@ impl BridgeEngine for LinkedEngine {
             .is_ok_and(|container| container.state.and_then(|state| state.running) == Some(true))
     }
 
-    async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) -> Cleanup {
+    async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) -> Swept {
         let Ok(docker) = docker_of(&self.link, session) else {
             info!(
                 session = session.0,
                 "netbridge cleanup skipped: the engine session that it was planned on has ended"
             );
-            return Cleanup::Owed;
+            return Swept::SessionEnded;
         };
-        portman_netbridge::runtime::remove_leftovers(&docker, self.listen_port, leftovers).await
+        let listen_port = self.listen_port;
+        match runtime::try_remove_leftovers(&docker, listen_port, leftovers).await {
+            Ok(ended) => Swept::Ended(ended),
+            Err(err) => unclaimed(listen_port, leftovers, &err),
+        }
     }
+}
+
+/// Only an address in use says that the port has a holder.
+fn unclaimed(listen_port: u16, leftovers: Leftovers, err: &std::io::Error) -> Swept {
+    if err.kind() != std::io::ErrorKind::AddrInUse {
+        warn!(
+            listen_port,
+            %err,
+            "netbridge leftovers stay in the engine: the claim on the listen port failed. portman tries again at the next docker session"
+        );
+        return Swept::ClaimFailed;
+    }
+    let until = match leftovers {
+        Leftovers::SetupContainer => "",
+        Leftovers::SetupContainerAndNetwork => {
+            ". portman does not ask again until the next `portman bridge disable`"
+        }
+    };
+    info!(
+        listen_port,
+        %err,
+        "netbridge leftovers stay in the engine: the listen port is taken, and its holder may run a bridge on them{until}"
+    );
+    Swept::PortTaken
 }
 
 fn docker_of(link: &watch::Receiver<Link>, wanted: Session) -> Result<Docker> {
@@ -890,7 +1170,7 @@ impl Bridge for Runtime {
         Runtime::shutdown(self).await;
     }
 
-    async fn shutdown_and_remove_network(self) -> Cleanup {
+    async fn shutdown_and_remove_network(self) -> CleanupEnd {
         Runtime::shutdown_and_remove_network(self).await
     }
 }
@@ -910,12 +1190,6 @@ async fn try_start<E: BridgeEngine>(
     Some(bridge)
 }
 
-fn persist(path: &Path, intent: &NetbridgeState) {
-    if let Err(err) = netbridge_state::save(path, intent) {
-        warn!(%err, "persisting netbridge state");
-    }
-}
-
 fn env_forces_enabled() -> bool {
     std::env::var(ENABLE_ENV).is_ok_and(|value| forces_enabled(&value))
 }
@@ -928,6 +1202,7 @@ fn forces_enabled(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runtime::{ENGINE_START_BUDGET, ENGINE_STEP_BUDGET};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tempfile::{tempdir, TempDir};
@@ -948,7 +1223,11 @@ mod tests {
     }
 
     fn intent(enabled: bool, mode: NetbridgeMode) -> NetbridgeState {
-        NetbridgeState { enabled, mode }
+        NetbridgeState {
+            enabled,
+            mode,
+            cleanup_owed: false,
+        }
     }
 
     #[test]
@@ -1268,7 +1547,7 @@ mod tests {
         /// How the next ensure ends.
         ensure: Arc<Mutex<Ensure>>,
         port_held: Arc<AtomicBool>,
-        cleanups_end: Arc<Mutex<Cleanup>>,
+        cleanups_end: Arc<Mutex<CleanupEnd>>,
     }
 
     struct Forwarding {
@@ -1303,7 +1582,7 @@ mod tests {
         seen: mpsc::UnboundedSender<Attempt>,
         swept: mpsc::UnboundedSender<(Session, Leftovers)>,
         /// How each cleanup ends.
-        cleanups_end: Arc<Mutex<Cleanup>>,
+        cleanups_end: Arc<Mutex<CleanupEnd>>,
         /// `None` fails every start.
         probe: Option<Probe>,
     }
@@ -1362,9 +1641,9 @@ mod tests {
             probe.setup_container.lock().unwrap().as_deref() == Some(id)
         }
 
-        async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) -> Cleanup {
+        async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) -> Swept {
             let _ = self.swept.send((session, leftovers));
-            *self.cleanups_end.lock().unwrap()
+            Swept::Ended(*self.cleanups_end.lock().unwrap())
         }
     }
 
@@ -1435,7 +1714,7 @@ mod tests {
             self.free_port();
         }
 
-        async fn shutdown_and_remove_network(mut self) -> Cleanup {
+        async fn shutdown_and_remove_network(mut self) -> CleanupEnd {
             self.probe.clone().stop(Stop::RemovesNetwork).await;
             self.free_port();
             *self.probe.cleanups_end.lock().unwrap()
@@ -1449,7 +1728,7 @@ mod tests {
         state_path: PathBuf,
         attempts: mpsc::UnboundedReceiver<Attempt>,
         sweeps: mpsc::UnboundedReceiver<(Session, Leftovers)>,
-        cleanups_end: Arc<Mutex<Cleanup>>,
+        cleanups_end: Arc<Mutex<CleanupEnd>>,
         stops: mpsc::UnboundedReceiver<Stop>,
         stops_may_end: watch::Sender<bool>,
         phase_at_utun_ask: Arc<Mutex<Vec<BridgePhase>>>,
@@ -1459,7 +1738,8 @@ mod tests {
         forwards: mpsc::UnboundedReceiver<Forwarding>,
         ensure: Arc<Mutex<Ensure>>,
         known_tlds: KnownTlds,
-        _dir: TempDir,
+        daemon: tokio::task::JoinHandle<Result<()>>,
+        dir: TempDir,
     }
 
     const LONGEST_WAIT: Duration = Duration::from_secs(3600);
@@ -1485,13 +1765,43 @@ mod tests {
         }
 
         fn spawn(session: Option<Session>, engine_starts_bridges: bool, forced_on: bool) -> Self {
+            Self::boot(
+                tempdir().unwrap(),
+                session,
+                engine_starts_bridges,
+                forced_on,
+            )
+        }
+
+        /// A daemon that boots on the `netbridge.json` that `saved` holds,
+        /// with an engine in its first session that fails every start.
+        fn boot_on(saved: Option<&str>) -> Self {
             let dir = tempdir().unwrap();
+            if let Some(saved) = saved {
+                std::fs::write(dir.path().join("netbridge.json"), saved).unwrap();
+            }
+            Self::boot(dir, S1, false, false)
+        }
+
+        /// Ends this daemon and boots another on what it saved.
+        async fn restart(self, session: Option<Session>) -> Self {
+            self.daemon.abort();
+            let _ = self.daemon.await;
+            Self::boot(self.dir, session, false, false)
+        }
+
+        fn boot(
+            dir: TempDir,
+            session: Option<Session>,
+            engine_starts_bridges: bool,
+            forced_on: bool,
+        ) -> Self {
             let (sessions, session_seen) = watch::channel(session);
             let bridges_held = Arc::new(AtomicUsize::new(0));
             let state_path = dir.path().join("netbridge.json");
             let (seen, attempts) = mpsc::unbounded_channel();
             let (swept, sweeps) = mpsc::unbounded_channel();
-            let cleanups_end = Arc::new(Mutex::new(Cleanup::Complete));
+            let cleanups_end = Arc::new(Mutex::new(CleanupEnd::Complete));
             let (stop_seen, stops) = mpsc::unbounded_channel();
             let (stops_may_end, may_end) = watch::channel(true);
             let phase_at_utun_ask = Arc::new(Mutex::new(Vec::new()));
@@ -1524,7 +1834,7 @@ mod tests {
                     cleanups_end: cleanups_end.clone(),
                 }),
             };
-            tokio::spawn(converge(
+            let daemon = tokio::spawn(converge(
                 engine,
                 handle.clone(),
                 rx,
@@ -1550,7 +1860,8 @@ mod tests {
                 forwards,
                 ensure,
                 known_tlds,
-                _dir: dir,
+                daemon,
+                dir,
             }
         }
 
@@ -1618,7 +1929,7 @@ mod tests {
             self.container_asks.lock().unwrap().clone()
         }
 
-        fn cleanups_end(&self, cleanup: Cleanup) {
+        fn cleanups_end(&self, cleanup: CleanupEnd) {
             *self.cleanups_end.lock().unwrap() = cleanup;
         }
 
@@ -1639,7 +1950,7 @@ mod tests {
         }
 
         async fn send(&self, msg: Control) {
-            self.handle.tx.send(msg).await.unwrap();
+            self.handle.send(msg).await.unwrap();
         }
 
         async fn next_attempt(&mut self) -> Attempt {
@@ -1885,7 +2196,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_stop_that_left_the_network_owed_is_followed_up_at_the_next_session() {
         let mut rig = Rig::up().await;
-        rig.cleanups_end(Cleanup::Owed);
+        rig.cleanups_end(CleanupEnd::Failed);
 
         rig.send(Control::Disable).await;
 
@@ -1960,7 +2271,7 @@ mod tests {
             state_path: PathBuf::new(),
             seen,
             swept,
-            cleanups_end: Arc::new(Mutex::new(Cleanup::Complete)),
+            cleanups_end: Arc::new(Mutex::new(CleanupEnd::Complete)),
             probe: None,
         };
         (engine, sessions)
@@ -1990,7 +2301,7 @@ mod tests {
         let wake = tokio::time::timeout(LONGEST_WAIT, wait)
             .await
             .expect("the retry timer ends the wait");
-        assert!(matches!(wake, Wake::RetryDue));
+        assert!(matches!(wake, Wake::TimerDue));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2401,6 +2712,12 @@ mod tests {
         "State": {"Running": true}
     }"#;
     const FORWARDER_BY_ID: &str = "/containers/dddd2222";
+    const LEFTOVERS: [(&str, &str); 4] = [
+        (SETUP_CONTAINER, OWN_SETUP_CONTAINER),
+        (NETWORK, OWN_NETWORK),
+        (FORWARDER, OWN_FORWARDER),
+        ("/containers/dddd2222/json", OWN_FORWARDER),
+    ];
 
     /// A listen port that nobody holds: a bind to port 0 gets a port that
     /// the system picks. A port that a test binds and frees is not safe,
@@ -2413,10 +2730,9 @@ mod tests {
         listen_port: u16,
     ) -> (LinkedEngine, Arc<crate::engine::tests::FakeEngine>) {
         let (engine, fake) = empty_engine(listen_port);
-        fake.hold(SETUP_CONTAINER, OWN_SETUP_CONTAINER);
-        fake.hold(NETWORK, OWN_NETWORK);
-        fake.hold(FORWARDER, OWN_FORWARDER);
-        fake.hold(&format!("{FORWARDER_BY_ID}/json"), OWN_FORWARDER);
+        for (path, json) in LEFTOVERS {
+            fake.hold(path, json);
+        }
         (engine, fake)
     }
 
@@ -2472,6 +2788,13 @@ mod tests {
             let bytes = std::mem::take(&mut *self.0.lock().unwrap());
             let text = String::from_utf8(bytes).unwrap();
             text.lines().map(String::from).collect()
+        }
+
+        /// Takes the lines since the last call and returns the warnings.
+        fn take_warnings(&self) -> Vec<String> {
+            let mut lines = self.lines();
+            lines.retain(|line| line.contains("WARN"));
+            lines
         }
     }
 
@@ -2569,7 +2892,7 @@ mod tests {
             .await;
 
         assert_eq!(fake.calls(), [] as [&str; 0]);
-        assert_eq!(cleanup, Cleanup::Owed);
+        assert_eq!(cleanup, Swept::SessionEnded);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2583,7 +2906,32 @@ mod tests {
             .await;
 
         assert_eq!(fake.calls(), [] as [&str; 0]);
-        assert_eq!(cleanup, Cleanup::Owed);
+        assert_eq!(cleanup, Swept::PortTaken);
+    }
+
+    #[test]
+    fn only_a_listen_port_that_is_taken_ends_the_debt_of_a_cleanup_that_did_not_get_it() {
+        let (logged, _capture) = Logged::capture();
+
+        let taken = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        let swept = unclaimed(HOST_WG_LISTEN_PORT, SetupContainerAndNetwork, &taken);
+
+        assert_eq!(swept, Swept::PortTaken);
+        assert_eq!(logged.take_warnings(), [] as [&str; 0]);
+
+        let out_of_descriptors = std::io::Error::from(nix::errno::Errno::EMFILE);
+        let swept = unclaimed(
+            HOST_WG_LISTEN_PORT,
+            SetupContainerAndNetwork,
+            &out_of_descriptors,
+        );
+
+        assert!(!swept.ends_the_debt(), "{swept:?}");
+        assert_eq!(swept.holds(), Some(BridgeCleanup::Failed));
+        let warnings = logged.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("Too many open files"), "{warnings:?}");
+        assert!(!warnings[0].contains("is taken"), "{warnings:?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2625,6 +2973,107 @@ mod tests {
         assert!(warnings[0].contains(&cause), "{}", warnings[0]);
     }
 
+    fn says_no_answer_within(budget: Duration) -> String {
+        let secs = budget.as_secs();
+        format!("the container engine gave no answer within {secs} s")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cleanup_on_an_engine_that_froze_ends_owed_when_its_budget_is_spent_and_says_so() {
+        for frozen_at in [SETUP_CONTAINER, FORWARDER, NETWORK] {
+            let (engine, fake) = engine_with_leftovers(FREE_PORT);
+            fake.hang(frozen_at);
+            let (logged, _capture) = Logged::capture();
+
+            let asked = Instant::now();
+            let cleanup = engine.remove_leftovers(Session(1), SetupContainerAndNetwork);
+            let cleanup = tokio::time::timeout(LONGEST_WAIT, cleanup)
+                .await
+                .unwrap_or_else(|_| panic!("the cleanup waited for the engine at {frozen_at}"));
+
+            assert_eq!(cleanup, Swept::Ended(CleanupEnd::NoAnswer), "{frozen_at}");
+            assert_eq!(asked.elapsed(), ENGINE_STEP_BUDGET, "{frozen_at}");
+            let warnings = logged.take_warnings();
+            assert_eq!(warnings.len(), 1, "{frozen_at} {warnings:?}");
+            let no_answer = says_no_answer_within(ENGINE_STEP_BUDGET);
+            assert!(warnings[0].contains(&no_answer), "{}", warnings[0]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_start_on_an_engine_that_froze_fails_when_its_budget_is_spent_and_says_so() {
+        let (engine, fake) = engine_with_leftovers(FREE_PORT);
+        fake.hang(NETWORK);
+        let (logged, _capture) = Logged::capture();
+
+        let asked = Instant::now();
+        let mut attempts = Attempts::new();
+        let start = try_start(&engine, Session(1), OptIn, &mut attempts);
+        let started = tokio::time::timeout(LONGEST_WAIT, start)
+            .await
+            .expect("the start waited for the engine");
+
+        assert!(started.is_none(), "a bridge started on a frozen engine");
+        assert_eq!(asked.elapsed(), ENGINE_START_BUDGET);
+        let warnings = logged.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let cause = format!("err={}", says_no_answer_within(ENGINE_START_BUDGET));
+        assert!(warnings[0].contains(&cause), "{}", warnings[0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_start_that_uses_up_every_wait_inside_it_fails_for_its_own_reason() {
+        let (engine, fake) = engine_with_leftovers(FREE_PORT);
+        fake.hold_what_it_creates(SETUP_CONTAINER, OWN_SETUP_CONTAINER);
+        fake.hold("/containers/portman-netbridge-setup/logs", "");
+        fake.be_slow(crate::engine::tests::Slow {
+            stop: Duration::from_millis(4_900),
+            removal: Duration::from_millis(9_900),
+        });
+        let (logged, _capture) = Logged::capture();
+
+        let asked = Instant::now();
+        let started = try_start(&engine, Session(1), OptIn, &mut Attempts::new()).await;
+
+        assert!(
+            started.is_none(),
+            "a bridge started with no key from the VM"
+        );
+        let warnings = logged.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let cause = "err=netbridge setup container did not report VM_PUBKEY";
+        assert!(warnings[0].contains(cause), "{}", warnings[0]);
+        let waited = asked.elapsed();
+        assert!(waited > Duration::from_secs(39), "{waited:?}");
+        let removals = fake
+            .calls()
+            .into_iter()
+            .filter(|call| call == "DELETE /containers/portman-netbridge-setup");
+        assert_eq!(removals.count(), 2, "the old setup container and its own");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_setup_container_that_the_engine_keeps_fails_its_cleanup_before_the_budget_is_spent()
+    {
+        let (engine, fake) = engine_with_leftovers(FREE_PORT);
+        fake.be_slow(crate::engine::tests::Slow {
+            stop: Duration::ZERO,
+            removal: LONGEST_WAIT,
+        });
+        let (logged, _capture) = Logged::capture();
+
+        let asked = Instant::now();
+        let cleanup = engine.remove_leftovers(Session(1), SetupContainer).await;
+
+        assert_eq!(cleanup, Swept::Ended(CleanupEnd::Failed));
+        let waited = asked.elapsed();
+        assert!(waited < ENGINE_STEP_BUDGET, "{waited:?}");
+        let warnings = logged.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let stays = "still present 10s after removal";
+        assert!(warnings[0].contains(stays), "{}", warnings[0]);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn with_the_listen_port_free_the_forwarder_and_the_network_go_only_when_asked_for() {
         let container = "/containers/portman-netbridge-setup";
@@ -2640,7 +3089,7 @@ mod tests {
 
             let cleanup = engine.remove_leftovers(Session(1), leftovers).await;
 
-            assert_eq!(cleanup, Cleanup::Complete, "{leftovers:?}");
+            assert_eq!(cleanup, Swept::Ended(CleanupEnd::Complete), "{leftovers:?}");
             let calls = fake.calls();
             let removed: Vec<_> = calls
                 .iter()
@@ -2691,25 +3140,25 @@ mod tests {
         let own_container = Some(OWN_SETUP_CONTAINER);
         // (setup container, network, asked for) → how the cleanup ends
         let cases = [
-            (None, None, both, Cleanup::Complete),
+            (None, None, both, CleanupEnd::Complete),
             (
                 own_container,
                 Some(anothers_network),
                 both,
-                Cleanup::Complete,
+                CleanupEnd::Complete,
             ),
             (
                 own_container,
                 Some(unreadable),
                 container_only,
-                Cleanup::Complete,
+                CleanupEnd::Complete,
             ),
-            (own_container, Some(unreadable), both, Cleanup::Owed),
+            (own_container, Some(unreadable), both, CleanupEnd::Failed),
             (
                 Some(anothers_container),
                 Some(OWN_NETWORK),
                 both,
-                Cleanup::Complete,
+                CleanupEnd::Complete,
             ),
         ];
         for (container, network, leftovers, want) in cases {
@@ -2723,7 +3172,11 @@ mod tests {
 
             let cleanup = engine.remove_leftovers(Session(1), leftovers).await;
 
-            assert_eq!(cleanup, want, "{container:?} {network:?} {leftovers:?}");
+            assert_eq!(
+                cleanup,
+                Swept::Ended(want),
+                "{container:?} {network:?} {leftovers:?}"
+            );
             let calls = fake.calls();
             let removed = |path: &str| calls.contains(&format!("DELETE {path}"));
             assert_eq!(
@@ -2750,13 +3203,13 @@ mod tests {
         let connection_cut = None;
         // the removals that fail, and how → how the cleanup ends
         let cases = [
-            (vec![(NETWORK, Some(IN_USE))], Cleanup::Complete),
-            (vec![(NETWORK, Some(ENGINE_FAILED))], Cleanup::Owed),
-            (vec![(NETWORK, connection_cut)], Cleanup::Owed),
-            (vec![(container, Some(ENGINE_FAILED))], Cleanup::Owed),
+            (vec![(NETWORK, Some(IN_USE))], CleanupEnd::Complete),
+            (vec![(NETWORK, Some(ENGINE_FAILED))], CleanupEnd::Failed),
+            (vec![(NETWORK, connection_cut)], CleanupEnd::Failed),
+            (vec![(container, Some(ENGINE_FAILED))], CleanupEnd::Failed),
             (
                 vec![(container, Some(ENGINE_FAILED)), (NETWORK, Some(IN_USE))],
-                Cleanup::Complete,
+                CleanupEnd::Complete,
             ),
         ];
         for (failures, want) in cases {
@@ -2769,7 +3222,25 @@ mod tests {
                 .remove_leftovers(Session(1), SetupContainerAndNetwork)
                 .await;
 
-            assert_eq!(cleanup, want, "{failures:?}");
+            assert_eq!(cleanup, Swept::Ended(want), "{failures:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_that_failed_logs_what_the_engine_said() {
+        let container = "/containers/portman-netbridge-setup";
+        for kept in [container, FORWARDER_BY_ID, NETWORK] {
+            let (engine, fake) = engine_with_leftovers(FREE_PORT);
+            fake.fail_delete(kept, Some(ENGINE_FAILED));
+            let (logged, _capture) = Logged::capture();
+
+            engine
+                .remove_leftovers(Session(1), SetupContainerAndNetwork)
+                .await;
+
+            let warnings = logged.take_warnings();
+            assert_eq!(warnings.len(), 1, "{kept} {warnings:?}");
+            assert!(warnings[0].contains(ENGINE_FAILED.1), "{}", warnings[0]);
         }
     }
 
@@ -2779,6 +3250,7 @@ mod tests {
         engine: Engine,
         fake: Arc<crate::engine::tests::FakeEngine>,
         sessions: watch::Sender<Link>,
+        state_path: PathBuf,
         _dir: TempDir,
     }
 
@@ -2787,6 +3259,20 @@ mod tests {
         /// path in `held`, and returns after the cleanup of the first
         /// session.
         async fn start(held: &[(&str, &str)]) -> Self {
+            Self::start_on(FREE_PORT, held).await
+        }
+
+        /// As [`OnFakeEngine::start`], with the bridges of this daemon on
+        /// UDP port `listen_port`.
+        async fn start_on(listen_port: u16, held: &[(&str, &str)]) -> Self {
+            let daemon = Self::boot(listen_port, held, None);
+            tokio::time::sleep(LONGEST_WAIT).await;
+            daemon
+        }
+
+        /// Boots the loop on the `netbridge.json` that `saved` holds, and
+        /// returns before the loop has run.
+        fn boot(listen_port: u16, held: &[(&str, &str)], saved: Option<&str>) -> Self {
             let (engine, sessions) = crate::engine::channel();
             let fake = crate::engine::tests::connect(&sessions);
             for (path, json) in held {
@@ -2794,33 +3280,36 @@ mod tests {
             }
             let linked = LinkedEngine {
                 link: engine.watch(),
-                listen_port: FREE_PORT,
+                listen_port,
             };
             let (handle, rx, phase_tx) = handle_pair();
             let dir = tempdir().unwrap();
             let state_path = dir.path().join("netbridge.json");
+            if let Some(saved) = saved {
+                std::fs::write(&state_path, saved).unwrap();
+            }
             tokio::spawn(converge(
                 linked,
                 handle.clone(),
                 rx,
                 phase_tx,
-                state_path,
+                state_path.clone(),
                 false,
                 KnownTlds::default(),
             ));
-            tokio::time::sleep(LONGEST_WAIT).await;
             Self {
                 handle,
                 engine,
                 fake,
                 sessions,
+                state_path,
                 _dir: dir,
             }
         }
 
         /// Returns when the loop has nothing left to do for the message.
         async fn disable(&self) {
-            self.handle.tx.send(Control::Disable).await.unwrap();
+            self.handle.send(Control::Disable).await.unwrap();
             tokio::time::sleep(LONGEST_WAIT).await;
         }
 
@@ -2842,6 +3331,41 @@ mod tests {
             calls.retain(|call| call.ends_with(NETWORK));
             calls
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_on_an_engine_that_froze_waits_one_step_budget_and_asks_no_second_time() {
+        let daemon = OnFakeEngine::start(&[(NETWORK, OWN_NETWORK)]).await;
+        daemon.fake.hang(NETWORK);
+        let (logged, _capture) = Logged::capture();
+
+        let disabled = Instant::now();
+        daemon.handle.send(Control::Disable).await.unwrap();
+        let poll = Duration::from_millis(100);
+        let mut warnings = logged.take_warnings();
+        while warnings.is_empty() && disabled.elapsed() < LONGEST_WAIT {
+            tokio::time::sleep(poll).await;
+            warnings = logged.take_warnings();
+        }
+
+        let waited = disabled.elapsed();
+        assert!(
+            waited >= ENGINE_STEP_BUDGET && waited <= ENGINE_STEP_BUDGET + poll,
+            "{waited:?}"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let no_answer = says_no_answer_within(ENGINE_STEP_BUDGET);
+        assert!(warnings[0].contains(&no_answer), "{}", warnings[0]);
+
+        let asked = daemon.fake.calls();
+        tokio::time::sleep(LONGEST_WAIT).await;
+
+        assert_eq!(logged.take_warnings(), [] as [&str; 0]);
+        assert_eq!(
+            daemon.fake.calls(),
+            asked,
+            "a second cleanup on the session"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2906,14 +3430,14 @@ mod tests {
         let both = SetupContainerAndNetwork;
         let network_in_use = Some((NETWORK, IN_USE));
         let forwarder_stays = Some((FORWARDER_BY_ID, ENGINE_FAILED));
-        let (complete, owed) = (Cleanup::Complete, Cleanup::Owed);
+        let (complete, failed) = (CleanupEnd::Complete, CleanupEnd::Failed);
         // (forwarder, the removal that fails, asked for)
         //     → (how the cleanup ends, the engine was asked to remove the forwarder)
         let cases = [
             (OWN_FORWARDER, None, both, complete, true),
             (OWN_FORWARDER, network_in_use, both, complete, true),
-            (OWN_FORWARDER, forwarder_stays, both, owed, true),
-            (unreadable, None, both, owed, false),
+            (OWN_FORWARDER, forwarder_stays, both, failed, true),
+            (unreadable, None, both, failed, false),
             (unreadable, network_in_use, both, complete, false),
             (anothers_container, None, both, complete, false),
             (unreadable, None, SetupContainer, complete, false),
@@ -2928,7 +3452,7 @@ mod tests {
 
             let cleanup = engine.remove_leftovers(Session(1), leftovers).await;
 
-            assert_eq!(cleanup, want, "{case}");
+            assert_eq!(cleanup, Swept::Ended(want), "{case}");
             let calls = fake.calls();
             let removal_of = |path: &str| {
                 calls
@@ -2964,7 +3488,7 @@ mod tests {
             false,
             tlds,
         ));
-        handle.tx.send(Control::Disable).await.unwrap();
+        handle.send(Control::Disable).await.unwrap();
         tokio::time::sleep(LONGEST_WAIT).await;
 
         let fake = crate::engine::tests::connect(&publisher);
@@ -3060,7 +3584,7 @@ mod tests {
         assert_eq!(rig.next_sweep().await, (Session(1), SetupContainer));
         let network_owed = |session| (Session(session), SetupContainerAndNetwork);
 
-        rig.cleanups_end(Cleanup::Owed);
+        rig.cleanups_end(CleanupEnd::Failed);
         rig.send(Control::Disable).await;
         assert_eq!(rig.next_sweep().await, network_owed(1));
         rig.no_sweep_follows().await;
@@ -3069,7 +3593,7 @@ mod tests {
         assert_eq!(rig.next_sweep().await, network_owed(2));
         rig.no_sweep_follows().await;
 
-        rig.cleanups_end(Cleanup::Complete);
+        rig.cleanups_end(CleanupEnd::Complete);
         rig.engine_session(Some(Session(3)));
         assert_eq!(rig.next_sweep().await, network_owed(3));
         rig.no_sweep_follows().await;
@@ -3120,5 +3644,479 @@ mod tests {
         );
         assert_eq!(rig.phase(), BridgePhase::Disabled);
         rig.no_attempt_follows().await;
+    }
+
+    /// What `netbridge.json` says about a cleanup that a disable left owed.
+    fn saved_debt(state_path: &Path) -> serde_json::Value {
+        let saved = std::fs::read(state_path).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        saved["cleanup_owed"].clone()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_that_found_no_session_is_paid_after_a_daemon_restart() {
+        let mut rig = Rig::spawn(None, false, false);
+        rig.send(Control::Disable).await;
+        rig.no_sweep_follows().await;
+        assert_eq!(saved_debt(&rig.state_path), true);
+
+        let mut rig = rig.restart(None).await;
+        rig.no_sweep_follows().await;
+        rig.engine_session(S1);
+
+        assert_eq!(
+            rig.next_sweep().await,
+            (Session(1), SetupContainerAndNetwork)
+        );
+        rig.no_sweep_follows().await;
+        assert_eq!(saved_debt(&rig.state_path), false);
+
+        let mut rig = rig.restart(S1).await;
+        assert_eq!(rig.next_sweep().await, (Session(1), SetupContainer));
+        rig.no_sweep_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_that_failed_is_made_again_when_the_loop_next_wakes() {
+        let mut rig = Rig::spawn(None, false, false);
+        rig.send(Control::Disable).await;
+        rig.no_sweep_follows().await;
+        assert_eq!(saved_debt(&rig.state_path), true);
+
+        // No file can replace a directory, whoever writes.
+        std::fs::remove_file(&rig.state_path).unwrap();
+        std::fs::create_dir(&rig.state_path).unwrap();
+        let (logged, _capture) = Logged::capture();
+        rig.engine_session(S1);
+        let swept = rig.next_sweep().await;
+        rig.no_sweep_follows().await;
+
+        assert_eq!(swept, (Session(1), SetupContainerAndNetwork));
+        let warnings = logged.take_warnings();
+        assert!(!warnings.is_empty(), "a write that failed and no warning");
+        for warning in &warnings {
+            assert!(warning.contains("Is a directory"), "{warning}");
+        }
+        std::fs::remove_dir(&rig.state_path).expect("the write replaced the directory");
+
+        rig.manage(&["test", "demo"]);
+        rig.no_sweep_follows().await;
+
+        assert_eq!(saved_debt(&rig.state_path), false);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_enable_ends_the_debt_and_the_next_disable_owes_anew() {
+        let mut rig = Rig::spawn(None, false, false);
+        rig.send(Control::Disable).await;
+        rig.no_sweep_follows().await;
+        assert_eq!(saved_debt(&rig.state_path), true);
+
+        rig.send(Control::Enable).await;
+        rig.reaches(BridgePhase::WaitingForDocker).await;
+        assert_eq!(saved_debt(&rig.state_path), false);
+
+        let mut rig = rig.restart(None).await;
+        rig.send(Control::Disable).await;
+        rig.no_sweep_follows().await;
+        assert_eq!(saved_debt(&rig.state_path), true);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_boot_owes_the_network_only_when_the_saved_state_says_so() {
+        // what `netbridge.json` holds at boot → what the first session is swept of
+        let table = [
+            (None, SetupContainer),
+            (Some(r#"{"enabled":false}"#), SetupContainer),
+            (
+                Some(r#"{"enabled":false,"cleanup_owed":false}"#),
+                SetupContainer,
+            ),
+            (
+                Some(r#"{"enabled":false,"cleanup_owed":true}"#),
+                SetupContainerAndNetwork,
+            ),
+        ];
+        for (saved, swept) in table {
+            let mut rig = Rig::boot_on(saved);
+
+            assert_eq!(rig.next_sweep().await, (Session(1), swept), "{saved:?}");
+            rig.no_sweep_follows().await;
+            rig.daemon.abort();
+        }
+    }
+
+    /// A client of the daemon that the bridge loop of `handle` runs in.
+    struct Client {
+        state: crate::DaemonState,
+        _dir: TempDir,
+    }
+
+    impl Client {
+        fn of(handle: &Handle) -> Self {
+            let dir = tempdir().unwrap();
+            let mut state = crate::handlers::tests::test_state(&dir);
+            state.netbridge = handle.clone();
+            Self { state, _dir: dir }
+        }
+
+        /// Sends what `portman bridge disable` sends, and returns when the
+        /// daemon has answered. The loop has not acted on it by then.
+        async fn disable(&self) {
+            let request = portman_core::Request::BridgeDisable;
+            let answer = crate::handlers::dispatch(request, &self.state).await;
+            assert!(matches!(answer, portman_core::Response::Ok), "{answer:?}");
+        }
+
+        /// What status says about the cleanup that a disable asked for.
+        async fn bridge_cleanup(&self) -> serde_json::Value {
+            let request = portman_core::Request::Status;
+            let status = crate::handlers::dispatch(request, &self.state).await;
+            serde_json::to_value(&status).unwrap()["bridge_cleanup"].clone()
+        }
+    }
+
+    fn no_answer_in_status() -> serde_json::Value {
+        serde_json::json!({"state": "no_answer", "within_secs": ENGINE_STEP_BUDGET.as_secs()})
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_debt_that_no_cleanup_ended_is_saved_and_status_says_what_holds_it() {
+        use serde_json::json;
+        #[derive(Debug)]
+        enum Engine {
+            RemovesTheNetwork,
+            RefusesANetworkInUse,
+            FailsTheRemoval,
+            GivesNoAnswer,
+        }
+        // how the engine takes the removal of the network
+        //     → (the debt that is saved, what status says of the cleanup)
+        let table = [
+            (Engine::RemovesTheNetwork, false, json!(null)),
+            (Engine::RefusesANetworkInUse, false, json!(null)),
+            (Engine::FailsTheRemoval, true, json!({"state": "failed"})),
+            (Engine::GivesNoAnswer, true, no_answer_in_status()),
+        ];
+        for (engine, owed, says) in table {
+            let daemon = OnFakeEngine::start(&[(NETWORK, OWN_NETWORK)]).await;
+            match engine {
+                Engine::RemovesTheNetwork => {}
+                Engine::RefusesANetworkInUse => daemon.fake.fail_delete(NETWORK, Some(IN_USE)),
+                Engine::FailsTheRemoval => daemon.fake.fail_delete(NETWORK, Some(ENGINE_FAILED)),
+                Engine::GivesNoAnswer => daemon.fake.hang(NETWORK),
+            }
+            let client = Client::of(&daemon.handle);
+
+            client.disable().await;
+            tokio::time::sleep(LONGEST_WAIT).await;
+
+            assert_eq!(saved_debt(&daemon.state_path), owed, "{engine:?}");
+            assert_eq!(client.bridge_cleanup().await, says, "{engine:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_reads_as_pending_from_its_request_until_its_cleanup_has_ended() {
+        use serde_json::json;
+        let daemon = OnFakeEngine::start(&[(NETWORK, OWN_NETWORK)]).await;
+        daemon.fake.hang(NETWORK);
+        let client = Client::of(&daemon.handle);
+        let pending = json!({"state": "pending"});
+        assert_eq!(client.bridge_cleanup().await, json!(null));
+
+        client.disable().await;
+
+        let cleanup = client.bridge_cleanup().await;
+        assert_eq!(cleanup, pending, "before the loop has acted on the request");
+        let second = Duration::from_secs(1);
+        tokio::time::sleep(ENGINE_STEP_BUDGET - second).await;
+        let cleanup = client.bridge_cleanup().await;
+        assert_eq!(cleanup, pending, "while the cleanup is in flight");
+        tokio::time::sleep(second * 2).await;
+        assert_eq!(client.bridge_cleanup().await, no_answer_in_status());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_says_that_a_cleanup_waits_for_docker_until_a_session_has_paid_it() {
+        use serde_json::json;
+        let (engine, publisher) = crate::engine::channel();
+        let engine = LinkedEngine {
+            link: engine.watch(),
+            listen_port: FREE_PORT,
+        };
+        let (handle, rx, phase_tx) = handle_pair();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("netbridge.json");
+        let tlds = KnownTlds::default();
+        tokio::spawn(converge(
+            engine,
+            handle.clone(),
+            rx,
+            phase_tx,
+            state_path,
+            false,
+            tlds,
+        ));
+        let client = Client::of(&handle);
+
+        client.disable().await;
+        tokio::time::sleep(LONGEST_WAIT).await;
+
+        let cleanup = client.bridge_cleanup().await;
+        assert_eq!(cleanup, json!({"state": "waits_for_docker"}));
+
+        let fake = crate::engine::tests::connect(&publisher);
+        fake.hold(NETWORK, OWN_NETWORK);
+        tokio::time::sleep(LONGEST_WAIT).await;
+
+        assert_eq!(client.bridge_cleanup().await, json!(null));
+    }
+
+    const OWES_A_CLEANUP: &str = r#"{"enabled":false,"cleanup_owed":true}"#;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_debt_from_before_a_session_is_paid_only_after_the_head_start_of_other_bridges() {
+        let everything = |session| (Session(session), SetupContainerAndNetwork);
+
+        let mut loaded_at_boot = Rig::boot_on(Some(OWES_A_CLEANUP));
+        let opened = Instant::now();
+        assert_eq!(loaded_at_boot.next_sweep().await, everything(1));
+        assert_eq!(opened.elapsed(), HEAD_START, "loaded at boot");
+
+        let mut saved_with_no_session = Rig::spawn(None, false, false);
+        saved_with_no_session.send(Control::Disable).await;
+        saved_with_no_session.no_sweep_follows().await;
+        saved_with_no_session.engine_session(S1);
+        let opened = Instant::now();
+        assert_eq!(saved_with_no_session.next_sweep().await, everything(1));
+        assert_eq!(opened.elapsed(), HEAD_START, "saved with no session");
+
+        let mut left_by_a_failed_cleanup = Rig::start();
+        left_by_a_failed_cleanup.cleanups_end(CleanupEnd::Failed);
+        left_by_a_failed_cleanup.send(Control::Disable).await;
+        assert_eq!(left_by_a_failed_cleanup.next_sweep().await, everything(1));
+        left_by_a_failed_cleanup.no_sweep_follows().await;
+        left_by_a_failed_cleanup.engine_session(S2);
+        let opened = Instant::now();
+        assert_eq!(left_by_a_failed_cleanup.next_sweep().await, everything(2));
+        assert_eq!(opened.elapsed(), HEAD_START, "left by a failed cleanup");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_that_ends_inside_the_head_start_begins_it_again_at_the_next_session() {
+        let mut rig = Rig::boot_on(Some(OWES_A_CLEANUP));
+        let moment = Duration::from_millis(1);
+
+        tokio::time::sleep(HEAD_START - moment).await;
+        rig.engine_session(None);
+        tokio::time::sleep(HEAD_START).await;
+        rig.engine_session(S2);
+        let opened = Instant::now();
+
+        assert_eq!(
+            rig.next_sweep().await,
+            (Session(2), SetupContainerAndNetwork),
+            "a cleanup on the session that ended"
+        );
+        assert_eq!(opened.elapsed(), HEAD_START);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_stop_of_a_bridge_on_a_young_session_reads_as_a_removal_that_runs() {
+        let mut rig = Rig::up().await;
+        rig.hold_stops();
+
+        rig.send(Control::Disable).await;
+        assert_eq!(rig.next_stop().await, Stop::RemovesNetwork);
+
+        assert_eq!(rig.handle.cleanup(), Some(BridgeCleanup::Pending));
+
+        rig.end_stops();
+        rig.reaches(BridgePhase::Disabled).await;
+        assert_eq!(rig.handle.cleanup(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_enable_inside_the_head_start_is_served_at_once_and_ends_the_debt() {
+        let mut rig = Rig::boot_on(Some(OWES_A_CLEANUP));
+        tokio::time::sleep(HEAD_START / 2).await;
+
+        let enabled = Instant::now();
+        rig.send(Control::Enable).await;
+        rig.next_attempt().await;
+
+        assert_eq!(enabled.elapsed(), Duration::ZERO);
+        assert_eq!(saved_debt(&rig.state_path), false);
+        rig.no_sweep_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_is_paid_at_once_on_a_session_that_has_been_open_for_the_head_start() {
+        let mut rig = Rig::start();
+        let opened = Instant::now();
+        assert_eq!(rig.next_sweep().await, (Session(1), SetupContainer));
+        assert_eq!(opened.elapsed(), HEAD_START);
+
+        let disabled = Instant::now();
+        rig.send(Control::Disable).await;
+
+        assert_eq!(
+            rig.next_sweep().await,
+            (Session(1), SetupContainerAndNetwork)
+        );
+        assert_eq!(disabled.elapsed(), Duration::ZERO);
+        rig.no_sweep_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_on_a_younger_session_is_taken_at_once_and_paid_when_the_head_start_is_over()
+    {
+        let mut rig = Rig::start();
+        let opened = Instant::now();
+        tokio::time::sleep(HEAD_START / 5).await;
+
+        rig.send(Control::Disable).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        assert_eq!(saved_debt(&rig.state_path), true);
+        assert_eq!(
+            rig.next_sweep().await,
+            (Session(1), SetupContainerAndNetwork),
+            "a cleanup before the disable"
+        );
+        assert_eq!(opened.elapsed(), HEAD_START);
+        rig.no_sweep_follows().await;
+    }
+
+    #[test]
+    fn a_cleanup_that_waits_for_docker_says_how_long_after_the_connect_it_runs() {
+        let stated = format!("{} s after Docker connects", HEAD_START.as_secs());
+
+        let words = BridgeCleanup::WaitsForDocker.in_words();
+
+        assert!(words.contains(&stated), "{words}");
+    }
+
+    #[test]
+    fn the_readme_states_the_head_start_that_a_bridge_of_another_daemon_gets() {
+        let readme = include_str!("../../../README.md");
+        let stated = format!(
+            "until Docker has been connected for {} s",
+            HEAD_START.as_secs()
+        );
+
+        assert_eq!(readme.matches(&stated).count(), 2, "{stated}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_engine_is_asked_nothing_during_the_head_start_and_for_what_is_owed_after_it() {
+        use serde_json::json;
+        #[derive(Debug, PartialEq)]
+        enum Owed {
+            ADebtFromBeforeTheBoot,
+            ADisableTwoSecondsIn,
+            TheSetupContainerOnly,
+        }
+        let container = "/containers/portman-netbridge-setup";
+        let everything = vec![container, FORWARDER_BY_ID, NETWORK];
+        let waits = json!({"state": "waits_for_bridges", "for_secs": 10});
+        let (moment, two_seconds) = (Duration::from_millis(1), Duration::from_secs(2));
+        // what the session owes
+        //     → (what status says during the head start, what goes after it)
+        let table = [
+            (
+                Owed::ADebtFromBeforeTheBoot,
+                waits.clone(),
+                everything.clone(),
+            ),
+            (Owed::ADisableTwoSecondsIn, waits, everything),
+            (Owed::TheSetupContainerOnly, json!(null), vec![container]),
+        ];
+        for (owed, says, goes) in table {
+            let saved = (owed == Owed::ADebtFromBeforeTheBoot).then_some(OWES_A_CLEANUP);
+            let daemon = OnFakeEngine::boot(FREE_PORT, &LEFTOVERS, saved);
+            let client = Client::of(&daemon.handle);
+            tokio::time::sleep(two_seconds).await;
+            if owed == Owed::ADisableTwoSecondsIn {
+                client.disable().await;
+            }
+
+            tokio::time::sleep(HEAD_START - two_seconds - moment).await;
+
+            assert_eq!(daemon.fake.calls(), [] as [&str; 0], "{owed:?}");
+            assert_eq!(client.bridge_cleanup().await, says, "{owed:?}");
+
+            tokio::time::sleep(moment * 2).await;
+
+            let calls = daemon.fake.calls();
+            let removed: Vec<_> = calls
+                .iter()
+                .filter_map(|call| call.strip_prefix("DELETE "))
+                .collect();
+            assert_eq!(removed, goes, "{owed:?} {calls:?}");
+            assert_eq!(client.bridge_cleanup().await, json!(null), "{owed:?}");
+            if owed != Owed::TheSetupContainerOnly {
+                assert_eq!(saved_debt(&daemon.state_path), false, "{owed:?}");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listen_port_that_is_taken_when_the_head_start_ends_ends_the_debt_with_no_request() {
+        let another_daemons_bridge = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let taken = another_daemons_bridge.local_addr().unwrap().port();
+        let daemon = OnFakeEngine::boot(taken, &LEFTOVERS, Some(OWES_A_CLEANUP));
+        let client = Client::of(&daemon.handle);
+        let moment = Duration::from_millis(1);
+
+        tokio::time::sleep(HEAD_START - moment).await;
+
+        let waits = serde_json::json!({"state": "waits_for_bridges", "for_secs": 10});
+        assert_eq!(client.bridge_cleanup().await, waits);
+        assert_eq!(saved_debt(&daemon.state_path), true);
+
+        tokio::time::sleep(moment * 2).await;
+
+        let port_taken = serde_json::json!({"state": "port_taken"});
+        assert_eq!(client.bridge_cleanup().await, port_taken);
+        assert_eq!(saved_debt(&daemon.state_path), false);
+        assert_eq!(daemon.fake.calls(), [] as [&str; 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listen_port_that_is_taken_ends_the_debt_for_that_disable() {
+        let another_daemons_bridge = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let taken = another_daemons_bridge.local_addr().unwrap().port();
+        let held = [(NETWORK, OWN_NETWORK), (FORWARDER, OWN_FORWARDER)];
+        let daemon = OnFakeEngine::start_on(taken, &held).await;
+        let client = Client::of(&daemon.handle);
+        let (logged, _capture) = Logged::capture();
+
+        daemon.disable().await;
+
+        assert_eq!(daemon.fake.calls(), [] as [&str; 0]);
+        let cleanup = client.bridge_cleanup().await;
+        assert_eq!(cleanup, serde_json::json!({"state": "port_taken"}));
+        let lines = logged.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let final_for_this_disable = "the listen port is taken, and its holder may run a bridge \
+                                      on them. portman does not ask again until the next \
+                                      `portman bridge disable`";
+        assert!(lines[0].contains(final_for_this_disable), "{lines:?}");
+        assert_eq!(saved_debt(&daemon.state_path), false);
+
+        drop(another_daemons_bridge);
+        daemon.open_session(2).await;
+
+        // The system can hand the freed port to another socket at once, and
+        // the cleanup of the new session then asks the engine nothing.
+        let mut asked = daemon.fake.calls();
+        asked.retain(|call| *call != format!("GET {SETUP_CONTAINER}"));
+        assert_eq!(
+            asked,
+            [] as [&str; 0],
+            "asked for more than the setup container when the port was free again"
+        );
     }
 }

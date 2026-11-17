@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use portman_core::paths::socket_path;
 use portman_protocol::transport::{read_response, write_request};
-use portman_protocol::{BridgePhase, NetbridgeMode, Request, Response};
+use portman_protocol::{BridgeCleanup, BridgePhase, NetbridgeMode, Request, Response};
 use tokio::net::UnixStream;
 use tokio::time::Instant;
 
@@ -44,6 +44,8 @@ pub(crate) struct BridgeStatus {
     sent_phase: BridgePhase,
     enabled: bool,
     pub(crate) mode: NetbridgeMode,
+    /// What holds up the cleanup that the last disable asked for.
+    cleanup: Option<BridgeCleanup>,
 }
 
 impl BridgeStatus {
@@ -58,11 +60,13 @@ pub(crate) async fn bridge_status() -> Result<BridgeStatus> {
             bridge_phase,
             bridge_enabled,
             bridge_mode,
+            bridge_cleanup,
             ..
         } => Ok(BridgeStatus {
             sent_phase: bridge_phase,
             enabled: bridge_enabled,
             mode: bridge_mode,
+            cleanup: bridge_cleanup,
         }),
         other => other.unexpected(),
     }
@@ -110,6 +114,9 @@ pub(crate) enum Settled {
     /// The user wants the bridge and no container engine is connected, so
     /// no wait can see it come up. The daemon starts it when one connects.
     WaitsForDocker,
+    /// The bridge is off as the command asked, and the daemon has not
+    /// removed the DNS forwarder and the docker network.
+    LeftoversStay(BridgeCleanup),
 }
 
 impl Settled {
@@ -118,6 +125,11 @@ impl Settled {
         match self {
             Settled::Reached => done.to_string(),
             Settled::WaitsForDocker => format!("{done}; the bridge starts when Docker connects"),
+            Settled::LeftoversStay(BridgeCleanup::Pending) => format!(
+                "{done}; {}. `portman bridge status` prints a `cleanup` line for as long as something holds it up",
+                BridgeCleanup::Pending.in_words()
+            ),
+            Settled::LeftoversStay(held) => format!("{done}; {}", held.in_words()),
         }
     }
 }
@@ -163,8 +175,11 @@ fn timed_out(desired_enabled: bool, last: BridgePhase) -> String {
     }
 }
 
-/// Poll until the bridge is up, or until it is off and gone. The daemon
-/// applies bridge changes asynchronously.
+/// Poll until the bridge is up, or until it is off and gone and the daemon
+/// has said what became of the cleanup that a disable asks for. The daemon
+/// applies bridge changes asynchronously. A cleanup that still runs or is
+/// still to come when the 60 s are used up ends the wait with no error,
+/// because the bridge is off.
 pub(crate) async fn wait_for_bridge_state(desired_enabled: bool) -> Result<Settled> {
     wait_for_state(bridge_status, desired_enabled).await
 }
@@ -176,14 +191,25 @@ where
     let mut previous = None;
     let mut pauses = Pauses::new();
     loop {
-        let phase = read().await?.phase();
-        match poll(desired_enabled, previous, phase) {
-            Poll::Reached => return Ok(Settled::Reached),
-            Poll::WaitsForDocker => return Ok(Settled::WaitsForDocker),
-            Poll::TurnedOff => bail!("netbridge was disabled before it came up"),
-            Poll::Pending => previous = Some(phase),
-        }
+        let status = read().await?;
+        let phase = status.phase();
+        let cleanup = status.cleanup.filter(|_| !desired_enabled);
+        let off_with_a_cleanup_to_come = match (poll(desired_enabled, previous, phase), cleanup) {
+            (Poll::Reached, None) => return Ok(Settled::Reached),
+            (
+                Poll::Reached,
+                Some(to_come @ (BridgeCleanup::Pending | BridgeCleanup::WaitsForBridges { .. })),
+            ) => Some(to_come),
+            (Poll::Reached, Some(held)) => return Ok(Settled::LeftoversStay(held)),
+            (Poll::WaitsForDocker, _) => return Ok(Settled::WaitsForDocker),
+            (Poll::TurnedOff, _) => bail!("netbridge was disabled before it came up"),
+            (Poll::Pending, _) => None,
+        };
+        previous = Some(phase);
         if !pauses.pause().await {
+            if let Some(to_come) = off_with_a_cleanup_to_come {
+                return Ok(Settled::LeftoversStay(to_come));
+            }
             bail!(timed_out(desired_enabled, phase));
         }
     }
@@ -390,6 +416,16 @@ mod tests {
             sent_phase: phase,
             enabled: matches!(phase, Up),
             mode,
+            cleanup: None,
+        }
+    }
+
+    /// A status from a daemon whose bridge is off and that says what holds
+    /// up the cleanup of a disable.
+    fn off_with(cleanup: BridgeCleanup) -> BridgeStatus {
+        BridgeStatus {
+            cleanup: Some(cleanup),
+            ..sent(OptIn, Disabled)
         }
     }
 
@@ -399,6 +435,7 @@ mod tests {
             sent_phase: Unknown,
             enabled,
             mode,
+            cleanup: None,
         }
     }
 
@@ -687,6 +724,75 @@ mod tests {
         let settled = wait_for_state(|| read_too_early.read(), ENABLE).await;
         assert_eq!(settled.unwrap(), Settled::WaitsForDocker);
         assert_eq!(read_too_early.pauses(), millis([10]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_waits_for_its_cleanup_and_says_what_held_it_up() {
+        let no_answer = BridgeCleanup::NoAnswer { within_secs: 20 };
+        let (pending, off) = (off_with(BridgeCleanup::Pending), sent(OptIn, Disabled));
+        let gives_a_head_start = off_with(BridgeCleanup::WaitsForBridges { for_secs: 10 });
+        let stays = Settled::LeftoversStay;
+        // the statuses that a disable reads → how its wait ends
+        let table = [
+            (vec![off], Settled::Reached),
+            (vec![pending, pending, off], Settled::Reached),
+            (vec![gives_a_head_start, pending, off], Settled::Reached),
+            (
+                vec![gives_a_head_start, off_with(BridgeCleanup::PortTaken)],
+                stays(BridgeCleanup::PortTaken),
+            ),
+            (
+                vec![sent(OptIn, Stopping), pending, off_with(no_answer)],
+                stays(no_answer),
+            ),
+            (
+                vec![off_with(BridgeCleanup::WaitsForDocker)],
+                stays(BridgeCleanup::WaitsForDocker),
+            ),
+            (
+                vec![pending, off_with(BridgeCleanup::PortTaken)],
+                stays(BridgeCleanup::PortTaken),
+            ),
+        ];
+        for (statuses, ends) in table {
+            let mut script = Script::new(&statuses);
+
+            let settled = wait_for_state(|| script.read(), false).await;
+
+            assert_eq!(settled.unwrap(), ends, "{statuses:?}");
+            assert_eq!(script.read_at.len(), statuses.len(), "{statuses:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_whose_cleanup_still_runs_after_60s_ends_with_no_error_and_says_so() {
+        let mut script = Script::new(&[off_with(BridgeCleanup::Pending)]);
+        let asked = Instant::now();
+
+        let settled = wait_for_state(|| script.read(), false).await.unwrap();
+
+        assert_eq!(settled, Settled::LeftoversStay(BridgeCleanup::Pending));
+        assert_eq!(asked.elapsed(), Duration::from_secs(60));
+        assert_eq!(
+            settled.line("netbridge disabled"),
+            "netbridge disabled; portman has not removed the dns forwarder and the `portman` \
+             network yet: the removal still runs. `portman bridge status` prints a `cleanup` line for as \
+             long as something holds it up"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_enable_does_not_wait_for_the_cleanup_of_a_disable() {
+        let up_beside_a_disable_in_flight = BridgeStatus {
+            cleanup: Some(BridgeCleanup::Pending),
+            ..sent(OptIn, Up)
+        };
+        let mut script = Script::new(&[up_beside_a_disable_in_flight]);
+
+        let settled = wait_for_state(|| script.read(), true).await;
+
+        assert_eq!(settled.unwrap(), Settled::Reached);
+        assert_eq!(script.read_at.len(), 1);
     }
 
     #[tokio::test(start_paused = true)]

@@ -418,7 +418,7 @@ async fn handle_bridge_control(_state: &DaemonState, enable: bool) -> Response {
         } else {
             Control::Disable
         };
-        if let Err(send_err) = _state.netbridge.tx.send(msg).await {
+        if let Err(send_err) = _state.netbridge.send(msg).await {
             return err(format!("netbridge task not reachable: {send_err}"));
         }
         info!(enable, "bridge control message sent");
@@ -436,7 +436,7 @@ async fn handle_bridge_mode(_state: &DaemonState, mode: NetbridgeMode) -> Respon
     {
         use crate::netbridge::Control;
         use tracing::info;
-        if let Err(send_err) = _state.netbridge.tx.send(Control::SetMode(mode)).await {
+        if let Err(send_err) = _state.netbridge.send(Control::SetMode(mode)).await {
             return err(format!("netbridge task not reachable: {send_err}"));
         }
         info!(mode = mode.as_str(), "bridge mode control message sent");
@@ -467,8 +467,11 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
         .unwrap_or(portman_protocol::BridgeAssessment::Unknown);
     // Mode first, phase second. `netbridge::publish` writes the phase first,
     // so the phase read here is never older than the mode. It can be newer.
+    // The cleanup comes after the phase for the same reason: the loop
+    // publishes it before the phase.
     let bridge_mode = *state.netbridge.mode.read().await;
     let published_phase = *state.netbridge.phase.borrow();
+    let bridge_cleanup = state.netbridge.cleanup();
     Response::Status {
         managed_broker: state.supervisor.managed_broker(),
         egress_grants_version: 1,
@@ -488,6 +491,7 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
             .netbridge
             .retry_in_secs()
             .map(std::num::NonZeroU64::get),
+        bridge_cleanup,
         bridge_mode,
         dashboard_port: state.dashboard_port,
         docker: Some(docker_status(

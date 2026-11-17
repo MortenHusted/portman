@@ -1,9 +1,10 @@
-//! Tiny persisted-state module for the v1 netbridge on/off flag.
+//! Tiny persisted-state module for the v1 netbridge: the on/off flag, the
+//! route mode, and whether a disable still owes a cleanup.
 //!
-//! One JSON file at [`crate::paths::netbridge_state_path`], one boolean.
+//! One JSON file at [`crate::paths::netbridge_state_path`].
 //! Intentionally separate from `static_store` / `tls_store` — those
-//! hold richer user-authored config. This is a single daemon-managed
-//! flag, deliberately trivial so the load path on startup is
+//! hold richer user-authored config. This is daemon-managed state,
+//! deliberately trivial so the load path on startup is
 //! fire-and-forget.
 
 use std::fs;
@@ -13,7 +14,7 @@ use anyhow::Result;
 use portman_protocol::NetbridgeMode;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetbridgeState {
     /// User-requested on/off. Missing file / parse error treated as
     /// `false` (off) — the netbridge is opt-in.
@@ -23,6 +24,13 @@ pub struct NetbridgeState {
     /// current behavior: only the dedicated `portman` network is routed.
     #[serde(default)]
     pub mode: NetbridgeMode,
+    /// The user turned the bridge off, and what that is to remove from the
+    /// engine can still be there: the DNS forwarder and the docker network.
+    /// A daemon that boots with this set removes them at its first engine
+    /// session. Missing from the file of an older daemon, which owed
+    /// nothing after a restart, and an older daemon passes the field over.
+    #[serde(default)]
+    pub cleanup_owed: bool,
 }
 
 /// Load persisted state from `path`. A missing file returns the
@@ -54,6 +62,7 @@ mod tests {
         let s = load(&dir.path().join("nope.json"));
         assert!(!s.enabled);
         assert_eq!(s.mode, NetbridgeMode::OptIn);
+        assert!(!s.cleanup_owed);
     }
 
     #[test]
@@ -65,11 +74,43 @@ mod tests {
             &NetbridgeState {
                 enabled: true,
                 mode: NetbridgeMode::Docker,
+                cleanup_owed: false,
             },
         )
         .unwrap();
         let loaded = load(&path);
         assert!(loaded.enabled);
+        assert_eq!(loaded.mode, NetbridgeMode::Docker);
+        assert!(!loaded.cleanup_owed);
+    }
+
+    #[test]
+    fn a_cleanup_that_a_disable_left_owed_is_saved_beside_the_flag() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("netbridge.json");
+        let owed = NetbridgeState {
+            enabled: false,
+            mode: NetbridgeMode::OptIn,
+            cleanup_owed: true,
+        };
+
+        save(&path, &owed).unwrap();
+
+        assert!(load(&path).cleanup_owed);
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["cleanup_owed"], true);
+        assert_eq!(saved["enabled"], false);
+    }
+
+    #[test]
+    fn the_file_of_a_daemon_that_saved_no_debt_loads_as_no_debt() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("netbridge.json");
+        fs::write(&path, br#"{"enabled":false,"mode":"docker"}"#).unwrap();
+
+        let loaded = load(&path);
+
+        assert!(!loaded.cleanup_owed);
         assert_eq!(loaded.mode, NetbridgeMode::Docker);
     }
 
