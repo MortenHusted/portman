@@ -57,6 +57,7 @@
 //!     start that failed runs again.
 
 use std::collections::{BTreeSet, HashSet};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -181,10 +182,10 @@ pub(crate) struct Handle {
 }
 
 impl Handle {
-    pub(crate) fn retry_in_secs(&self) -> Option<u64> {
+    pub(crate) fn retry_in_secs(&self) -> Option<NonZeroU64> {
         let at = (*self.retry_at.read().expect("retry lock poisoned"))?;
         let left = at.saturating_duration_since(Instant::now());
-        (!left.is_zero()).then(|| left.as_secs() + u64::from(left.subsec_nanos() > 0))
+        NonZeroU64::new(left.as_secs() + u64::from(left.subsec_nanos() > 0))
     }
 }
 
@@ -1767,13 +1768,13 @@ mod tests {
         rig.send(Control::Enable).await;
         rig.next_attempt().await;
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert_eq!(rig.handle.retry_in_secs(), Some(4));
+        assert_eq!(rig.handle.retry_in_secs(), NonZeroU64::new(4));
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert_eq!(rig.handle.retry_in_secs(), Some(2));
+        assert_eq!(rig.handle.retry_in_secs(), NonZeroU64::new(2));
 
         rig.next_attempt().await;
         tokio::time::sleep(Duration::from_secs(1)).await;
-        assert_eq!(rig.handle.retry_in_secs(), Some(9));
+        assert_eq!(rig.handle.retry_in_secs(), NonZeroU64::new(9));
 
         rig.send(Control::Disable).await;
         rig.reaches(BridgePhase::Disabled).await;
@@ -1787,7 +1788,7 @@ mod tests {
         *handle.retry_at.write().unwrap() = Some(due);
 
         tokio::time::advance(RETRY_BASE - Duration::from_nanos(1)).await;
-        assert_eq!(handle.retry_in_secs(), Some(1));
+        assert_eq!(handle.retry_in_secs(), NonZeroU64::new(1));
         tokio::time::advance(Duration::from_nanos(1)).await;
         assert_eq!(handle.retry_in_secs(), None, "at the due instant");
         tokio::time::advance(Duration::from_millis(1)).await;

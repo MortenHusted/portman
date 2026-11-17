@@ -53,7 +53,7 @@ pub(crate) struct Handle {
 }
 
 impl Handle {
-    pub(crate) fn retry_in_secs(&self) -> Option<u64> {
+    pub(crate) fn retry_in_secs(&self) -> Option<std::num::NonZeroU64> {
         None
     }
 }

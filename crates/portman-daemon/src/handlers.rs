@@ -484,7 +484,10 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
         bridge_assessment,
         bridge_enabled: published_phase.reads_as_enabled(),
         bridge_phase: BridgePhase::from(published_phase),
-        bridge_retry_in_secs: state.netbridge.retry_in_secs(),
+        bridge_retry_in_secs: state
+            .netbridge
+            .retry_in_secs()
+            .map(std::num::NonZeroU64::get),
         bridge_mode,
         dashboard_port: state.dashboard_port,
         docker: Some(docker_status(
