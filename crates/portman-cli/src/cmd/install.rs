@@ -9,6 +9,8 @@ use anyhow::{bail, Context, Result};
 use portman_daemon::BridgeLeftovers;
 #[cfg(target_os = "macos")]
 use portman_protocol::{DockerState, DockerStatus, Request, Response};
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 use std::process::Command as StdCommand;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
@@ -197,33 +199,76 @@ pub(crate) async fn cmd_uninstall() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 pub(crate) async fn cmd_uninstall_macos() -> Result<()> {
-    use portman_core::launchd::{DAEMON_LABEL, DAEMON_PLIST_PATH};
-
-    let engine_socket = daemon_engine_socket(request(Request::Status)).await;
-
-    eprintln!("tearing down launchd service…");
-    let _ = StdCommand::new("sudo")
-        .args(["launchctl", "bootout", &format!("system/{DAEMON_LABEL}")])
-        .status();
-
-    sweep_stragglers();
-    remove_legacy_menubar();
-
-    if !old_daemon_exits_within_30s() {
-        eprintln!("previous daemon still running after 30s");
-    }
-    eprintln!("removing what the bridge left in Docker…");
-    let leftovers = portman_daemon::remove_bridge_leftovers(engine_socket).await;
-    for line in bridge_leftover_lines(&leftovers) {
-        eprintln!("{line}");
-    }
-
-    eprintln!("removing system plist (sudo required)");
-    let _ = run_sudo(&["rm", "-f", DAEMON_PLIST_PATH]);
-
-    remove_installed_binaries();
+    uninstall(&ThisMac).await;
     println!("portman uninstalled.");
     Ok(())
+}
+
+/// What an uninstall does to a Mac and to its Docker engine. A test runs
+/// [`uninstall`] on a stand-in, with no launchd, no sudo and no engine.
+#[cfg(target_os = "macos")]
+trait Uninstall {
+    async fn daemon_status(&self) -> Result<Response>;
+    /// Boots the daemon out of launchd and ends what still runs of it.
+    fn stop_daemon(&self);
+    fn wait_for_daemon_exit(&self);
+    async fn remove_bridge_leftovers(&self, engine_socket: Option<PathBuf>) -> BridgeLeftovers;
+    /// Removes the launchd plist and the daemon's binary.
+    fn remove_service_files(&self);
+    fn say(&self, line: &str);
+}
+
+#[cfg(target_os = "macos")]
+async fn uninstall(mac: &impl Uninstall) {
+    let engine_socket = daemon_engine_socket(mac.daemon_status()).await;
+    mac.stop_daemon();
+    mac.wait_for_daemon_exit();
+    let leftovers = mac.remove_bridge_leftovers(engine_socket).await;
+    for line in bridge_leftover_lines(&leftovers) {
+        mac.say(&line);
+    }
+    mac.remove_service_files();
+}
+
+#[cfg(target_os = "macos")]
+struct ThisMac;
+
+#[cfg(target_os = "macos")]
+impl Uninstall for ThisMac {
+    async fn daemon_status(&self) -> Result<Response> {
+        request(Request::Status).await
+    }
+
+    fn stop_daemon(&self) {
+        eprintln!("tearing down launchd service…");
+        let service = format!("system/{}", portman_core::launchd::DAEMON_LABEL);
+        let _ = StdCommand::new("sudo")
+            .args(["launchctl", "bootout", &service])
+            .status();
+        sweep_stragglers();
+        remove_legacy_menubar();
+    }
+
+    fn wait_for_daemon_exit(&self) {
+        if !old_daemon_exits_within_30s() {
+            eprintln!("previous daemon still running after 30s");
+        }
+    }
+
+    async fn remove_bridge_leftovers(&self, engine_socket: Option<PathBuf>) -> BridgeLeftovers {
+        eprintln!("removing what the bridge left in Docker…");
+        portman_daemon::remove_bridge_leftovers(engine_socket).await
+    }
+
+    fn remove_service_files(&self) {
+        eprintln!("removing system plist (sudo required)");
+        let _ = run_sudo(&["rm", "-f", portman_core::launchd::DAEMON_PLIST_PATH]);
+        remove_installed_binaries();
+    }
+
+    fn say(&self, line: &str) {
+        eprintln!("{line}");
+    }
 }
 
 /// How long the daemon has to say which engine it is connected to. An
@@ -237,7 +282,7 @@ const STATUS_BUDGET: Duration = Duration::from_secs(3);
 #[cfg(target_os = "macos")]
 async fn daemon_engine_socket(
     status: impl std::future::Future<Output = Result<Response>>,
-) -> Option<std::path::PathBuf> {
+) -> Option<PathBuf> {
     match tokio::time::timeout(STATUS_BUDGET, status).await {
         Ok(Ok(Response::Status {
             docker:
@@ -703,6 +748,93 @@ mod tests {
 
         assert_eq!(socket, None);
         assert_eq!(began.elapsed(), STATUS_BUDGET);
+    }
+
+    /// A Mac that only writes down what an uninstall does to it. Its daemon
+    /// is connected to the engine at `/run/demo/docker.sock`.
+    #[cfg(target_os = "macos")]
+    struct StandInMac {
+        /// `None` is an engine that never answers the removal.
+        leftovers: Option<BridgeLeftovers>,
+        did: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl StandInMac {
+        fn new(leftovers: Option<BridgeLeftovers>) -> Self {
+            Self {
+                leftovers,
+                did: Default::default(),
+            }
+        }
+
+        fn note(&self, what: impl Into<String>) {
+            self.did.lock().unwrap().push(what.into());
+        }
+
+        fn did(&self) -> Vec<String> {
+            self.did.lock().unwrap().clone()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Uninstall for StandInMac {
+        async fn daemon_status(&self) -> Result<Response> {
+            self.note("ask the daemon for its engine");
+            status(r#"{"state":"connected","socket":"/run/demo/docker.sock"}"#)
+        }
+
+        fn stop_daemon(&self) {
+            self.note("stop the daemon");
+        }
+
+        fn wait_for_daemon_exit(&self) {
+            self.note("wait for the daemon to exit");
+        }
+
+        async fn remove_bridge_leftovers(&self, engine_socket: Option<PathBuf>) -> BridgeLeftovers {
+            self.note(format!(
+                "ask the engine at {engine_socket:?} for the removal"
+            ));
+            match &self.leftovers {
+                Some(leftovers) => leftovers.clone(),
+                None => std::future::pending().await,
+            }
+        }
+
+        fn remove_service_files(&self) {
+            self.note("remove the plist and the daemon's binary");
+        }
+
+        fn say(&self, line: &str) {
+            self.note(format!("say: {line}"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn an_uninstall_does_each_step_once_in_this_order() {
+        let owed = BridgeLeftovers::Owed {
+            socket: "/run/demo/docker.sock".into(),
+        };
+        let mac = StandInMac::new(Some(owed.clone()));
+
+        uninstall(&mac).await;
+
+        let said = bridge_leftover_lines(&owed)
+            .into_iter()
+            .map(|line| format!("say: {line}"));
+        let steps = [
+            vec![
+                "ask the daemon for its engine".to_string(),
+                "stop the daemon".to_string(),
+                "wait for the daemon to exit".to_string(),
+                r#"ask the engine at Some("/run/demo/docker.sock") for the removal"#.to_string(),
+            ],
+            said.collect(),
+            vec!["remove the plist and the daemon's binary".to_string()],
+        ];
+        assert_eq!(mac.did(), steps.concat());
     }
 
     #[cfg(target_os = "macos")]
