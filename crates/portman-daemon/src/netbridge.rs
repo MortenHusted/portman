@@ -62,11 +62,15 @@
 //!     beside such a network stays until the next `Disable`.
 //!   - [`publish`] tells the rest of the daemon what the bridge is doing:
 //!     the [`phase`], the mode, the interface index of the utun, and when a
-//!     start that failed runs again.
+//!     start that failed runs again. Before it, the loop publishes what
+//!     holds up the cleanup that a `Disable` asked for, so that a client
+//!     that reads the phase `Disabled` can say whether the DNS forwarder
+//!     and the docker network are gone.
 
 use std::collections::{BTreeSet, HashSet};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,6 +83,7 @@ use portman_netbridge::runtime::{
     self, CleanupEnd, DnsForwarder, Leftovers, Runtime, RuntimeOptions,
 };
 use portman_netbridge::tunnel::{Keypair, HOST_WG_LISTEN_PORT};
+use portman_protocol::BridgeCleanup;
 use tokio::sync::{mpsc, watch, Notify, RwLock};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -178,7 +183,7 @@ impl From<BridgePhase> for portman_protocol::BridgePhase {
 /// what the netbridge task last published.
 #[derive(Clone)]
 pub(crate) struct Handle {
-    pub tx: mpsc::Sender<Control>,
+    tx: mpsc::Sender<Control>,
     pub mode: Arc<RwLock<NetbridgeMode>>,
     pub phase: watch::Receiver<BridgePhase>,
     /// Interface index of the bridge's utun while it is up. The proxy /
@@ -191,9 +196,43 @@ pub(crate) struct Handle {
     /// When the next start is due, while a start that failed waits for its
     /// retry.
     pub retry_at: Arc<std::sync::RwLock<Option<Instant>>>,
+    /// What holds up the cleanup that the last `Disable` asked for, as the
+    /// loop last published it. Read it through [`Handle::cleanup`].
+    cleanup: Arc<std::sync::RwLock<Option<BridgeCleanup>>>,
+    /// The `Disable` messages that went to the loop, and those that the
+    /// loop had acted on when it last published.
+    disables_sent: Arc<AtomicU64>,
+    disables_published: Arc<AtomicU64>,
 }
 
 impl Handle {
+    pub(crate) async fn send(&self, msg: Control) -> Result<(), mpsc::error::SendError<Control>> {
+        if matches!(msg, Control::Disable) {
+            self.disables_sent.fetch_add(1, Ordering::SeqCst);
+        }
+        self.tx.send(msg).await
+    }
+
+    /// What holds up the cleanup that the last `Disable` asked for. It is
+    /// `Pending` from the moment a `Disable` is sent until the loop has
+    /// published what it made of it, so that a client that reads the status
+    /// right after its request does not act on the state from before it.
+    /// Read the phase first: the loop publishes this before the phase.
+    pub(crate) fn cleanup(&self) -> Option<BridgeCleanup> {
+        let published = self.disables_published.load(Ordering::SeqCst);
+        if published != self.disables_sent.load(Ordering::SeqCst) {
+            return Some(BridgeCleanup::Pending);
+        }
+        *self.cleanup.read().expect("cleanup lock poisoned")
+    }
+
+    /// The count goes last, so that a reader that finds it current also
+    /// finds the cleanup that belongs to it.
+    fn publish_cleanup(&self, cleanup: Option<BridgeCleanup>, disables: u64) {
+        *self.cleanup.write().expect("cleanup lock poisoned") = cleanup;
+        self.disables_published.store(disables, Ordering::SeqCst);
+    }
+
     pub(crate) fn retry_in_secs(&self) -> Option<NonZeroU64> {
         let at = (*self.retry_at.read().expect("retry lock poisoned"))?;
         let left = at.saturating_duration_since(Instant::now());
@@ -215,6 +254,9 @@ pub(crate) fn handle_pair() -> (Handle, mpsc::Receiver<Control>, watch::Sender<B
             ifindex: crate::upstream::new_bridge_ifindex(),
             tlds_changed: Arc::new(Notify::new()),
             retry_at: Arc::default(),
+            cleanup: Arc::default(),
+            disables_sent: Arc::default(),
+            disables_published: Arc::default(),
         },
         rx,
         phase_tx,
@@ -400,6 +442,12 @@ fn backoff(failures: u32) -> Duration {
 struct Debt {
     /// The session that had its cleanup. Every other session is owed one.
     swept: Option<Session>,
+    /// How the cleanup that the last `Disable` asked for ended, when that
+    /// left the DNS forwarder and the docker network where they were.
+    /// `None` before that cleanup ran, and after one that ended complete.
+    held: Option<BridgeCleanup>,
+    /// The `Disable` messages that the loop has acted on.
+    disables: u64,
 }
 
 impl Debt {
@@ -413,11 +461,36 @@ impl Debt {
 
     fn disabled(&mut self) {
         self.swept = None;
+        self.held = None;
+        self.disables += 1;
     }
 
     /// A cleanup that did not finish is not tried again on its session.
-    fn settle(&mut self, session: Session) {
+    fn settle(&mut self, session: Session, asked_for: Leftovers, swept: Swept) {
         self.swept = Some(session);
+        if asked_for == Leftovers::SetupContainerAndNetwork {
+            self.held = swept.holds();
+        }
+    }
+
+    /// What status says about the cleanup that the last `Disable` asked
+    /// for. A port that was taken stays reported until the next `Disable`,
+    /// because no cleanup asks again before that.
+    fn status(&self, intent: &NetbridgeState, session: Option<Session>) -> Option<BridgeCleanup> {
+        if intent.enabled {
+            return None;
+        }
+        if self.held == Some(BridgeCleanup::PortTaken) {
+            return self.held;
+        }
+        if !intent.cleanup_owed {
+            return None;
+        }
+        match session {
+            None => Some(BridgeCleanup::WaitsForDocker),
+            Some(session) if self.swept != Some(session) => Some(BridgeCleanup::Pending),
+            Some(_) => self.held,
+        }
     }
 }
 
@@ -442,6 +515,20 @@ impl Swept {
         match self {
             Swept::Ended(CleanupEnd::Complete) | Swept::PortTaken => true,
             Swept::Ended(CleanupEnd::Failed | CleanupEnd::NoAnswer) | Swept::SessionEnded => false,
+        }
+    }
+
+    /// What a cleanup that ended so tells a client about the DNS forwarder
+    /// and the docker network. A session that ended holds nothing by
+    /// itself: the next session, or the lack of one, does.
+    fn holds(self) -> Option<BridgeCleanup> {
+        match self {
+            Swept::Ended(CleanupEnd::Complete) | Swept::SessionEnded => None,
+            Swept::Ended(CleanupEnd::Failed) => Some(BridgeCleanup::Failed),
+            Swept::Ended(CleanupEnd::NoAnswer) => Some(BridgeCleanup::NoAnswer {
+                within_secs: runtime::ENGINE_STEP_BUDGET.as_secs(),
+            }),
+            Swept::PortTaken => Some(BridgeCleanup::PortTaken),
         }
     }
 }
@@ -550,6 +637,7 @@ async fn converge<E: BridgeEngine>(
         }
         let intent = wanted.intent();
         let built = running.as_ref().map(|r| r.built);
+        handle.publish_cleanup(debt.status(&intent, session), debt.disables);
         publish(
             &handle,
             &phase_tx,
@@ -617,15 +705,15 @@ async fn converge<E: BridgeEngine>(
             }
             Step::Teardown => {
                 if let Some(old) = running.take() {
-                    let ended = old.bridge.shutdown_and_remove_network().await;
-                    debt.settle(old.built.session);
+                    let ended = Swept::Ended(old.bridge.shutdown_and_remove_network().await);
                     let asked_for = Leftovers::SetupContainerAndNetwork;
-                    settle(&mut wanted, &state_path, asked_for, Swept::Ended(ended));
+                    debt.settle(old.built.session, asked_for, ended);
+                    settle(&mut wanted, &state_path, asked_for, ended);
                 }
             }
             Step::Sweep(session, leftovers) => {
                 let swept = engine.remove_leftovers(session, leftovers).await;
-                debt.settle(session);
+                debt.settle(session, leftovers, swept);
                 settle(&mut wanted, &state_path, leftovers, swept);
             }
         }
@@ -747,7 +835,8 @@ async fn next_wake(
 }
 
 /// The one place that tells the rest of the daemon what the bridge is
-/// doing. The ifindex goes first, so that a reader woken by `Up` finds it
+/// doing, but for [`Handle::publish_cleanup`], which the loop calls before
+/// it. The ifindex goes first, so that a reader woken by `Up` finds it
 /// set. The mode goes last, so that a reader that takes the mode first and
 /// the phase second never gets a new mode with a phase that is older than
 /// it.
@@ -1739,7 +1828,7 @@ mod tests {
         }
 
         async fn send(&self, msg: Control) {
-            self.handle.tx.send(msg).await.unwrap();
+            self.handle.send(msg).await.unwrap();
         }
 
         async fn next_attempt(&mut self) -> Attempt {
@@ -3018,7 +3107,7 @@ mod tests {
 
         /// Returns when the loop has nothing left to do for the message.
         async fn disable(&self) {
-            self.handle.tx.send(Control::Disable).await.unwrap();
+            self.handle.send(Control::Disable).await.unwrap();
             tokio::time::sleep(LONGEST_WAIT).await;
         }
 
@@ -3049,7 +3138,7 @@ mod tests {
         let (logged, _capture) = Logged::capture();
 
         let disabled = Instant::now();
-        daemon.handle.tx.send(Control::Disable).await.unwrap();
+        daemon.handle.send(Control::Disable).await.unwrap();
         let poll = Duration::from_millis(100);
         let mut warnings = logged.take_warnings();
         while warnings.is_empty() && disabled.elapsed() < LONGEST_WAIT {
@@ -3197,7 +3286,7 @@ mod tests {
             false,
             tlds,
         ));
-        handle.tx.send(Control::Disable).await.unwrap();
+        handle.send(Control::Disable).await.unwrap();
         tokio::time::sleep(LONGEST_WAIT).await;
 
         let fake = crate::engine::tests::connect(&publisher);

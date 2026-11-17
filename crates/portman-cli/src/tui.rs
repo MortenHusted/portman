@@ -796,7 +796,9 @@ fn after_disable(res: &Result<Settled>) -> Modal {
 /// shows a bridge that is up or off.
 fn apply_bridge_result(state: &mut State, res: Result<Settled>, done: &str) {
     let notice = match &res {
-        Ok(Settled::WaitsForDocker) => Some(Settled::WaitsForDocker.line(done)),
+        Ok(settled @ (Settled::WaitsForDocker | Settled::LeftoversStay(_))) => {
+            Some(settled.line(done))
+        }
         _ => None,
     };
     apply_result(state, res.map(drop));

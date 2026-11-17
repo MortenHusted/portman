@@ -89,11 +89,23 @@ pub(crate) async fn cmd_doctor() -> Result<()> {
     Ok(())
 }
 
+/// What `portman bridge enable` and `portman bridge disable` print. A
+/// disable whose cleanup did not remove the DNS forwarder says so in its
+/// one line, and does not add the note that portman removes it.
+fn settled_lines(settled: Settled, desired_enabled: bool, verb: &str) -> Vec<String> {
+    match settled {
+        Settled::LeftoversStay(_) => vec![settled.line(&format!("netbridge {verb}"))],
+        Settled::Reached | Settled::WaitsForDocker => {
+            bridge_command_lines(settled, desired_enabled, verb)
+        }
+    }
+}
+
 pub(crate) async fn cmd_bridge(req: Request, desired_enabled: bool, verb: &str) -> Result<()> {
     match request(req).await? {
         Response::Ok => {
             let settled = wait_for_bridge_state(desired_enabled).await?;
-            for line in bridge_command_lines(settled, desired_enabled, verb) {
+            for line in settled_lines(settled, desired_enabled, verb) {
                 println!("{line}");
             }
             Ok(())
@@ -324,5 +336,32 @@ mod tests {
                 "labelled docker networks: unavailable (no answer in 3 s)",
             ]
         );
+    }
+
+    #[test]
+    fn a_disable_that_left_the_forwarder_says_why_and_not_that_portman_removes_it() {
+        let no_answer = portman_protocol::BridgeCleanup::NoAnswer { within_secs: 20 };
+
+        let lines = settled_lines(Settled::LeftoversStay(no_answer), false, "disabled");
+
+        assert_eq!(
+            lines,
+            [
+                "netbridge disabled; portman could not remove the dns forwarder and the \
+              `portman` network: the container engine gave no answer within 20 s. It tries \
+              again when it next connects to Docker, or at the next `portman bridge disable`"
+            ]
+        );
+        for (settled, enable, verb) in [
+            (Settled::Reached, false, "disabled"),
+            (Settled::Reached, true, "enabled"),
+            (Settled::WaitsForDocker, true, "enabled"),
+        ] {
+            assert_eq!(
+                settled_lines(settled, enable, verb),
+                bridge_command_lines(settled, enable, verb),
+                "{settled:?}"
+            );
+        }
     }
 }

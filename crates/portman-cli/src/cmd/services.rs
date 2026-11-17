@@ -31,6 +31,7 @@ pub(crate) async fn cmd_status(repo: bool) -> Result<()> {
             bridge_enabled: _bridge_enabled,
             bridge_phase: _bridge_phase,
             bridge_retry_in_secs: _bridge_retry_in_secs,
+            bridge_cleanup: _bridge_cleanup,
             bridge_mode: _bridge_mode,
             dashboard_port: _,
             managed_broker,
