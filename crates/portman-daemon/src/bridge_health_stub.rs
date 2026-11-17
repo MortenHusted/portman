@@ -16,6 +16,7 @@ pub(crate) async fn run(
     _engine: crate::engine::Engine,
     _shared: Shared,
     _bridge_ifindex: crate::upstream::BridgeIfIndex,
+    _phase: tokio::sync::watch::Receiver<crate::netbridge::BridgePhase>,
 ) -> anyhow::Result<()> {
     loop {
         tokio::time::sleep(Duration::from_secs(3600)).await;

@@ -28,10 +28,12 @@ use std::time::Duration;
 use bollard::models::ContainerSummary;
 use bollard::query_parameters::{ListContainersOptionsBuilder, ListNetworksOptionsBuilder};
 use bollard::Docker;
+use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::discovery::{self, PORTMAN_NETWORK};
 use crate::engine::Engine;
+use crate::netbridge::BridgePhase;
 
 /// How often to re-assess. 5s matches the menubar's own refresh cadence;
 /// a bridge flap surfaces in the UI within the next poll cycle.
@@ -59,6 +61,7 @@ pub(crate) async fn run(
     engine: Engine,
     shared: Shared,
     bridge_ifindex: crate::upstream::BridgeIfIndex,
+    _phase: watch::Receiver<BridgePhase>,
 ) -> anyhow::Result<()> {
     let mut ticker = tokio::time::interval(ASSESSMENT_PERIOD);
     let mut link = engine.watch();
@@ -307,7 +310,8 @@ mod tests {
         let (engine, publisher) = crate::engine::channel();
         let shared = new_shared();
         let ifindex = crate::upstream::new_bridge_ifindex();
-        tokio::spawn(run(engine, shared.clone(), ifindex));
+        let (_phase_tx, phase) = watch::channel(BridgePhase::Disabled);
+        tokio::spawn(run(engine, shared.clone(), ifindex, phase));
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(*shared.read().unwrap(), BridgeAssessment::Offline);
 
@@ -315,6 +319,27 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1)).await;
 
         assert_eq!(*shared.read().unwrap(), BridgeAssessment::Healthy);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bridge_that_changes_phase_is_assessed_before_the_next_period() {
+        let (engine, fake) = crate::engine::tests::connected();
+        let shared = new_shared();
+        let ifindex = crate::upstream::new_bridge_ifindex();
+        let (phase_tx, phase) = watch::channel(BridgePhase::Starting);
+        tokio::spawn(run(engine, shared.clone(), ifindex, phase));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(*shared.read().unwrap(), BridgeAssessment::Healthy);
+
+        fake.fail_lists();
+        phase_tx.send_replace(BridgePhase::Up { epoch: 1 });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        assert_eq!(
+            *shared.read().unwrap(),
+            BridgeAssessment::Offline,
+            "the assessment is from before the bridge came up"
+        );
     }
 
     #[tokio::test]
