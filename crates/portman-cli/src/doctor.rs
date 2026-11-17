@@ -1266,6 +1266,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn doctor_names_what_the_health_found_for_a_bridge_that_is_up_in_docker_mode() {
+        use BridgeAssessment::{Offline, RoutesMissing, TunnelDead, Unknown};
+        let status = "`portman bridge status` names each labelled network";
+        // health → what the guidance names
+        let table = [
+            (RoutesMissing, "has no route through the bridge"),
+            (RoutesMissing, status),
+            (TunnelDead, "an interface that no longer exists"),
+            (TunnelDead, status),
+            (Offline, "container runtime"),
+            (Unknown, "no health"),
+        ];
+        for (health, names) in table {
+            let mut report = ready_but_for_the_bridge(BridgePhase::Up);
+            report.daemon.bridge_assessment = Some(health);
+
+            let rendered = render_report(&report);
+
+            let guidance = rendered.split("guidance:").nth(1).unwrap_or_default();
+            assert!(
+                guidance.contains("netbridge is up in docker mode"),
+                "{rendered}"
+            );
+            assert!(guidance.contains(names), "{health}: {names}\n{rendered}");
+            for done in ["portman bridge enable", "portman bridge mode docker"] {
+                assert!(!guidance.contains(done), "{health}: {done}\n{rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_gives_no_bridge_advice_for_a_healthy_bridge_in_docker_mode() {
+        let mut no_image = ready_but_for_the_bridge(BridgePhase::Up);
+        no_image.setup_image = SetupImageStatus::Missing;
+        let rendered = render_report(&no_image);
+        assert!(
+            rendered.contains("replacement: needs attention"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("run `portman bridge prepare`"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("guidance:"), "{rendered}");
+
+        let mut legacy = ready_but_for_the_bridge(BridgePhase::Up);
+        legacy.legacy_bridge = LegacyBridgeStatus::Running {
+            detail: "docker-mac-net-connect pid 1234".to_string(),
+        };
+        let rendered = render_report(&legacy);
+        assert!(
+            rendered.contains("guidance:\n  Portman did not stop it automatically."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn doctor_advises_docker_mode_for_a_bridge_that_is_up_in_another_mode() {
+        for mode in [NetbridgeMode::OptIn, NetbridgeMode::All] {
+            let mut report = ready_but_for_the_bridge(BridgePhase::Up);
+            report.daemon.bridge_mode = Some(mode);
+
+            let rendered = render_report(&report);
+
+            let guidance = rendered.split("guidance:").nth(1).unwrap_or_default();
+            assert!(
+                guidance.contains("portman bridge mode docker"),
+                "{mode:?}\n{rendered}"
+            );
+        }
+    }
+
     /// Answers each status read with the next of `healths`, and with the
     /// last one from then on. `None` is a daemon that does not answer.
     fn daemon_that_reports(
