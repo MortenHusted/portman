@@ -506,9 +506,11 @@ impl RestartReport {
         }
         for NotStarted { service, why } in &self.in_backoff {
             lines.push(format!(
-                "could not start {name} again yet: {why}. The daemon keeps trying. \
-                 See `portman logs {name}`, or stop it with `portman down {name}`.",
-                name = service.name
+                "could not start {name} again yet: {why}. The daemon tries again as its restart \
+                 policy allows. See `portman logs {name}`. If the service ends as failed, run \
+                 `portman up {name}` in {place}.",
+                name = service.name,
+                place = service.place()
             ));
         }
         for NotStarted { service, why } in &self.not_started {
@@ -1041,7 +1043,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_service_that_fails_twice_is_named_while_the_daemon_keeps_trying() {
+    async fn a_service_that_fails_twice_is_named_while_the_daemon_tries_again() {
         let mut daemon = NewDaemon::holding(&["jobs", "web"]);
         daemon.after_the_start_request(
             "web",
@@ -1072,8 +1074,9 @@ mod tests {
             [
                 "started again: jobs",
                 "could not start web again yet: backoff (port 3000 is taken; restarting in \
-                 1000ms). The daemon keeps trying. See `portman logs web`, or stop it with \
-                 `portman down web`.",
+                 1000ms). The daemon tries again as its restart policy allows. See `portman \
+                 logs web`. If the service ends as failed, run `portman up web` in \
+                 /Users/dev/acme/web.",
             ]
         );
         assert!(began.elapsed() < Duration::from_secs(1));
