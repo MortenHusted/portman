@@ -204,30 +204,17 @@ pub(crate) async fn cmd_uninstall_macos() -> Result<()> {
     Ok(())
 }
 
-/// What an uninstall does to a Mac and to its Docker engine. A test runs
-/// [`uninstall`] on a stand-in, with no launchd, no sudo and no engine.
 #[cfg(target_os = "macos")]
 trait Uninstall {
     async fn daemon_status(&self) -> Result<Response>;
-    /// Boots the daemon out of launchd and ends what still runs of it.
     fn stop_daemon(&self);
     fn wait_for_daemon_exit(&self);
     async fn remove_bridge_leftovers(&self, engine_socket: Option<PathBuf>) -> BridgeLeftovers;
-    /// Removes the launchd plist and the daemon's binary.
     fn remove_service_files(&self);
-    /// Whether the saved bridge state is on.
     fn bridge_is_enabled(&self) -> bool;
     fn say(&self, line: &str);
 }
 
-/// The plist goes before the engine is asked. An uninstall that is
-/// interrupted while it waits for the engine then leaves no plist that
-/// starts the daemon again at the next boot.
-///
-/// With no engine to ask and the bridge saved as off, nothing is said about
-/// a forwarder: a bridge that was never on left none, and a user with no
-/// Docker has nothing to remove by hand. The saved state does not record a
-/// removal that a disable still owed, so such a forwarder goes unmentioned.
 #[cfg(target_os = "macos")]
 async fn uninstall(mac: &impl Uninstall) {
     let engine_socket = daemon_engine_socket(mac.daemon_status()).await;
@@ -245,18 +232,12 @@ async fn uninstall(mac: &impl Uninstall) {
     }
 }
 
-/// How long the engine has to remove what the bridge left. The engine's
-/// client bounds only the wait for the head of each response, so an engine
-/// that stalls after the connect probe would hold the uninstall for
-/// minutes. A removal that the engine answers needs the 3 s of the probe,
-/// up to 15 s for the stop and removal of the setup container, and two
-/// short requests more.
+/// The engine's client bounds only the wait for the head of each response,
+/// so an engine that stalls after the connect probe would hold the
+/// uninstall for minutes.
 #[cfg(target_os = "macos")]
 const REMOVAL_BUDGET: Duration = Duration::from_secs(35);
 
-/// The commands that remove the forwarder and its network by hand, and
-/// when not to run them. They go by name. Neither portman's labels nor the
-/// bridge's UDP port guard them, as both guard a removal by portman.
 #[cfg(target_os = "macos")]
 fn by_hand_lines() -> Vec<String> {
     let mut lines: Vec<String> = portman_daemon::manual_removal_commands()
@@ -810,11 +791,8 @@ mod tests {
         assert_eq!(began.elapsed(), STATUS_BUDGET);
     }
 
-    /// A Mac that only writes down what an uninstall does to it. Its daemon
-    /// is connected to the engine at `/run/demo/docker.sock`.
     #[cfg(target_os = "macos")]
     struct StandInMac {
-        /// `None` is an engine that never answers the removal.
         leftovers: Option<BridgeLeftovers>,
         bridge_enabled: bool,
         did: std::sync::Mutex<Vec<String>>,

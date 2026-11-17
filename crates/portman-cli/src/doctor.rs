@@ -25,9 +25,6 @@ pub(crate) const DNS_FORWARDER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 99, 129);
 const PORTMAN_NETWORK_CIDR: &str = "192.168.99.128/25";
 /// The label of a setup image that has the `dns` mode, and its value.
 const DNS_IMAGE_LABEL: (&str, &str) = ("dev.portman.dns-forwarder", "1");
-/// The label that carries the revision of a setup image, and the revision
-/// that this portman builds. An image with a lower revision, or with none,
-/// is from an older portman.
 const SETUP_IMAGE_REVISION: (&str, u32) = ("dev.portman.setup-image-revision", 2);
 const ENDPOINT_TIMEOUT: Duration = Duration::from_millis(200);
 
@@ -140,15 +137,8 @@ pub(crate) type CliAnswer<'a> = Result<(), &'a DockerCliError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SetupImageStatus {
-    Present {
-        id: String,
-        created: String,
-    },
-    /// An older portman built the image. The bridge runs from it.
-    Outdated {
-        id: String,
-        created: String,
-    },
+    Present { id: String, created: String },
+    Outdated { id: String, created: String },
     Missing,
     Unavailable(DockerCliError),
 }
@@ -283,7 +273,6 @@ pub(crate) async fn inspect_setup_image() -> SetupImageStatus {
     setup_image_from_inspect(&stdout)
 }
 
-/// `inspected` is the JSON that `docker image inspect` prints for the image.
 /// The fields are read from the JSON and not through a template: for an
 /// image that was built with no label the JSON has no `Labels` entry, and a
 /// template that names both the id and a label then fails.
@@ -1009,8 +998,6 @@ fn check_daemon(daemon: &DaemonSnapshot) -> CheckOutcome {
     CheckOutcome::gating(state, line)
 }
 
-/// An image from an older portman does not gate readiness, because the
-/// bridge runs from it.
 fn check_setup_image(status: &SetupImageStatus) -> CheckOutcome {
     let short = |id: &str| -> String {
         let id = id.strip_prefix("sha256:").unwrap_or(id);
@@ -2618,7 +2605,6 @@ destination: 172.18.0.0
                 r#""Labels":{{"dev.portman.dns-forwarder":"1","dev.portman.setup-image-revision":"{revision}"}}"#
             )
         };
-        // the image's `Config` as `docker image inspect` prints it → what doctor reads
         let table = [
             (with_revision("2"), current.clone()),
             (with_revision("3"), current),

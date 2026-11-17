@@ -1,6 +1,3 @@
-//! What `portman uninstall` removes from the engine after it stopped the
-//! daemon.
-//!
 //! A daemon that stops leaves the setup container, the DNS forwarder and
 //! the `portman` network in the engine, so that containers keep their
 //! lookups and their addresses until the daemon is back. An uninstall brings
@@ -84,8 +81,6 @@ async fn remove_from(
     }
 }
 
-/// [`Absent`] in its own words tells the user which daemon setting to
-/// change. An uninstall reads none of them, so it says only where it looked.
 fn where_no_engine_answered(absent: Absent) -> String {
     match absent {
         Absent::Unreachable { socket, error } => {
