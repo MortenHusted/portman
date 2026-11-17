@@ -786,7 +786,7 @@ fn apply_result(state: &mut State, res: Result<()>) {
 
 fn after_disable(res: &Result<Settled>) -> Modal {
     match (res, disable_note()) {
-        (Ok(_), Some(note)) => Modal::BridgeDisabled { note },
+        (Ok(Settled::Reached), Some(note)) => Modal::BridgeDisabled { note },
         _ => Modal::None,
     }
 }
