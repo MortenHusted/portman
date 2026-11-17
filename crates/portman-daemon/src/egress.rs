@@ -83,7 +83,6 @@ impl CredentialSource for SupervisorCredentials {
             host,
             &crate::egress_grants::route_identity(target, spec),
             headers,
-            crate::now_unix_ms() / 1000,
         )
     }
     async fn resolve(&self, spec: &EgressSpec) -> Option<String> {

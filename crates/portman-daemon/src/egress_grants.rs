@@ -1,7 +1,8 @@
 //! Host-controller grants. The store contains digests, never bearer tokens.
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -24,18 +25,40 @@ struct Records {
     grants: BTreeMap<String, Option<Grant>>,
 }
 
+trait Clock: Send + Sync {
+    fn unix_secs(&self) -> u64;
+    fn monotonic(&self) -> Instant;
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn unix_secs(&self) -> u64 {
+        crate::now_unix_ms() / 1000
+    }
+    fn monotonic(&self) -> Instant {
+        Instant::now()
+    }
+}
+
 pub(crate) struct GrantStore {
     path: PathBuf,
     gate: Mutex<()>,
-    started_at: (u64, std::time::Instant),
+    clock: Arc<dyn Clock>,
+    started_at: (u64, Instant),
 }
 
 impl GrantStore {
     pub(crate) fn new(path: PathBuf) -> Self {
+        Self::with_clock(path, Arc::new(SystemClock))
+    }
+
+    fn with_clock(path: PathBuf, clock: Arc<dyn Clock>) -> Self {
         Self {
             path,
             gate: Mutex::new(()),
-            started_at: (crate::now_unix_ms() / 1000, std::time::Instant::now()),
+            started_at: (clock.unix_secs(), clock.monotonic()),
+            clock,
         }
     }
 
@@ -51,11 +74,10 @@ impl GrantStore {
         portman_core::atomic_json::atomic_write_json_durable(&self.path, records, 0o600)
     }
 
-    fn observe(&self, records: &mut Records, now: u64) -> Result<()> {
-        let monotonic_floor = self
-            .started_at
-            .0
-            .saturating_add(self.started_at.1.elapsed().as_secs());
+    fn observe(&self, _gate: &MutexGuard<'_, ()>, records: &mut Records) -> Result<u64> {
+        let now = self.clock.unix_secs();
+        let since_start = self.clock.monotonic().duration_since(self.started_at.1);
+        let monotonic_floor = self.started_at.0.saturating_add(since_start.as_secs());
         let floor = records.observed_unix.max(monotonic_floor);
         if now < floor {
             bail!("clock rollback: egress grants unavailable until time recovers");
@@ -64,7 +86,7 @@ impl GrantStore {
             records.observed_unix = now;
             self.write(records)?;
         }
-        Ok(())
+        Ok(now)
     }
 
     pub(crate) fn issue(
@@ -87,9 +109,9 @@ impl GrantStore {
         {
             bail!("token_sha256 must be a lowercase SHA-256 hex digest");
         }
-        let _guard = self.gate.lock().expect("grant lock poisoned");
+        let gate = self.gate.lock().expect("grant lock poisoned");
         let mut records = self.read()?;
-        self.observe(&mut records, crate::now_unix_ms() / 1000)?;
+        let now = self.observe(&gate, &mut records)?;
         let grant = Grant {
             host,
             token_sha256: digest,
@@ -103,7 +125,7 @@ impl GrantStore {
             }
             bail!("grant ID already exists or was revoked");
         }
-        if expires_at <= crate::now_unix_ms() / 1000 {
+        if expires_at <= now {
             bail!("grant expiry must be in the future");
         }
         // Reusing a bearer across hosts would silently broaden its authority.
@@ -132,13 +154,7 @@ impl GrantStore {
         self.write(&records)
     }
 
-    pub(crate) fn permits(
-        &self,
-        host: &str,
-        route: &str,
-        headers: &[(String, String)],
-        now: u64,
-    ) -> bool {
+    pub(crate) fn permits(&self, host: &str, route: &str, headers: &[(String, String)]) -> bool {
         if headers.iter().any(|(name, _)| {
             ["proxy-authorization", "x-api-key", "api-key"]
                 .iter()
@@ -166,13 +182,13 @@ impl GrantStore {
             return false;
         }
         let digest = hex::encode(Sha256::digest(token.as_bytes()));
-        let _guard = self.gate.lock().expect("grant lock poisoned");
+        let gate = self.gate.lock().expect("grant lock poisoned");
         let Ok(mut records) = self.read() else {
             return false;
         };
-        if self.observe(&mut records, now).is_err() {
+        let Ok(now) = self.observe(&gate, &mut records) else {
             return false;
-        }
+        };
         records.grants.values().flatten().any(|g| {
             !g.revoked
                 && g.route_identity == route
@@ -204,6 +220,8 @@ fn validate_id(id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::time::Duration;
     const TOKEN: &str = "synthetic-token-0123456789abcdef0123456789";
     fn headers() -> Vec<(String, String)> {
         vec![("Authorization".into(), format!("Bearer {TOKEN}"))]
@@ -217,49 +235,81 @@ mod tests {
             "route-v1".into(),
         )
     }
+    const START: u64 = 1_800_000_000;
+    struct TestClock {
+        started: Instant,
+        wall: AtomicU64,
+        monotonic_secs: AtomicU64,
+    }
+    impl TestClock {
+        fn at(wall: u64) -> Arc<Self> {
+            Arc::new(Self {
+                started: Instant::now(),
+                wall: AtomicU64::new(wall),
+                monotonic_secs: AtomicU64::new(0),
+            })
+        }
+        fn advance(&self, secs: u64) {
+            self.wall.fetch_add(secs, Ordering::Relaxed);
+            self.monotonic_secs.fetch_add(secs, Ordering::Relaxed);
+        }
+        fn roll_wall_back_to(&self, wall: u64) {
+            self.wall.store(wall, Ordering::Relaxed);
+        }
+    }
+    impl Clock for TestClock {
+        fn unix_secs(&self) -> u64 {
+            self.wall.load(Ordering::Relaxed)
+        }
+        fn monotonic(&self) -> Instant {
+            self.started + Duration::from_secs(self.monotonic_secs.load(Ordering::Relaxed))
+        }
+    }
     #[test]
     fn scoped_expiring_idempotent_and_terminal_across_reload() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("grants.json");
-        let store = GrantStore::new(path.clone());
-        let now = crate::now_unix_ms() / 1000;
-        issue(&store, "run-1", now + 60).unwrap();
-        issue(&store, "run-1", now + 60).unwrap();
-        assert!(store.permits("qwen.localhost", "route-v1", &headers(), now));
-        assert!(!store.permits("qwen.localhost", "changed-route", &headers(), now));
-        assert!(!store.permits("other.localhost", "route-v1", &headers(), now));
-        assert!(!store.permits("qwen.localhost", "route-v1", &headers(), now + 60));
-        assert!(!store.permits("qwen.localhost", "route-v1", &[], now));
+        let clock = TestClock::at(START);
+        let store = GrantStore::with_clock(path.clone(), clock.clone());
+        issue(&store, "run-1", START + 60).unwrap();
+        issue(&store, "run-1", START + 60).unwrap();
+        assert!(store.permits("qwen.localhost", "route-v1", &headers()));
+        assert!(!store.permits("qwen.localhost", "changed-route", &headers()));
+        assert!(!store.permits("other.localhost", "route-v1", &headers()));
+        assert!(!store.permits("qwen.localhost", "route-v1", &[]));
         let mut duplicate = headers();
         duplicate.extend(headers());
-        assert!(!store.permits("qwen.localhost", "route-v1", &duplicate, now));
-        assert!(issue(&store, "run-1", now + 90).is_err());
+        assert!(!store.permits("qwen.localhost", "route-v1", &duplicate));
+        assert!(issue(&store, "run-1", START + 90).is_err());
         assert!(!std::fs::read_to_string(&path).unwrap().contains(TOKEN));
+        clock.advance(59);
+        assert!(store.permits("qwen.localhost", "route-v1", &headers()));
+        clock.advance(1);
+        assert!(!store.permits("qwen.localhost", "route-v1", &headers()));
         store.revoke("run-1".into()).unwrap();
-        let reloaded = GrantStore::new(path);
-        assert!(!reloaded.permits("qwen.localhost", "route-v1", &headers(), now));
-        assert!(issue(&reloaded, "run-1", now + 60).is_err());
+        let reloaded = GrantStore::with_clock(path, clock.clone());
+        assert!(!reloaded.permits("qwen.localhost", "route-v1", &headers()));
+        assert!(issue(&reloaded, "run-1", START + 120).is_err());
         reloaded.revoke("run-2".into()).unwrap();
-        assert!(issue(&reloaded, "run-2", now + 60).is_err());
+        assert!(issue(&reloaded, "run-2", START + 120).is_err());
     }
     #[test]
     fn concurrent_callers_keep_a_valid_grant_while_the_clock_advances() {
-        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-        use std::sync::Arc;
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(GrantStore::new(dir.path().join("grants.json")));
-        issue(&store, "run-1", crate::now_unix_ms() / 1000 + 3600).unwrap();
-        let clock = Arc::new(AtomicU64::new(crate::now_unix_ms() / 1000));
+        let clock = TestClock::at(START);
+        let store = Arc::new(GrantStore::with_clock(
+            dir.path().join("grants.json"),
+            clock.clone(),
+        ));
+        issue(&store, "run-1", START + 3600).unwrap();
         let done = Arc::new(AtomicBool::new(false));
         let denied = Arc::new(AtomicUsize::new(0));
         let callers: Vec<_> = (0..8)
             .map(|_| {
-                let (store, clock, done, denied) =
-                    (store.clone(), clock.clone(), done.clone(), denied.clone());
+                let (store, done, denied) = (store.clone(), done.clone(), denied.clone());
                 std::thread::spawn(move || {
                     while !done.load(Ordering::Relaxed) {
-                        let now = clock.load(Ordering::Relaxed);
-                        if !store.permits("qwen.localhost", "route-v1", &headers(), now) {
+                        if !store.permits("qwen.localhost", "route-v1", &headers()) {
                             denied.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -267,8 +317,8 @@ mod tests {
             })
             .collect();
         for _ in 0..100 {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            clock.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(2));
+            clock.advance(1);
         }
         done.store(true, Ordering::Relaxed);
         for caller in callers {
@@ -282,22 +332,24 @@ mod tests {
         let path = dir.path().join("grants.json");
         std::fs::write(&path, "broken").unwrap();
         let store = GrantStore::new(path);
-        assert!(!store.permits("qwen.localhost", "route-v1", &headers(), 0));
+        assert!(!store.permits("qwen.localhost", "route-v1", &headers()));
         assert!(store.revoke("run-1".into()).is_err());
     }
     #[test]
     fn clock_rollback_cannot_reactivate_expired_grants_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("grants.json");
-        let store = GrantStore::new(path.clone());
-        let now = crate::now_unix_ms() / 1000;
-        issue(&store, "clock-test", now + 60).unwrap();
-        assert!(store.permits("qwen.localhost", "route-v1", &headers(), now));
-        assert!(!store.permits("qwen.localhost", "route-v1", &headers(), now + 60));
-        assert!(!store.permits("qwen.localhost", "route-v1", &headers(), now));
-        let reloaded = GrantStore::new(path);
-        assert!(!reloaded.permits("qwen.localhost", "route-v1", &headers(), now));
-        assert!(issue(&reloaded, "new-run", now + 120).is_err());
+        let clock = TestClock::at(START);
+        let store = GrantStore::with_clock(path.clone(), clock.clone());
+        issue(&store, "clock-test", START + 60).unwrap();
+        assert!(store.permits("qwen.localhost", "route-v1", &headers()));
+        clock.advance(60);
+        assert!(!store.permits("qwen.localhost", "route-v1", &headers()));
+        clock.roll_wall_back_to(START);
+        assert!(!store.permits("qwen.localhost", "route-v1", &headers()));
+        let reloaded = GrantStore::with_clock(path, TestClock::at(START));
+        assert!(!reloaded.permits("qwen.localhost", "route-v1", &headers()));
+        assert!(issue(&reloaded, "new-run", START + 120).is_err());
         reloaded.revoke("clock-test".into()).unwrap();
     }
 }
