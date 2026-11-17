@@ -15,6 +15,7 @@ pub(crate) async fn cmd_bridge_status() -> Result<()> {
             bridge_assessment,
             bridge_enabled,
             bridge_phase,
+            bridge_retry_in_secs,
             bridge_mode,
             docker,
             ..
@@ -23,6 +24,7 @@ pub(crate) async fn cmd_bridge_status() -> Result<()> {
             let lines = bridge_status_lines(
                 bridge_assessment,
                 bridge_phase.or_from_enabled(bridge_enabled),
+                bridge_retry_in_secs,
                 bridge_mode,
                 docker.as_ref(),
                 &routes,
@@ -41,13 +43,14 @@ pub(crate) async fn cmd_bridge_status() -> Result<()> {
 fn bridge_status_lines(
     assessment: BridgeAssessment,
     phase: BridgePhase,
+    retry_in_secs: Option<u64>,
     mode: NetbridgeMode,
     docker: Option<&DockerStatus>,
     routes: &doctor::DockerRouteStatus,
 ) -> Vec<String> {
     let mut lines = vec![
         format!("bridge:    {assessment}"),
-        format!("netbridge: {}", phase.display_word()),
+        format!("netbridge: {}", phase.status_words(retry_in_secs)),
         format!("mode:      {}", NetbridgeMode::display_word(mode)),
     ];
     lines.extend(docker.map(|docker| format!("docker:    {}", docker.summary())));
@@ -176,6 +179,7 @@ mod tests {
         bridge_status_lines(
             BridgeAssessment::Offline,
             phase,
+            None,
             NetbridgeMode::OptIn,
             docker,
             routes,
@@ -206,6 +210,23 @@ mod tests {
                 "mode:      opt-in",
                 networks,
             ]
+        );
+    }
+
+    #[test]
+    fn bridge_status_says_when_a_failed_start_runs_again() {
+        let waits = bridge_status_lines(
+            BridgeAssessment::Offline,
+            BridgePhase::Starting,
+            Some(12),
+            NetbridgeMode::OptIn,
+            None,
+            &DockerRouteStatus::NoLabelledContainers,
+        );
+
+        assert_eq!(
+            waits[1],
+            "netbridge: starting, the last start failed, tries again in 12s"
         );
     }
 

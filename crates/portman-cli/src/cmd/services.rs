@@ -27,6 +27,7 @@ pub(crate) async fn cmd_status(repo: bool) -> Result<()> {
             bridge_assessment: _bridge_assessment,
             bridge_enabled: _bridge_enabled,
             bridge_phase: _bridge_phase,
+            bridge_retry_in_secs: _bridge_retry_in_secs,
             bridge_mode: _bridge_mode,
             dashboard_port: _,
             managed_broker,
@@ -61,10 +62,11 @@ pub(crate) async fn cmd_status(repo: bool) -> Result<()> {
             {
                 println!("bridge:          {_bridge_assessment}");
                 println!(
-                    "netbridge:       {}",
-                    _bridge_phase
-                        .or_from_enabled(_bridge_enabled)
-                        .display_word()
+                    "{}",
+                    netbridge_line(
+                        _bridge_phase.or_from_enabled(_bridge_enabled),
+                        _bridge_retry_in_secs
+                    )
                 );
                 println!(
                     "netbridge mode:  {}",
@@ -93,6 +95,13 @@ pub(crate) async fn cmd_status(repo: bool) -> Result<()> {
 /// reports no engine state, and status then prints no line.
 fn docker_line(docker: Option<&portman_protocol::DockerStatus>) -> Option<String> {
     docker.map(|docker| format!("docker:          {}", docker.summary()))
+}
+
+/// The `netbridge` line of `portman status`. A bridge whose last start
+/// failed also says when the daemon starts it again.
+#[cfg(any(target_os = "macos", test))]
+fn netbridge_line(phase: portman_protocol::BridgePhase, retry_in_secs: Option<u64>) -> String {
+    format!("netbridge:       {}", phase.status_words(retry_in_secs))
 }
 
 /// Load and validate this repo's service config (walking up from the cwd).
@@ -446,6 +455,35 @@ mod tests {
         assert_eq!(
             line(r#"{"kind":"status","docker":{"state":"paused"}}"#).as_deref(),
             Some("docker:          unknown")
+        );
+    }
+
+    #[test]
+    fn status_says_when_a_failed_bridge_start_runs_again() {
+        let line = |json: &str| match serde_json::from_str(json).unwrap() {
+            Response::Status {
+                bridge_phase,
+                bridge_enabled,
+                bridge_retry_in_secs,
+                ..
+            } => netbridge_line(
+                bridge_phase.or_from_enabled(bridge_enabled),
+                bridge_retry_in_secs,
+            ),
+            other => panic!("expected status response, got {other:?}"),
+        };
+
+        assert_eq!(
+            line(r#"{"kind":"status","bridge_phase":"starting","bridge_retry_in_secs":12}"#),
+            "netbridge:       starting, the last start failed, tries again in 12s"
+        );
+        assert_eq!(
+            line(r#"{"kind":"status","bridge_phase":"starting"}"#),
+            "netbridge:       starting"
+        );
+        assert_eq!(
+            line(r#"{"kind":"status","version":"0.1.5","bridge_enabled":true}"#),
+            "netbridge:       up"
         );
     }
 

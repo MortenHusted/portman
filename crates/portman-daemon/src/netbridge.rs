@@ -51,7 +51,8 @@
 //!     a network that is in use. A forwarder that could not be removed
 //!     beside such a network stays until the next `Disable`.
 //!   - [`publish`] tells the rest of the daemon what the bridge is doing:
-//!     the [`phase`], the mode, and the interface index of the utun.
+//!     the [`phase`], the mode, the interface index of the utun, and when a
+//!     start that failed runs again.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -172,6 +173,19 @@ pub(crate) struct Handle {
     /// Wakes the netbridge task after a change of the managed TLD set, which
     /// the DNS forwarder is built from.
     pub tlds_changed: Arc<Notify>,
+    /// When the next start is due, while a start that failed waits for its
+    /// retry.
+    pub retry_at: Arc<std::sync::RwLock<Option<Instant>>>,
+}
+
+impl Handle {
+    /// The seconds until the retry of a failed start, rounded up. `None`
+    /// when no start waits for one.
+    pub(crate) fn retry_in_secs(&self) -> Option<u64> {
+        let at = (*self.retry_at.read().expect("retry lock poisoned"))?;
+        let left = at.saturating_duration_since(Instant::now());
+        Some(left.as_secs() + u64::from(left.subsec_nanos() > 0))
+    }
 }
 
 /// Build the handle the daemon shares, and the two ends only the netbridge
@@ -187,6 +201,7 @@ pub(crate) fn handle_pair() -> (Handle, mpsc::Receiver<Control>, watch::Sender<B
             phase,
             ifindex: crate::upstream::new_bridge_ifindex(),
             tlds_changed: Arc::new(Notify::new()),
+            retry_at: Arc::default(),
         },
         rx,
         phase_tx,
@@ -506,6 +521,7 @@ async fn converge<E: BridgeEngine>(
             phase(&intent, session, built),
             reported_mode(&intent, built),
             running.as_ref(),
+            attempts.retry_at,
         )
         .await;
         let may_start = attempts.retry_at.is_none();
@@ -685,16 +701,18 @@ async fn next_wake(
 /// doing. The ifindex goes first, so that a reader woken by `Up` finds it
 /// set. The mode goes last, so that a reader that takes the mode first and
 /// the phase second never gets a new mode with a phase that is older than
-/// it.
+/// it. `retry_at` is when a start that failed runs again.
 async fn publish(
     handle: &Handle,
     phase_tx: &watch::Sender<BridgePhase>,
     phase: BridgePhase,
     mode: NetbridgeMode,
     running: Option<&Running<impl Bridge>>,
+    retry_at: Option<Instant>,
 ) {
     let up = running.filter(|_| phase.epoch().is_some());
     publish_ifindex(&handle.ifindex, up.map(|r| &r.bridge));
+    *handle.retry_at.write().expect("retry lock poisoned") = retry_at;
     phase_tx.send_replace(phase);
     *handle.mode.write().await = mode;
 }
@@ -1736,6 +1754,40 @@ mod tests {
         let retry = rig.next_attempt().await;
 
         assert_eq!(retry.at - first.at, RETRY_BASE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_time_of_the_retry_is_published_while_a_failed_start_waits_for_it() {
+        let mut rig = Rig::start();
+        assert_eq!(rig.handle.retry_in_secs(), None);
+
+        rig.send(Control::Enable).await;
+        rig.next_attempt().await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(rig.handle.retry_in_secs(), Some(4));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(rig.handle.retry_in_secs(), Some(2));
+
+        rig.next_attempt().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(rig.handle.retry_in_secs(), Some(9));
+
+        rig.send(Control::Disable).await;
+        rig.reaches(BridgePhase::Disabled).await;
+        assert_eq!(rig.handle.retry_in_secs(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_retry_time_is_published_for_a_bridge_that_is_up_or_waits_for_docker() {
+        let rig = Rig::up().await;
+        assert_eq!(rig.handle.retry_in_secs(), None);
+
+        let mut failing = Rig::start();
+        failing.send(Control::Enable).await;
+        failing.next_attempt().await;
+        failing.engine_session(None);
+        failing.reaches(BridgePhase::WaitingForDocker).await;
+        assert_eq!(failing.handle.retry_in_secs(), None);
     }
 
     #[tokio::test(start_paused = true)]
