@@ -283,6 +283,15 @@ struct NotStarted {
     why: String,
 }
 
+impl UpService {
+    fn place(&self) -> String {
+        match &self.root {
+            Some(root) => root.display().to_string(),
+            None => "its repository".to_string(),
+        }
+    }
+}
+
 impl InterruptedServices {
     pub(crate) async fn record() -> Self {
         let Some(recorded) = Self::record_from(request).await else {
@@ -438,7 +447,16 @@ impl InterruptedServices {
     }
 
     fn start_lines(&self) -> Vec<String> {
-        Vec::new()
+        if self.0.is_empty() {
+            return Vec::new();
+        }
+        let head = "the daemon did not start, so these services stay down. \
+                    When the daemon runs again, start each one:";
+        let commands = self.0.iter().map(|service| {
+            let (name, place) = (&service.name, service.place());
+            format!("  `portman up {name}` in {place}")
+        });
+        std::iter::once(head.to_string()).chain(commands).collect()
     }
 
     fn names(&self) -> Vec<String> {
@@ -474,13 +492,10 @@ impl RestartReport {
             ));
         }
         for NotStarted { service, why } in &self.not_started {
-            let place = match &service.root {
-                Some(root) => root.display().to_string(),
-                None => "its repository".to_string(),
-            };
             lines.push(format!(
                 "could not start {name} again: {why}. Run `portman up {name}` in {place}.",
-                name = service.name
+                name = service.name,
+                place = service.place()
             ));
         }
         lines
