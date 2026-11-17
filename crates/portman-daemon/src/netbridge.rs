@@ -1690,9 +1690,17 @@ mod tests {
         (engine, fake)
     }
 
-    /// What this thread logs at info and above while the guard lives.
+    /// What this thread logs at info and above while a [`Capture`] lives.
     #[derive(Clone, Default)]
     struct Logged(Arc<Mutex<Vec<u8>>>);
+
+    /// While one subscriber exists, tracing takes a callsite's interest
+    /// from the thread that reaches it first, and that can be a test that
+    /// has no subscriber. With a second subscriber it asks each of them.
+    struct Capture {
+        _on_this_thread: tracing::subscriber::DefaultGuard,
+        _second_subscriber: tracing::Dispatch,
+    }
 
     impl std::io::Write for Logged {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -1706,14 +1714,18 @@ mod tests {
     }
 
     impl Logged {
-        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        fn capture() -> (Self, Capture) {
             let logged = Self::default();
             let writer = logged.clone();
             let subscriber = tracing_subscriber::fmt()
                 .with_ansi(false)
                 .with_writer(move || writer.clone())
                 .finish();
-            (logged, tracing::subscriber::set_default(subscriber))
+            let capture = Capture {
+                _on_this_thread: tracing::subscriber::set_default(subscriber),
+                _second_subscriber: tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new()),
+            };
+            (logged, capture)
         }
 
         /// Takes the lines that were logged since the last call.
@@ -1727,7 +1739,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_cleanup_logs_each_removal_once_and_nothing_when_nothing_is_left() {
         let (engine, _fake) = engine_with_leftovers(FREE_PORT);
-        let (logged, _guard) = Logged::capture();
+        let (logged, _capture) = Logged::capture();
 
         engine
             .remove_leftovers(Session(1), SetupContainerAndNetwork)
@@ -1754,7 +1766,7 @@ mod tests {
         let taken = another_daemons_bridge.local_addr().unwrap().port();
         let (on_a_taken_port, _fake) = engine_with_leftovers(taken);
         let (on_a_free_port, _fake) = engine_with_leftovers(FREE_PORT);
-        let (logged, _guard) = Logged::capture();
+        let (logged, _capture) = Logged::capture();
 
         on_a_taken_port
             .remove_leftovers(Session(1), SetupContainerAndNetwork)
