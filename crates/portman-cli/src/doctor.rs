@@ -711,31 +711,71 @@ pub(crate) fn render_report(report: &DoctorReport) -> String {
     // Guidance is conditional: printing "stop the legacy bridge" on a clean
     // machine hands users alarming instructions for a service they don't
     // have, and the enable hint is noise once the replacement is ready.
-    if legacy_running || !ready {
+    let mut guidance = Vec::new();
+    if !ready {
+        guidance.extend(
+            bridge_guidance(&report.daemon)
+                .iter()
+                .map(|line| format!("  {line}")),
+        );
+    }
+    if legacy_running {
+        guidance.push("  Portman did not stop it automatically.".to_string());
+        guidance.push("  to stop the legacy bridge when you are ready:".to_string());
+        guidance.push("    sudo brew services stop docker-mac-net-connect".to_string());
+        guidance.push(format!(
+            "    sudo launchctl bootout system {DOCKER_MAC_NET_CONNECT_PLIST}"
+        ));
+    }
+    if !guidance.is_empty() {
         lines.push("guidance:".to_string());
-        if !ready {
-            lines.extend(
-                bridge_guidance(report.daemon.bridge_phase)
-                    .iter()
-                    .map(|line| format!("  {line}")),
-            );
-        }
-        if legacy_running {
-            lines.push("  Portman did not stop it automatically.".to_string());
-            lines.push("  to stop the legacy bridge when you are ready:".to_string());
-            lines.push("    sudo brew services stop docker-mac-net-connect".to_string());
-            lines.push(format!(
-                "    sudo launchctl bootout system {DOCKER_MAC_NET_CONNECT_PLIST}"
-            ));
-        }
+        lines.extend(guidance);
     }
 
     lines.join("\n") + "\n"
 }
 
 /// `portman bridge enable` helps only a bridge that is off. For a bridge
-/// that is enabled and not up, it restarts the retry delay and waits.
-fn bridge_guidance(phase: Option<BridgePhase>) -> &'static [&'static str] {
+/// that is enabled and not up, it restarts the retry delay and waits. A
+/// bridge that is up in `docker` mode is where both commands lead, so the
+/// advice for it is what the health found.
+fn bridge_guidance(daemon: &DaemonSnapshot) -> &'static [&'static str] {
+    match (daemon.bridge_phase, daemon.bridge_mode) {
+        (Some(BridgePhase::Up), Some(NetbridgeMode::Docker)) => {
+            health_guidance(daemon.bridge_assessment.unwrap_or_default())
+        }
+        (phase, _) => phase_guidance(phase),
+    }
+}
+
+/// For a bridge that is up in `docker` mode. That bridge adds a missing
+/// route within seconds and leaves one that another live `utun` holds, so a
+/// route that stays missing is one that the bridge does not own or does not
+/// make.
+fn health_guidance(health: BridgeAssessment) -> &'static [&'static str] {
+    const LOOK_AT: &str =
+        "`portman bridge status` names each labelled network and the interface of its route";
+    match health {
+        BridgeAssessment::Healthy => &[],
+        BridgeAssessment::RoutesMissing => &[
+            "netbridge is up in docker mode, and a labelled Docker network has no route through the bridge",
+            LOOK_AT,
+            "the bridge leaves a route in place that another live `utun` holds, such as the one of a VPN",
+        ],
+        BridgeAssessment::TunnelDead => &[
+            "netbridge is up in docker mode, and the route to a labelled Docker network names an interface that no longer exists",
+            LOOK_AT,
+        ],
+        BridgeAssessment::Offline => &[
+            "netbridge is up in docker mode, and the daemon's health check got no answer from Docker; check that your container runtime is running",
+        ],
+        BridgeAssessment::Unknown => &[
+            "netbridge is up in docker mode, and the daemon reports no health for it that this `portman` can read",
+        ],
+    }
+}
+
+fn phase_guidance(phase: Option<BridgePhase>) -> &'static [&'static str] {
     match phase {
         Some(BridgePhase::Starting) => &[
             "netbridge is enabled and not up yet; if a start fails, the daemon tries again",
