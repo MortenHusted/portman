@@ -2584,9 +2584,30 @@ destination: 172.18.0.0
     #[test]
     fn the_embedded_setup_image_says_which_revision_it_is() {
         let dockerfile = include_str!("../../portman-netbridge/setup-image/Dockerfile");
+        let entrypoint = include_str!("../../portman-netbridge/setup-image/entrypoint.sh");
         let label = format!("LABEL {SETUP_IMAGE_REVISION_LABEL}=\"{SETUP_IMAGE_REVISION}\"");
 
         assert!(dockerfile.lines().any(|line| line == label), "{label}");
+        assert_eq!(
+            (SETUP_IMAGE_REVISION, fnv1a(&[dockerfile, entrypoint])),
+            REVISION_AND_DIGEST_OF_THE_SETUP_IMAGE,
+            "the Dockerfile or the entrypoint of the setup image changed. `portman doctor` \
+             tells an older image from the current one by the revision alone, so raise the \
+             revision in the Dockerfile's label and in SETUP_IMAGE_REVISION, and pin the new \
+             pair in REVISION_AND_DIGEST_OF_THE_SETUP_IMAGE"
+        );
+    }
+
+    /// The revision of the setup image, and a digest of the files it is built
+    /// from as that revision has them.
+    const REVISION_AND_DIGEST_OF_THE_SETUP_IMAGE: (u32, u64) = (2, 2160735590138777321);
+
+    /// FNV-1a over the bytes of each part and a zero byte after it.
+    fn fnv1a(parts: &[&str]) -> u64 {
+        let bytes = parts.iter().flat_map(|part| part.bytes().chain([0]));
+        bytes.fold(0xcbf2_9ce4_8422_2325, |hash: u64, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        })
     }
 
     #[test]
