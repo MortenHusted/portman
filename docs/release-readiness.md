@@ -141,6 +141,8 @@ the compose line `dns: [192.168.99.129]`.
   strict order tries the next server and has none, so it sends no reply over
   UDP. The client then waits for its own timeout, where Docker's own
   resolver passes the error on at once. Over TCP the error comes through.
+  The forwarder also does not pass on the `ad` flag of a DNSSEC answer, as
+  on portman 0.1.7. The records of that answer are the same.
 - The daemon looks at the container at each bridge start, at each change of
   the managed TLD set, and once more a minute after it started one. It replaces a container that does not run, runs
   another command, or comes from another build of the setup image, and leaves
