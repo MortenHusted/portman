@@ -93,7 +93,7 @@ A service that does not start does not fail the install. In three cases the inst
 
 - The old daemon gives no answer within 3 seconds. The install cannot name the services, and it restarts the daemon without a record of them.
 - The new daemon does not start. The install fails, and it prints the `portman up` command for each service that was up.
-- The new daemon stops answering after it took the start request. The install cannot tell which services started, and it names them.
+- The new daemon stops answering once the install has sent the start request. The install cannot tell which services started, and it names them.
 
 ### macOS
 

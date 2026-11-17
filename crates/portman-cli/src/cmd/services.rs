@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use portman_protocol::{ServiceState, ServiceStatusInfo};
 use tokio::time::{sleep, timeout, timeout_at, Duration, Instant};
 
@@ -378,17 +378,14 @@ impl InterruptedServices {
         let start = send(Request::ServiceUp {
             names: names.clone(),
         });
-        let asked = timeout(NEW_DAEMON_LIMIT, start)
-            .await
-            .unwrap_or_else(|_| {
-                Err(anyhow!(
-                    "the new daemon did not answer the start request within 30s"
-                ))
-            })
-            .and_then(|response| match response {
-                Response::ServiceStatuses { services } => Ok(services),
-                other => other.unexpected(),
-            });
+        let Ok(asked) = timeout(NEW_DAEMON_LIMIT, start).await else {
+            report.unconfirmed = names;
+            return report;
+        };
+        let asked = asked.and_then(|response| match response {
+            Response::ServiceStatuses { services } => Ok(services),
+            other => other.unexpected(),
+        });
         let wanted_up = match asked {
             Ok(rows) => rows.into_iter().filter(|row| row.desired_up),
             Err(err) => {
@@ -498,9 +495,8 @@ impl RestartReport {
         }
         if !self.unconfirmed.is_empty() {
             lines.push(format!(
-                "the new daemon stopped answering after the start request, so the install \
-                 cannot tell whether these services started: {}. \
-                 Run `portman status` when the daemon answers again.",
+                "the new daemon stopped answering, so the install cannot tell whether these \
+                 services started: {}. Run `portman status` when the daemon answers again.",
                 self.unconfirmed.join(", ")
             ));
         }
@@ -1109,8 +1105,8 @@ mod tests {
         assert_eq!(
             report.lines(),
             [
-                "could not start web again: the new daemon did not answer the start request \
-                 within 30s. Run `portman up web` in /Users/dev/acme/web."
+                "the new daemon stopped answering, so the install cannot tell whether these \
+                 services started: web. Run `portman status` when the daemon answers again."
             ]
         );
     }
@@ -1146,9 +1142,8 @@ mod tests {
         assert_eq!(
             report.lines(),
             [
-                "the new daemon stopped answering after the start request, so the install \
-                 cannot tell whether these services started: web. \
-                 Run `portman status` when the daemon answers again."
+                "the new daemon stopped answering, so the install cannot tell whether these \
+                 services started: web. Run `portman status` when the daemon answers again."
             ]
         );
     }
@@ -1193,9 +1188,8 @@ mod tests {
         assert_eq!(
             report.lines(),
             [
-                "the new daemon stopped answering after the start request, so the install \
-                 cannot tell whether these services started: web. \
-                 Run `portman status` when the daemon answers again."
+                "the new daemon stopped answering, so the install cannot tell whether these \
+                 services started: web. Run `portman status` when the daemon answers again."
             ]
         );
     }
