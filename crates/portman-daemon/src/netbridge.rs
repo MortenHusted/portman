@@ -1783,6 +1783,20 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_retry_that_has_fallen_due_has_no_time_left_to_report() {
+        let (handle, _rx, _phase_tx) = handle_pair();
+        let due = Instant::now() + RETRY_BASE;
+        *handle.retry_at.write().unwrap() = Some(due);
+
+        tokio::time::advance(RETRY_BASE - Duration::from_nanos(1)).await;
+        assert_eq!(handle.retry_in_secs(), Some(1));
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        assert_eq!(handle.retry_in_secs(), None, "at the due instant");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(handle.retry_in_secs(), None, "after the due instant");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn no_retry_time_is_published_for_a_bridge_that_is_up_or_waits_for_docker() {
         let rig = Rig::up().await;
         assert_eq!(rig.handle.retry_in_secs(), None);
