@@ -69,16 +69,31 @@ git clone https://github.com/MortenHusted/portman && cd portman && cargo build -
 
 Optional extras: a Docker runtime if you want container routing, and [`mkcert`](https://github.com/FiloSottile/mkcert) if you want local TLS.
 
-To upgrade, run `portman install` again. It restarts the daemon, and the daemon stops every supervised service when it stops. The install names the services that are up before the restart and starts the same ones on the new daemon. A service that was down stays down, unless a service that the install starts depends on it. The daemon then starts that dependency too, and the install names it. The install waits up to 120 seconds for the services to get ready, then prints the ones that are ready again. For each service that is not ready, it prints the reason and the command that starts it:
+To upgrade, run `portman install` again. In a checkout, build first and run the binary that you built. The `portman` on your `PATH` is still the old version, and it restarts the daemon the way that version did.
+
+```bash
+cargo build --release -p portman && ./target/release/portman install
+```
+
+The install restarts the daemon, and the daemon stops every supervised service when it stops. Before the restart, the install asks the daemon which services are up and names them. After the restart, it starts the same services on the new daemon. A service that was down stays down, unless a service that the install starts depends on it. The daemon then starts that dependency too, and the install names it.
+
+The install waits up to 30 seconds for the new daemon to answer, and then up to 120 seconds for the services to get ready. It prints the services that are ready again. For each service that is not ready, it prints the reason and the command that starts it:
 
 ```text
-the restart of the daemon stops these services: jobs, web
+the restart of the daemon stops these services: api, jobs, web
 starting them again on the new daemon…
-started again: web
+started again: api, web
+started as a dependency: db
 could not start jobs again: failed (process exited (exit status: 1) before becoming ready). Run `portman up jobs` in /Users/dev/acme/shop.
 ```
 
-A service that does not start does not fail the install.
+When the first start of a service fails and the daemon tries again, the install does not wait for that service. It prints the reason and says that the daemon keeps trying.
+
+A service that does not start does not fail the install. In three cases the install cannot do its part, and it says so:
+
+- The old daemon gives no answer within 3 seconds. The install cannot name the services, and it restarts the daemon without a record of them.
+- The new daemon does not start. The install fails, and it prints the `portman up` command for each service that was up.
+- The new daemon stops answering after it took the start request. The install cannot tell which services started, and it names them.
 
 ### macOS
 
