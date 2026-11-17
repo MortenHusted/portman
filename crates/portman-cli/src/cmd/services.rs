@@ -63,22 +63,14 @@ pub(crate) async fn cmd_status(repo: bool) -> Result<()> {
                 println!("{line}");
             }
             #[cfg(target_os = "macos")]
-            {
-                println!("bridge:          {_bridge_assessment}");
-                println!(
-                    "{}",
-                    netbridge_line(
-                        _bridge_phase.or_from_enabled(_bridge_enabled),
-                        _bridge_retry_in_secs
-                    )
-                );
-                if let Some(line) = bridge_cleanup_line(_bridge_cleanup) {
-                    println!("{line}");
-                }
-                println!(
-                    "netbridge mode:  {}",
-                    portman_protocol::NetbridgeMode::display_word(_bridge_mode)
-                );
+            for line in bridge_lines(
+                _bridge_assessment,
+                _bridge_phase.or_from_enabled(_bridge_enabled),
+                _bridge_retry_in_secs,
+                _bridge_cleanup,
+                _bridge_mode,
+            ) {
+                println!("{line}");
             }
         }
         other => return other.unexpected(),
@@ -102,6 +94,27 @@ pub(crate) async fn cmd_status(repo: bool) -> Result<()> {
 /// reports no engine state, and status then prints no line.
 fn docker_line(docker: Option<&portman_protocol::DockerStatus>) -> Option<String> {
     docker.map(|docker| format!("docker:          {}", docker.summary()))
+}
+
+/// The lines of `portman status` about the bridge, which only macOS has.
+#[cfg(any(target_os = "macos", test))]
+fn bridge_lines(
+    assessment: portman_protocol::BridgeAssessment,
+    phase: portman_protocol::BridgePhase,
+    retry_in_secs: Option<u64>,
+    cleanup: Option<portman_protocol::BridgeCleanup>,
+    mode: portman_protocol::NetbridgeMode,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!("bridge:          {assessment}"),
+        netbridge_line(phase, retry_in_secs),
+    ];
+    lines.extend(bridge_cleanup_line(cleanup));
+    lines.push(format!(
+        "netbridge mode:  {}",
+        portman_protocol::NetbridgeMode::display_word(mode)
+    ));
+    lines
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1434,6 +1447,27 @@ mod tests {
                  until the next `portman bridge disable`"
             )
         );
+    }
+
+    #[test]
+    fn status_puts_the_cleanup_line_between_the_bridge_and_its_mode() {
+        use portman_protocol::{BridgeAssessment, BridgeCleanup, BridgePhase, NetbridgeMode};
+        let lines = bridge_lines(
+            BridgeAssessment::Offline,
+            BridgePhase::Disabled,
+            None,
+            Some(BridgeCleanup::Failed),
+            NetbridgeMode::OptIn,
+        );
+
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines[0], "bridge:          offline");
+        assert_eq!(lines[1], "netbridge:       disabled");
+        assert!(
+            lines[2].starts_with("bridge cleanup:  portman could not"),
+            "{lines:?}"
+        );
+        assert_eq!(lines[3], "netbridge mode:  opt-in");
     }
 
     #[test]

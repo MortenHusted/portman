@@ -10,7 +10,16 @@ use crate::client::request;
 use portman_protocol::{Request, Response};
 
 pub(crate) async fn cmd_bridge_status() -> Result<()> {
-    match request(Request::Status).await? {
+    let status = request(Request::Status).await?;
+    let routes = doctor::collect_docker_routes().await;
+    for line in lines_of_status(status, &routes)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn lines_of_status(status: Response, routes: &doctor::DockerRouteStatus) -> Result<Vec<String>> {
+    match status {
         Response::Status {
             bridge_assessment,
             bridge_enabled,
@@ -20,22 +29,15 @@ pub(crate) async fn cmd_bridge_status() -> Result<()> {
             bridge_mode,
             docker,
             ..
-        } => {
-            let routes = doctor::collect_docker_routes().await;
-            let lines = bridge_status_lines(
-                bridge_assessment,
-                bridge_phase.or_from_enabled(bridge_enabled),
-                bridge_retry_in_secs,
-                bridge_cleanup,
-                bridge_mode,
-                docker.as_ref(),
-                &routes,
-            );
-            for line in lines {
-                println!("{line}");
-            }
-            Ok(())
-        }
+        } => Ok(bridge_status_lines(
+            bridge_assessment,
+            bridge_phase.or_from_enabled(bridge_enabled),
+            bridge_retry_in_secs,
+            bridge_cleanup,
+            bridge_mode,
+            docker.as_ref(),
+            routes,
+        )),
         other => other.unexpected(),
     }
 }
@@ -291,6 +293,21 @@ mod tests {
                  when it next connects to Docker, or at the next `portman bridge disable`",
                 "mode:      opt-in",
             ]
+        );
+    }
+
+    #[test]
+    fn bridge_status_prints_the_cleanup_state_that_the_daemon_sends() {
+        let sent =
+            r#"{"kind":"status","bridge_phase":"disabled","bridge_cleanup":{"state":"failed"}}"#;
+        let status: Response = serde_json::from_str(sent).unwrap();
+
+        let lines = lines_of_status(status, &DockerRouteStatus::NoLabelledContainers).unwrap();
+
+        assert_eq!(lines[1], "netbridge: disabled");
+        assert!(
+            lines[2].starts_with("cleanup:   portman could not"),
+            "{lines:?}"
         );
     }
 
