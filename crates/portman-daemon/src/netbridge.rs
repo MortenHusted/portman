@@ -18,11 +18,13 @@
 //!     the channel. A message that arrives later waits for the step to end:
 //!     the loop does not cancel a step in flight.
 //!   - a bridge is built on one engine session. When no session exists the
-//!     loop drops the bridge and asks the engine nothing. When another
+//!     loop ends the bridge and asks the engine nothing. When another
 //!     session opens, the loop keeps the bridge if that engine says within
 //!     [`SETUP_CHECK_BUDGET`] that it still runs the setup container that
 //!     the bridge started, because the tunnel then still has both ends.
-//!     Otherwise it drops the bridge and builds a new one.
+//!     Otherwise it ends the bridge and builds a new one. It waits for the
+//!     tasks of a bridge that it ends, because they hold the UDP port that
+//!     the next bridge binds.
 //!   - while the bridge is off and none runs, the loop removes the setup
 //!     container that an earlier bridge can have left in the engine, once
 //!     for each session and again when the user turns the bridge off. Only
@@ -244,7 +246,7 @@ fn forwarder_due(forwarded: Option<&Forwarded>, tlds: &BTreeSet<String>, now: In
 enum Step {
     Keep,
     Start(Session),
-    /// Drop the bridge without a Docker call. Its session is gone, and no
+    /// End the bridge without a Docker call. Its session is gone, and no
     /// later session's engine said in time that it runs the bridge's setup
     /// container.
     Abandon,
@@ -551,7 +553,11 @@ async fn converge<E: BridgeEngine>(
                     });
                 }
             }
-            Step::Abandon => running = None,
+            Step::Abandon => {
+                if let Some(old) = running.take() {
+                    old.bridge.abandon().await;
+                }
+            }
             Step::Shutdown => {
                 if let Some(old) = running.take() {
                     old.bridge.shutdown().await;
@@ -738,9 +744,8 @@ pub(crate) trait BridgeEngine {
     /// Removes `leftovers` that carry portman's label from the engine of
     /// `session`, and says whether any is still owed. Does nothing when another
     /// session exists at the call, or when the UDP port that a bridge
-    /// listens on is taken. Another daemon's bridge holds that port. So do
-    /// the tasks of a bridge that this daemon dropped, until their abort
-    /// ends, and so can a process that is not portman.
+    /// listens on is taken. Another daemon's bridge holds that port, and so
+    /// can a process that is not portman.
     async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) -> Cleanup;
 }
 
@@ -753,6 +758,9 @@ pub(crate) trait Bridge {
     /// Makes the bridge's engine run the DNS forwarder for `tlds`. It
     /// changes the engine only while the forwarder differs from that.
     async fn ensure_dns_forwarder(&self, tlds: &BTreeSet<String>) -> Result<DnsForwarder>;
+    /// Ends the bridge and asks its engine nothing. The listen port is free
+    /// when this returns, so that the next start can take it.
+    async fn abandon(self);
     /// Stops the bridge and keeps the docker network and the DNS forwarder.
     async fn shutdown(self);
     /// Stops the bridge and removes the DNS forwarder and the docker
@@ -850,6 +858,10 @@ impl Bridge for Runtime {
 
     async fn ensure_dns_forwarder(&self, tlds: &BTreeSet<String>) -> Result<DnsForwarder> {
         Runtime::ensure_dns_forwarder(self, tlds).await
+    }
+
+    async fn abandon(self) {
+        Runtime::abandon(self).await;
     }
 
     async fn shutdown(self) {
@@ -1390,6 +1402,10 @@ mod tests {
                 Ensure::FindsItRestarting => Ok(DnsForwarder::Restarting),
                 Ensure::Fails => anyhow::bail!("the engine refused the container"),
             }
+        }
+
+        async fn abandon(mut self) {
+            self.free_port();
         }
 
         async fn shutdown(mut self) {

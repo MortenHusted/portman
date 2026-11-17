@@ -317,7 +317,20 @@ impl Runtime {
         info!(utun = %self.utun_name, "netbridge shut down");
     }
 
+    /// Ends the bridge and asks the engine nothing, for a bridge whose
+    /// engine is gone. The pump tasks hold the listen port and the utun, and
+    /// they have ended when this returns. So a start that follows at once
+    /// finds the port free, which it does not after a drop.
+    pub async fn abandon(mut self) {
+        self.end_tasks().await;
+    }
+
     async fn stop(&mut self) {
+        self.end_tasks().await;
+        best_effort_remove_setup_container(&self.docker, &self.listen_port).await;
+    }
+
+    async fn end_tasks(&mut self) {
         for t in &self.tasks {
             t.abort();
         }
@@ -328,7 +341,6 @@ impl Runtime {
         // device is gone and route repair would treat a *recycled* utun —
         // somebody else's VPN — as ours to repoint.
         forget_own_utun(&self.utun_name);
-        best_effort_remove_setup_container(&self.docker, &self.listen_port).await;
     }
 }
 
@@ -2681,6 +2693,19 @@ destination: 172.18.0.0
             next_start.err().map(|err| err.kind()),
             Some(std::io::ErrorKind::AddrInUse)
         );
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_bridge_has_freed_the_listen_port_and_asked_the_engine_nothing() {
+        let engine = FakeEngine::start().await;
+        engine.hold(SETUP_INSPECT, OWN_SETUP_CONTAINER);
+        let bridge = engine.bridge_with_pumps().await;
+        let socket = Arc::downgrade(&bridge.listen_port.0);
+
+        bridge.abandon().await;
+
+        assert_eq!(socket.strong_count(), 0, "the listen port has a holder");
+        assert_eq!(engine.asked_for(), [] as [&str; 0]);
     }
 
     #[test]
