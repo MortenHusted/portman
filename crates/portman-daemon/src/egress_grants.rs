@@ -228,11 +228,15 @@ mod tests {
     fn headers() -> Vec<(String, String)> {
         vec![("Authorization".into(), format!("Bearer {TOKEN}"))]
     }
+    const OTHER_TOKEN: &str = "synthetic-other-0123456789abcdef0123456789";
     fn issue(store: &GrantStore, id: &str, expires: u64) -> Result<()> {
+        issue_token(store, id, TOKEN, expires)
+    }
+    fn issue_token(store: &GrantStore, id: &str, token: &str, expires: u64) -> Result<()> {
         store.issue(
             id.into(),
             "qwen.localhost".into(),
-            hex::encode(Sha256::digest(TOKEN)),
+            hex::encode(Sha256::digest(token)),
             expires,
             "route-v1".into(),
         )
@@ -368,5 +372,31 @@ mod tests {
         assert!(!reloaded.permits("qwen.localhost", "route-v1", &headers()));
         assert!(issue(&reloaded, "new-run", START + 120).is_err());
         reloaded.revoke("clock-test".into()).unwrap();
+    }
+    #[test]
+    fn wall_clock_set_back_while_running_denies_a_live_grant_until_time_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = TestClock::at(START);
+        let store = GrantStore::with_clock(dir.path().join("grants.json"), clock.clone());
+        issue(&store, "run-1", START + 7200).unwrap();
+        clock.advance(3600);
+        clock.roll_wall_back_to(START + 1);
+        assert!(!store.permits("qwen.localhost", "route-v1", &headers()));
+        assert!(issue_token(&store, "run-2", OTHER_TOKEN, START + 7200).is_err());
+        clock.roll_wall_back_to(START + 3599);
+        assert!(!store.permits("qwen.localhost", "route-v1", &headers()));
+        clock.roll_wall_back_to(START + 3600);
+        assert!(store.permits("qwen.localhost", "route-v1", &headers()));
+        issue_token(&store, "run-2", OTHER_TOKEN, START + 7200).unwrap();
+    }
+    #[test]
+    fn wall_clock_set_back_while_running_cannot_revive_a_grant_that_expired_unseen() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = TestClock::at(START);
+        let store = GrantStore::with_clock(dir.path().join("grants.json"), clock.clone());
+        issue(&store, "run-1", START + 60).unwrap();
+        clock.advance(3600);
+        clock.roll_wall_back_to(START + 10);
+        assert!(!store.permits("qwen.localhost", "route-v1", &headers()));
     }
 }
