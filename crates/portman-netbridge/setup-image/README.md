@@ -98,6 +98,11 @@ The daemon starts this container. The command above shows what it runs.
   TLD that portman does not hold.
 - The image label `dev.portman.dns-forwarder=1` marks an image that has this
   mode. The daemon starts the forwarder only from an image with the label.
+- The image label `dev.portman.setup-image-revision` carries a number that
+  goes up with each change to the image that a user needs. `portman doctor`
+  reports an image with a lower number than its own, or with no such label,
+  as older than this portman and names `portman bridge prepare`. The daemon
+  does not read the label, and keeps using an older image.
 
 ## Why `--network host`?
 

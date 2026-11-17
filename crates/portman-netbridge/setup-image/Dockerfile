@@ -48,6 +48,15 @@ FROM alpine:3.22
 
 LABEL dev.portman.dns-forwarder="1"
 
+# Raise the revision with each change to this image that a user needs.
+# `portman doctor` names `portman bridge prepare` for an image with a lower
+# revision than its own, or with none, as portman 0.1.7 and older built it.
+# The revision is a label of its own: the daemon of 0.1.7 starts the
+# forwarder only for `dev.portman.dns-forwarder=1`, so a higher value there
+# would take the forwarder from a user who built this image and still runs
+# that daemon.
+LABEL dev.portman.setup-image-revision="2"
+
 RUN apk add --no-cache \
     wireguard-tools \
     iproute2 \

@@ -25,6 +25,10 @@ pub(crate) const DNS_FORWARDER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 99, 129);
 const PORTMAN_NETWORK_CIDR: &str = "192.168.99.128/25";
 /// The label of a setup image that has the `dns` mode, and its value.
 const DNS_IMAGE_LABEL: (&str, &str) = ("dev.portman.dns-forwarder", "1");
+/// The label that carries the revision of a setup image, and the revision
+/// that this portman builds. An image with a lower revision, or with none,
+/// is from an older portman.
+const SETUP_IMAGE_REVISION: (&str, u32) = ("dev.portman.setup-image-revision", 2);
 const ENDPOINT_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,7 +140,15 @@ pub(crate) type CliAnswer<'a> = Result<(), &'a DockerCliError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SetupImageStatus {
-    Present { id: String, created: String },
+    Present {
+        id: String,
+        created: String,
+    },
+    /// An older portman built the image. The bridge runs from it.
+    Outdated {
+        id: String,
+        created: String,
+    },
     Missing,
     Unavailable(DockerCliError),
 }
@@ -258,8 +270,7 @@ pub(crate) struct SetupImageBuildCommand {
 }
 
 pub(crate) async fn inspect_setup_image() -> SetupImageStatus {
-    let format = "{{.Id}}\t{{.Created}}";
-    let inspect = ["image", "inspect", SETUP_IMAGE, "--format", format];
+    let inspect = ["image", "inspect", SETUP_IMAGE, "--format", "{{json .}}"];
     let stdout = match docker_stdout(&inspect).await {
         Ok(stdout) => stdout,
         Err(DockerCliError::Failed(message))
@@ -269,12 +280,26 @@ pub(crate) async fn inspect_setup_image() -> SetupImageStatus {
         }
         Err(error) => return SetupImageStatus::Unavailable(error),
     };
+    setup_image_from_inspect(&stdout)
+}
 
-    let mut parts = stdout.trim().split('\t');
-    let id = parts.next().unwrap_or("").to_string();
-    let created = parts.next().unwrap_or("").to_string();
+/// `inspected` is the JSON that `docker image inspect` prints for the image.
+/// The fields are read from the JSON and not through a template: for an
+/// image that was built with no label the JSON has no `Labels` entry, and a
+/// template that names both the id and a label then fails.
+fn setup_image_from_inspect(inspected: &str) -> SetupImageStatus {
+    let image: Value = serde_json::from_str(inspected).unwrap_or_default();
+    let text = |field: &str| image.get(field).and_then(Value::as_str).unwrap_or("");
+    let (id, created) = (text("Id").to_string(), text("Created").to_string());
+    let revision = image
+        .pointer("/Config/Labels")
+        .and_then(|labels| labels.get(SETUP_IMAGE_REVISION.0))
+        .and_then(Value::as_str)
+        .and_then(|revision| revision.parse().ok());
     if id.is_empty() {
         SetupImageStatus::Missing
+    } else if revision.unwrap_or(0) < SETUP_IMAGE_REVISION.1 {
+        SetupImageStatus::Outdated { id, created }
     } else {
         SetupImageStatus::Present { id, created }
     }
@@ -984,20 +1009,28 @@ fn check_daemon(daemon: &DaemonSnapshot) -> CheckOutcome {
     CheckOutcome::gating(state, line)
 }
 
+/// An image from an older portman does not gate readiness, because the
+/// bridge runs from it.
 fn check_setup_image(status: &SetupImageStatus) -> CheckOutcome {
+    let short = |id: &str| -> String {
+        let id = id.strip_prefix("sha256:").unwrap_or(id);
+        id.chars().take(12).collect()
+    };
     match status {
-        SetupImageStatus::Present { id, created } => {
-            let short_id = id
-                .strip_prefix("sha256:")
-                .unwrap_or(id)
-                .chars()
-                .take(12)
-                .collect::<String>();
-            CheckOutcome::gating(
-                CheckState::Ok,
-                format!("setup image: present {SETUP_IMAGE} {short_id} created {created}"),
-            )
-        }
+        SetupImageStatus::Present { id, created } => CheckOutcome::gating(
+            CheckState::Ok,
+            format!(
+                "setup image: present {SETUP_IMAGE} {} created {created}",
+                short(id)
+            ),
+        ),
+        SetupImageStatus::Outdated { id, created } => CheckOutcome::informational(
+            CheckState::Warn,
+            format!(
+                "setup image: older than this portman, {SETUP_IMAGE} {} created {created} (run `portman bridge prepare`; a dns forwarder from the older image stays until the bridge next starts)",
+                short(id)
+            ),
+        ),
         SetupImageStatus::Missing => CheckOutcome::gating(
             CheckState::Warn,
             format!("setup image: missing {SETUP_IMAGE} (run `portman bridge prepare`)"),
@@ -2563,10 +2596,66 @@ destination: 172.18.0.0
     #[test]
     fn the_embedded_setup_image_says_which_revision_it_is() {
         let dockerfile = include_str!("../../portman-netbridge/setup-image/Dockerfile");
-        let revision = dockerfile
-            .lines()
-            .find_map(|line| line.strip_prefix("LABEL dev.portman.setup-image-revision="));
+        let (key, revision) = SETUP_IMAGE_REVISION;
+        let label = format!("LABEL {key}=\"{revision}\"");
 
-        assert_eq!(revision, Some("\"2\""));
+        assert!(dockerfile.lines().any(|line| line == label), "{label}");
+    }
+
+    #[test]
+    fn doctor_tells_an_image_of_an_older_portman_from_the_current_one() {
+        let (id, created) = ("sha256:a3884c", "2026-04-24T07:48:00Z");
+        let current = SetupImageStatus::Present {
+            id: id.to_string(),
+            created: created.to_string(),
+        };
+        let older = SetupImageStatus::Outdated {
+            id: id.to_string(),
+            created: created.to_string(),
+        };
+        let with_revision = |revision: &str| {
+            format!(
+                r#""Labels":{{"dev.portman.dns-forwarder":"1","dev.portman.setup-image-revision":"{revision}"}}"#
+            )
+        };
+        // the image's `Config` as `docker image inspect` prints it → what doctor reads
+        let table = [
+            (with_revision("2"), current.clone()),
+            (with_revision("3"), current),
+            (with_revision("1"), older.clone()),
+            (with_revision("soon"), older.clone()),
+            (
+                r#""Labels":{"dev.portman.dns-forwarder":"1"}"#.to_string(),
+                older.clone(),
+            ),
+            (r#""Cmd":["/bin/sh"]"#.to_string(), older),
+        ];
+        for (config, status) in table {
+            let inspected =
+                format!(r#"{{"Id":"{id}","Created":"{created}","Config":{{{config}}}}}"#);
+            assert_eq!(setup_image_from_inspect(&inspected), status, "{inspected}");
+        }
+        assert_eq!(setup_image_from_inspect("\n"), SetupImageStatus::Missing);
+    }
+
+    #[test]
+    fn doctor_names_bridge_prepare_for_an_older_image_and_stays_ready() {
+        let mut report = ready_but_for_the_bridge(BridgePhase::Up);
+        report.setup_image = SetupImageStatus::Outdated {
+            id: "sha256:a3884c0f9d1e77".to_string(),
+            created: "2026-04-24T07:48:00Z".to_string(),
+        };
+
+        let rendered = render_report(&report);
+
+        assert!(
+            rendered.contains(
+                "\nsetup image: older than this portman, portman-netbridge/setup:local \
+                 a3884c0f9d1e created 2026-04-24T07:48:00Z (run `portman bridge prepare`; a dns \
+                 forwarder from the older image stays until the bridge next starts)\n"
+            ),
+            "{rendered}"
+        );
+        assert!(rendered.contains("replacement: ready"), "{rendered}");
     }
 }
