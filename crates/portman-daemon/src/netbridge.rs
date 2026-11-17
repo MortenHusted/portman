@@ -3173,6 +3173,14 @@ mod tests {
         /// As [`OnFakeEngine::start`], with the bridges of this daemon on
         /// UDP port `listen_port`.
         async fn start_on(listen_port: u16, held: &[(&str, &str)]) -> Self {
+            let daemon = Self::boot(listen_port, held, None);
+            tokio::time::sleep(LONGEST_WAIT).await;
+            daemon
+        }
+
+        /// Boots the loop on the `netbridge.json` that `saved` holds, and
+        /// returns before the loop has run.
+        fn boot(listen_port: u16, held: &[(&str, &str)], saved: Option<&str>) -> Self {
             let (engine, sessions) = crate::engine::channel();
             let fake = crate::engine::tests::connect(&sessions);
             for (path, json) in held {
@@ -3185,6 +3193,9 @@ mod tests {
             let (handle, rx, phase_tx) = handle_pair();
             let dir = tempdir().unwrap();
             let state_path = dir.path().join("netbridge.json");
+            if let Some(saved) = saved {
+                std::fs::write(&state_path, saved).unwrap();
+            }
             tokio::spawn(converge(
                 linked,
                 handle.clone(),
@@ -3194,7 +3205,6 @@ mod tests {
                 false,
                 KnownTlds::default(),
             ));
-            tokio::time::sleep(LONGEST_WAIT).await;
             Self {
                 handle,
                 engine,
@@ -3769,6 +3779,132 @@ mod tests {
         tokio::time::sleep(LONGEST_WAIT).await;
 
         assert_eq!(client.bridge_cleanup().await, json!(null));
+    }
+
+    const HEAD_START: Duration = Duration::from_secs(10);
+    const OWES_A_CLEANUP: &str = r#"{"enabled":false,"cleanup_owed":true}"#;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_debt_from_before_a_session_is_paid_only_after_the_head_start_of_other_bridges() {
+        let everything = |session| (Session(session), SetupContainerAndNetwork);
+
+        let mut loaded_at_boot = Rig::boot_on(Some(OWES_A_CLEANUP));
+        let opened = Instant::now();
+        assert_eq!(loaded_at_boot.next_sweep().await, everything(1));
+        assert_eq!(opened.elapsed(), HEAD_START, "loaded at boot");
+
+        let mut saved_with_no_session = Rig::spawn(None, false, false);
+        saved_with_no_session.send(Control::Disable).await;
+        saved_with_no_session.no_sweep_follows().await;
+        saved_with_no_session.engine_session(S1);
+        let opened = Instant::now();
+        assert_eq!(saved_with_no_session.next_sweep().await, everything(1));
+        assert_eq!(opened.elapsed(), HEAD_START, "saved with no session");
+
+        let mut left_by_a_failed_cleanup = Rig::start();
+        left_by_a_failed_cleanup.cleanups_end(CleanupEnd::Failed);
+        left_by_a_failed_cleanup.send(Control::Disable).await;
+        assert_eq!(left_by_a_failed_cleanup.next_sweep().await, everything(1));
+        left_by_a_failed_cleanup.no_sweep_follows().await;
+        left_by_a_failed_cleanup.engine_session(S2);
+        let opened = Instant::now();
+        assert_eq!(left_by_a_failed_cleanup.next_sweep().await, everything(2));
+        assert_eq!(opened.elapsed(), HEAD_START, "left by a failed cleanup");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_that_ends_inside_the_head_start_begins_it_again_at_the_next_session() {
+        let mut rig = Rig::boot_on(Some(OWES_A_CLEANUP));
+        let moment = Duration::from_millis(1);
+
+        tokio::time::sleep(HEAD_START - moment).await;
+        rig.engine_session(None);
+        tokio::time::sleep(HEAD_START).await;
+        rig.engine_session(S2);
+        let opened = Instant::now();
+
+        assert_eq!(
+            rig.next_sweep().await,
+            (Session(2), SetupContainerAndNetwork),
+            "a cleanup on the session that ended"
+        );
+        assert_eq!(opened.elapsed(), HEAD_START);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_enable_inside_the_head_start_is_served_at_once_and_ends_the_debt() {
+        let mut rig = Rig::boot_on(Some(OWES_A_CLEANUP));
+        tokio::time::sleep(HEAD_START / 2).await;
+
+        let enabled = Instant::now();
+        rig.send(Control::Enable).await;
+        rig.next_attempt().await;
+
+        assert_eq!(enabled.elapsed(), Duration::ZERO);
+        assert_eq!(saved_debt(&rig.state_path), false);
+        rig.no_sweep_follows().await;
+    }
+
+    /// Every leftover of a bridge, as [`engine_with_leftovers`] holds them.
+    const LEFTOVERS: [(&str, &str); 4] = [
+        (SETUP_CONTAINER, OWN_SETUP_CONTAINER),
+        (NETWORK, OWN_NETWORK),
+        (FORWARDER, OWN_FORWARDER),
+        ("/containers/dddd2222/json", OWN_FORWARDER),
+    ];
+
+    #[tokio::test(start_paused = true)]
+    async fn the_engine_is_asked_nothing_during_the_head_start_and_for_every_leftover_after_it() {
+        let daemon = OnFakeEngine::boot(FREE_PORT, &LEFTOVERS, Some(OWES_A_CLEANUP));
+        let client = Client::of(&daemon.handle);
+        let moment = Duration::from_millis(1);
+
+        tokio::time::sleep(HEAD_START - moment).await;
+
+        assert_eq!(daemon.fake.calls(), [] as [&str; 0]);
+        let waits = serde_json::json!({"state": "waits_for_bridges", "for_secs": 10});
+        assert_eq!(client.bridge_cleanup().await, waits);
+
+        tokio::time::sleep(moment * 2).await;
+
+        let calls = daemon.fake.calls();
+        let removed: Vec<_> = calls
+            .iter()
+            .filter_map(|call| call.strip_prefix("DELETE "))
+            .collect();
+        assert_eq!(
+            removed,
+            [
+                "/containers/portman-netbridge-setup",
+                FORWARDER_BY_ID,
+                NETWORK
+            ],
+            "{calls:?}"
+        );
+        assert_eq!(client.bridge_cleanup().await, serde_json::json!(null));
+        assert_eq!(saved_debt(&daemon.state_path), false);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listen_port_that_is_taken_when_the_head_start_ends_ends_the_debt_with_no_request() {
+        let another_daemons_bridge = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let taken = another_daemons_bridge.local_addr().unwrap().port();
+        let daemon = OnFakeEngine::boot(taken, &LEFTOVERS, Some(OWES_A_CLEANUP));
+        let client = Client::of(&daemon.handle);
+        let moment = Duration::from_millis(1);
+
+        tokio::time::sleep(HEAD_START - moment).await;
+
+        let waits = serde_json::json!({"state": "waits_for_bridges", "for_secs": 10});
+        assert_eq!(client.bridge_cleanup().await, waits);
+        assert_eq!(saved_debt(&daemon.state_path), true);
+
+        tokio::time::sleep(moment * 2).await;
+
+        let port_taken = serde_json::json!({"state": "port_taken"});
+        assert_eq!(client.bridge_cleanup().await, port_taken);
+        assert_eq!(saved_debt(&daemon.state_path), false);
+        assert_eq!(daemon.fake.calls(), [] as [&str; 0]);
     }
 
     #[tokio::test(start_paused = true)]
