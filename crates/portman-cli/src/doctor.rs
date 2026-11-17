@@ -421,9 +421,9 @@ fn check_docker(
 /// The daemon and the `docker` CLI each choose their socket, so one can
 /// have an engine while the other has none. The note says so, and names the
 /// lines that show the CLI's result. `cli_answers` holds one answer for each
-/// check that ran the CLI. A check that failed in another way than
-/// [`DockerCliError::NoAnswer`] shows neither that the CLI has an engine nor
-/// that it has none, so it brings no note.
+/// check that ran the CLI. Only a call that an engine answered counts as an
+/// engine for the CLI, and only [`DockerCliError::NoAnswer`] counts as none.
+/// Any other failure brings no note.
 pub(crate) fn docker_cli_note(
     docker: Option<&DockerStatus>,
     cli_answers: &[CliAnswer<'_>],
@@ -734,18 +734,18 @@ fn route_interface_for_cidr(cidr: &str) -> Option<String> {
     parse_route_get_interface(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// How long one `docker` CLI call has to end. A healthy call ends in tens
-/// of milliseconds. The daemon gives an engine the same three seconds before
-/// it reports the engine unreachable, so the CLI and the daemon call an
-/// engine silent after the same wait.
+/// How long one `docker` CLI call has to end. The daemon gives an engine
+/// the same three seconds before it reports the engine unreachable, so the
+/// CLI and the daemon call an engine silent after the same wait.
 const DOCKER_CLI_BOUND: Duration = Duration::from_secs(3);
 
 async fn docker_stdout(args: &[&str]) -> Result<String, DockerCliError> {
     run_docker("docker", args, DOCKER_CLI_BOUND).await
 }
 
-/// What the `docker` CLI prints when it reaches no engine. Docker 29 names
-/// "the docker API", and the releases before it name "the Docker daemon".
+/// What the `docker` CLI prints when it reaches no engine. The words differ
+/// between releases: Docker 29.9 names "the docker API", and older ones name
+/// "the Docker daemon".
 const NO_ENGINE: [&str; 3] = [
     "connect to the docker API",
     "connect to the Docker daemon",
@@ -753,8 +753,8 @@ const NO_ENGINE: [&str; 3] = [
 ];
 
 /// Runs `program`, and kills it when it has not ended after `bound`. The
-/// `docker` CLI sets no time limit of its own, and waits without end on a
-/// socket that accepts a connection and never answers.
+/// `docker` CLI itself waits for minutes on a socket that accepts a
+/// connection and never answers.
 async fn run_docker(
     program: &str,
     args: &[&str],
