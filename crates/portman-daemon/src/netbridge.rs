@@ -2509,6 +2509,26 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_failed_start_logs_the_error_of_the_operating_system() {
+        let another_daemons_bridge = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let taken = another_daemons_bridge.local_addr().unwrap().port();
+        let (engine, _fake) = engine_with_leftovers(taken);
+        let (logged, _capture) = Logged::capture();
+
+        let started = try_start(&engine, Session(1), OptIn, &mut Attempts::new()).await;
+
+        assert!(
+            started.is_none(),
+            "a bridge started on a port that is taken"
+        );
+        let lines = logged.lines();
+        let warnings: Vec<&String> = lines.iter().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{lines:?}");
+        let cause = format!("err=binding 0.0.0.0:{taken}: Address already in use");
+        assert!(warnings[0].contains(&cause), "{}", warnings[0]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn with_the_listen_port_free_the_forwarder_and_the_network_go_only_when_asked_for() {
         let container = "/containers/portman-netbridge-setup";
         let cases = [
