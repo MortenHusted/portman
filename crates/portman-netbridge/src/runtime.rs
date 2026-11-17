@@ -3025,6 +3025,14 @@ destination: 172.18.0.0
             let_go.send(()).unwrap();
         });
 
+        let claim_ended = (0..3000).any(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            !is_own_utun(utun)
+        });
+        assert!(
+            claim_ended,
+            "the claim stands while the command runs, so the pass could go on after it"
+        );
         assert!(
             lets_go.recv_timeout(Duration::from_millis(200)).is_err(),
             "the bridge let go of its utun while a route command for it ran"
