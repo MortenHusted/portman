@@ -11,6 +11,9 @@
 //!   - a `Control` message from the IPC server changes the intent. The
 //!     intent is persisted before anything acts on it, so an enable issued
 //!     while the engine is unreachable is still an enable after a restart.
+//!     A write that fails is made again each time the loop wakes. Until one
+//!     succeeds the file holds the older state, and a daemon that restarts
+//!     acts on that.
 //!   - [`plan`] compares the intent and the engine session with the running
 //!     bridge and names the next step. The loop applies steps until none is
 //!     left, then waits for a control message, a change of engine session,
@@ -547,6 +550,10 @@ impl Swept {
 struct Wanted {
     saved: NetbridgeState,
     forced_on: bool,
+    /// The last write of `saved` failed, so `netbridge.json` holds an older
+    /// state. A daemon that restarts now boots on that one: it can owe a
+    /// debt that has ended, or lack an intent that the user gave.
+    unsaved: bool,
 }
 
 impl Wanted {
@@ -555,6 +562,16 @@ impl Wanted {
             enabled: self.saved.enabled || self.forced_on,
             ..self.saved
         }
+    }
+
+    /// Writes `saved` to `netbridge.json`. A write that fails is logged,
+    /// and the loop makes it again each time it wakes.
+    fn save(&mut self, state_path: &Path) {
+        let written = netbridge_state::save(state_path, &self.saved);
+        if let Err(err) = &written {
+            warn!(%err, "persisting netbridge state");
+        }
+        self.unsaved = written.is_err();
     }
 
     fn apply(&mut self, msg: Control) {
@@ -609,6 +626,7 @@ async fn converge<E: BridgeEngine>(
     let mut wanted = Wanted {
         saved: netbridge_state::load(&state_path),
         forced_on,
+        unsaved: false,
     };
     info!(
         persisted_enabled = wanted.saved.enabled,
@@ -626,6 +644,9 @@ async fn converge<E: BridgeEngine>(
     loop {
         while let Ok(msg) = rx.try_recv() {
             take(msg, &mut wanted, &mut attempts, &mut debt, &state_path);
+        }
+        if wanted.unsaved {
+            wanted.save(&state_path);
         }
         // A start sequence serves one session, as it serves one intent.
         if session != engine.session() {
@@ -733,7 +754,7 @@ fn settle(wanted: &mut Wanted, state_path: &Path, asked_for: Leftovers, swept: S
     let network_asked_for = asked_for == Leftovers::SetupContainerAndNetwork;
     if wanted.saved.cleanup_owed && network_asked_for && swept.ends_the_debt() {
         wanted.saved.cleanup_owed = false;
-        persist(state_path, &wanted.saved);
+        wanted.save(state_path);
     }
 }
 
@@ -751,7 +772,7 @@ fn take(
         debt.disabled();
     }
     wanted.apply(msg);
-    persist(state_path, &wanted.saved);
+    wanted.save(state_path);
     *attempts = Attempts::new();
 }
 
@@ -1080,12 +1101,6 @@ async fn try_start<E: BridgeEngine>(
         "netbridge up: docker network `portman`, container pool 192.168.99.130–.253"
     );
     Some(bridge)
-}
-
-fn persist(path: &Path, intent: &NetbridgeState) {
-    if let Err(err) = netbridge_state::save(path, intent) {
-        warn!(%err, "persisting netbridge state");
-    }
 }
 
 fn env_forces_enabled() -> bool {
