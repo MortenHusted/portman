@@ -215,12 +215,19 @@ trait Uninstall {
     async fn remove_bridge_leftovers(&self, engine_socket: Option<PathBuf>) -> BridgeLeftovers;
     /// Removes the launchd plist and the daemon's binary.
     fn remove_service_files(&self);
+    /// Whether the saved bridge state is on.
+    fn bridge_is_enabled(&self) -> bool;
     fn say(&self, line: &str);
 }
 
 /// The plist goes before the engine is asked. An uninstall that is
 /// interrupted while it waits for the engine then leaves no plist that
 /// starts the daemon again at the next boot.
+///
+/// With no engine to ask and the bridge saved as off, nothing is said about
+/// a forwarder: a bridge that was never on left none, and a user with no
+/// Docker has nothing to remove by hand. The saved state does not record a
+/// removal that a disable still owed, so such a forwarder goes unmentioned.
 #[cfg(target_os = "macos")]
 async fn uninstall(mac: &impl Uninstall) {
     let engine_socket = daemon_engine_socket(mac.daemon_status()).await;
@@ -229,6 +236,7 @@ async fn uninstall(mac: &impl Uninstall) {
     mac.wait_for_daemon_exit();
     let removal = mac.remove_bridge_leftovers(engine_socket);
     let lines = match tokio::time::timeout(REMOVAL_BUDGET, removal).await {
+        Ok(BridgeLeftovers::NoEngine { .. }) if !mac.bridge_is_enabled() => vec![],
         Ok(leftovers) => bridge_leftover_lines(&leftovers),
         Err(_) => stalled_removal_lines(),
     };
@@ -289,7 +297,7 @@ impl Uninstall for ThisMac {
     }
 
     async fn remove_bridge_leftovers(&self, engine_socket: Option<PathBuf>) -> BridgeLeftovers {
-        eprintln!("removing what the bridge left in Docker…");
+        eprintln!("looking in Docker for what the bridge left…");
         portman_daemon::remove_bridge_leftovers(engine_socket).await
     }
 
@@ -297,6 +305,12 @@ impl Uninstall for ThisMac {
         eprintln!("removing system plist (sudo required)");
         let _ = run_sudo(&["rm", "-f", portman_core::launchd::DAEMON_PLIST_PATH]);
         remove_installed_binaries();
+    }
+
+    fn bridge_is_enabled(&self) -> bool {
+        portman_core::paths::netbridge_state_path()
+            .map(|path| portman_core::netbridge_state::load(&path).enabled)
+            .unwrap_or(true)
     }
 
     fn say(&self, line: &str) {
@@ -359,7 +373,7 @@ fn bridge_leftover_lines(leftovers: &BridgeLeftovers) -> Vec<String> {
         .concat(),
         BridgeLeftovers::NoEngine { reason } => [
             vec![
-                format!("bridge: {reason}"),
+                format!("bridge: found no Docker engine to ask ({reason})"),
                 "bridge: the Docker VM may still hold the dns forwarder. When Docker runs again, remove the forwarder and its network with:".to_string(),
             ],
             by_hand.to_vec(),
@@ -789,6 +803,7 @@ mod tests {
     struct StandInMac {
         /// `None` is an engine that never answers the removal.
         leftovers: Option<BridgeLeftovers>,
+        bridge_enabled: bool,
         did: std::sync::Mutex<Vec<String>>,
     }
 
@@ -797,6 +812,7 @@ mod tests {
         fn new(leftovers: Option<BridgeLeftovers>) -> Self {
             Self {
                 leftovers,
+                bridge_enabled: true,
                 did: Default::default(),
             }
         }
@@ -837,6 +853,10 @@ mod tests {
 
         fn remove_service_files(&self) {
             self.note("remove the plist and the daemon's binary");
+        }
+
+        fn bridge_is_enabled(&self) -> bool {
+            self.bridge_enabled
         }
 
         fn say(&self, line: &str) {
@@ -894,6 +914,34 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn an_uninstall_that_finds_no_engine_names_the_forwarder_only_for_a_bridge_that_was_on() {
+        let no_engine = BridgeLeftovers::NoEngine {
+            reason: "no docker socket found".into(),
+        };
+        for (bridge_enabled, lines) in [(false, 0), (true, 4)] {
+            let mac = StandInMac {
+                bridge_enabled,
+                ..StandInMac::new(Some(no_engine.clone()))
+            };
+
+            uninstall(&mac).await;
+
+            let did = mac.did();
+            assert_eq!(
+                did[..5],
+                UP_TO_THE_REMOVAL,
+                "bridge_enabled={bridge_enabled}"
+            );
+            let said: Vec<String> = bridge_leftover_lines(&no_engine)
+                .into_iter()
+                .map(|line| format!("say: {line}"))
+                .collect();
+            assert_eq!(did[5..], said[..lines], "bridge_enabled={bridge_enabled}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn an_uninstall_says_what_is_left_of_the_bridge_and_how_to_remove_it_by_hand() {
         let socket = std::path::PathBuf::from("/run/demo/docker.sock");
@@ -925,10 +973,10 @@ mod tests {
         );
         assert_eq!(
             bridge_leftover_lines(&BridgeLeftovers::NoEngine {
-                reason: "docker is not connected: no docker socket found".into()
+                reason: "no docker socket found".into()
             }),
             [
-                "bridge: docker is not connected: no docker socket found",
+                "bridge: found no Docker engine to ask (no docker socket found)",
                 "bridge: the Docker VM may still hold the dns forwarder. When Docker runs \
                  again, remove the forwarder and its network with:",
                 by_hand[0],
