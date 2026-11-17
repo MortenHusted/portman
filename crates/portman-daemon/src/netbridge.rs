@@ -642,7 +642,7 @@ impl Wanted {
     fn save(&mut self, state_path: &Path) {
         match netbridge_state::save(state_path, &self.saved) {
             Ok(()) => self.on_disk = self.saved.clone(),
-            Err(err) => warn!(%err, "persisting netbridge state"),
+            Err(err) => warn!(err = %format_args!("{err:#}"), "persisting netbridge state"),
         }
     }
 
