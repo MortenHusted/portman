@@ -502,7 +502,14 @@ mod tests {
                 mode_only,
                 OptIn,
                 sent(Docker, WaitingForDocker),
-                ModePoll::Reached,
+                ModePoll::WaitsForDocker,
+            ),
+            (
+                Docker,
+                mode_only,
+                OptIn,
+                sent(OptIn, WaitingForDocker),
+                ModePoll::Pending,
             ),
             (
                 Docker,
@@ -758,12 +765,18 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_mode_change_on_a_bridge_that_was_not_up_ends_when_the_new_mode_shows() {
-        for not_up in [Disabled, Starting, WaitingForDocker] {
+        // the phase of a bridge that is not up → how the wait ends
+        let table = [
+            (Disabled, Settled::Reached),
+            (Starting, Settled::Reached),
+            (WaitingForDocker, Settled::WaitsForDocker),
+        ];
+        for (not_up, ends) in table {
             let mut script = Script::new(&[sent(OptIn, not_up), sent(Docker, not_up)]);
 
             let settled = wait_for_mode(|| script.read(), Docker, sent(OptIn, not_up)).await;
 
-            assert_eq!(settled.unwrap(), Settled::Reached, "{not_up:?}");
+            assert_eq!(settled.unwrap(), ends, "{not_up:?}");
             assert_eq!(script.read_at.len(), 2, "{not_up:?}");
         }
     }
