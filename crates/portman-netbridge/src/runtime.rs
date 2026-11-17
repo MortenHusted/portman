@@ -1877,7 +1877,7 @@ fn while_bridge_holds<T>(utun: &str, command: impl FnOnce() -> T) -> Result<T, R
 
 fn ensure_route_command(route: &RunRoute, cmd: &RouteCommand) -> Result<(), RouteError> {
     if cmd.verb == "add" {
-        if let Some(existing) = specific_route_utun_interface(route, &cmd.iface, &cmd.cidr)? {
+        if let Some(existing) = exact_route_utun_interface(route, &cmd.iface, &cmd.cidr)? {
             match classify_existing_route(&cmd.cidr, &existing, &cmd.iface) {
                 ExistingRoute::Correct => return Ok(()),
                 // The dedicated subnet belongs to this runtime even if its
@@ -1912,7 +1912,7 @@ fn ensure_route_command(route: &RunRoute, cmd: &RouteCommand) -> Result<(), Rout
 
     match run_route(route, cmd.verb, &cmd.cidr, &cmd.iface) {
         Err(RouteError::Failed(err)) if cmd.verb == "add" => {
-            match specific_route_utun_interface(route, &cmd.iface, &cmd.cidr)? {
+            match exact_route_utun_interface(route, &cmd.iface, &cmd.cidr)? {
                 Some(existing)
                     if classify_existing_route(&cmd.cidr, &existing, &cmd.iface)
                         != ExistingRoute::Repair =>
@@ -2004,13 +2004,12 @@ fn route_result(verb: &str, output: std::io::Result<Output>) -> Result<()> {
     Ok(())
 }
 
-/// The utun of the route to exactly `cidr`, asked for while the bridge
-/// holds `iface`. `-net` with the prefix length makes the kernel look for
-/// that prefix alone. A route to a wider prefix that covers the subnet,
-/// such as the one of a VPN, does not answer for it. The kernel answers
-/// with the default route when the subnet has no route of its own, and the
-/// `destination:` line tells the two answers apart.
-fn specific_route_utun_interface(
+/// Asks while the bridge holds `iface`. `-net` with the prefix length makes
+/// the kernel look for that prefix alone. A route to a wider prefix that
+/// covers the subnet, such as the one of a VPN, does not answer for it. The
+/// kernel answers with the default route when the subnet has no route of
+/// its own, and the `destination:` line tells the two answers apart.
+fn exact_route_utun_interface(
     route: &RunRoute,
     iface: &str,
     cidr: &str,
@@ -2025,10 +2024,10 @@ fn specific_route_utun_interface(
         return Ok(None);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(route_get_specific_utun_interface(&stdout, addr))
+    Ok(route_get_exact_utun_interface(&stdout, addr))
 }
 
-fn route_get_specific_utun_interface(stdout: &str, addr: &str) -> Option<String> {
+fn route_get_exact_utun_interface(stdout: &str, addr: &str) -> Option<String> {
     let mut destination_matches = false;
     let mut interface = None;
     for line in stdout.lines() {
@@ -2151,15 +2150,15 @@ destination: default
 ";
 
         assert_eq!(
-            route_get_specific_utun_interface(routed, "172.18.0.0"),
+            route_get_exact_utun_interface(routed, "172.18.0.0"),
             Some("utun0".to_string())
         );
         assert_eq!(
-            route_get_specific_utun_interface(default_route, "172.19.0.0"),
+            route_get_exact_utun_interface(default_route, "172.19.0.0"),
             None
         );
         assert_eq!(
-            route_get_specific_utun_interface(utun_default, "172.19.0.0"),
+            route_get_exact_utun_interface(utun_default, "172.19.0.0"),
             None
         );
     }
@@ -2173,10 +2172,7 @@ destination: 172.18.0.0
   interface: en0
 ";
 
-        assert_eq!(
-            route_get_specific_utun_interface(routed, "172.18.0.0"),
-            None
-        );
+        assert_eq!(route_get_exact_utun_interface(routed, "172.18.0.0"), None);
     }
 
     #[test]
@@ -3664,9 +3660,7 @@ destination: default
   interface: en0
 ";
         let ran = std::cell::RefCell::new(Vec::new());
-        // Answers as `route` does on a Mac whose table holds a route to
-        // `192.168.16.0/20` and a default route.
-        let route = |args: &[&str]| {
+        let table_with_the_slash_20_route_and_a_default_route = |args: &[&str]| {
             ran.borrow_mut().push(args.join(" "));
             match args {
                 ["-n", "get", "-net", "192.168.16.0/20"] => route_printed(&its_own_route),
@@ -3680,7 +3674,7 @@ destination: default
         ];
 
         remember_own_utun(utun);
-        reconcile_routes(&route, &pass);
+        reconcile_routes(&table_with_the_slash_20_route_and_a_default_route, &pass);
         forget_own_utun(utun);
 
         assert_eq!(
