@@ -3074,6 +3074,24 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_that_failed_logs_what_the_engine_said() {
+        let container = "/containers/portman-netbridge-setup";
+        for kept in [container, FORWARDER_BY_ID, NETWORK] {
+            let (engine, fake) = engine_with_leftovers(FREE_PORT);
+            fake.fail_delete(kept, Some(ENGINE_FAILED));
+            let (logged, _capture) = Logged::capture();
+
+            engine
+                .remove_leftovers(Session(1), SetupContainerAndNetwork)
+                .await;
+
+            let warnings = logged.take_warnings();
+            assert_eq!(warnings.len(), 1, "{kept} {warnings:?}");
+            assert!(warnings[0].contains(ENGINE_FAILED.1), "{}", warnings[0]);
+        }
+    }
+
     /// The control loop on the daemon's engine, with the bridge off.
     struct OnFakeEngine {
         handle: Handle,
