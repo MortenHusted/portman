@@ -384,7 +384,7 @@ fn open_utun(extra_route_cidrs: &BTreeSet<String>) -> Result<(tun::AsyncDevice, 
 
     let mut installed = InstalledRoutes::new(utun_name.clone());
     for cmd in startup_route_plan(&utun_name, extra_route_cidrs) {
-        if let Err(err) = ensure_route_command(&cmd) {
+        if let Err(err) = ensure_route_command(&sbin_route, &cmd) {
             // The device drops with this error; stop claiming its name
             // (same reasoning as shutdown — names are recycled).
             forget_own_utun(&utun_name);
@@ -591,7 +591,7 @@ fn spawn_route_reconciler(docker: Docker, mode: NetbridgeMode, iface: String) ->
                 }
             };
             let cmds = startup_route_plan(&iface, &extra_route_cidrs);
-            let _ = tokio::task::spawn_blocking(move || reconcile_routes(&cmds)).await;
+            let _ = tokio::task::spawn_blocking(move || reconcile_routes(&sbin_route, &cmds)).await;
         }
     })
 }
@@ -601,9 +601,9 @@ fn spawn_route_reconciler(docker: Docker, mode: NetbridgeMode, iface: String) ->
 /// utun before the interface goes, and the routes go with the interface. So
 /// a command that fails for a utun that the bridge let go of is no failure,
 /// and the pass ends there.
-fn reconcile_routes(cmds: &[RouteCommand]) {
+fn reconcile_routes(route: &RunRoute, cmds: &[RouteCommand]) {
     for cmd in cmds {
-        let Err(err) = ensure_route_command(cmd) else {
+        let Err(err) = ensure_route_command(route, cmd) else {
             continue;
         };
         if !is_own_utun(&cmd.iface) {
@@ -1601,7 +1601,7 @@ impl Drop for InstalledRoutes {
             return;
         }
         for cidr in &self.cidrs {
-            if let Err(err) = run_route("delete", cidr, &self.iface) {
+            if let Err(err) = run_route(&sbin_route, "delete", cidr, &self.iface) {
                 warn!(%cidr, iface = %self.iface, %err, "rolling back netbridge route");
             }
         }
@@ -1642,9 +1642,9 @@ fn classify_existing_route(cidr: &str, existing_iface: &str, wanted_iface: &str)
     }
 }
 
-fn ensure_route_command(cmd: &RouteCommand) -> Result<()> {
+fn ensure_route_command(route: &RunRoute, cmd: &RouteCommand) -> Result<()> {
     if cmd.verb == "add" {
-        if let Some(existing) = specific_route_utun_interface(&cmd.cidr) {
+        if let Some(existing) = specific_route_utun_interface(route, &cmd.cidr) {
             match classify_existing_route(&cmd.cidr, &existing, &cmd.iface) {
                 ExistingRoute::Correct => return Ok(()),
                 // The dedicated subnet belongs to this runtime even if its
@@ -1657,7 +1657,7 @@ fn ensure_route_command(cmd: &RouteCommand) -> Result<()> {
                         alive = interface_is_alive(&existing),
                         "repointing stale netbridge route"
                     );
-                    if run_route("change", &cmd.cidr, &cmd.iface).is_ok() {
+                    if run_route(route, "change", &cmd.cidr, &cmd.iface).is_ok() {
                         return Ok(());
                     }
                     // `change` can fail if the route vanished under us; fall
@@ -1676,9 +1676,9 @@ fn ensure_route_command(cmd: &RouteCommand) -> Result<()> {
         }
     }
 
-    match run_route(cmd.verb, &cmd.cidr, &cmd.iface) {
+    match run_route(route, cmd.verb, &cmd.cidr, &cmd.iface) {
         Ok(()) => Ok(()),
-        Err(err) if cmd.verb == "add" => match specific_route_utun_interface(&cmd.cidr) {
+        Err(err) if cmd.verb == "add" => match specific_route_utun_interface(route, &cmd.cidr) {
             Some(existing)
                 if classify_existing_route(&cmd.cidr, &existing, &cmd.iface)
                     != ExistingRoute::Repair =>
@@ -1692,10 +1692,17 @@ fn ensure_route_command(cmd: &RouteCommand) -> Result<()> {
     }
 }
 
-fn run_route(verb: &str, cidr: &str, iface: &str) -> Result<()> {
-    let output = StdCommand::new("/sbin/route")
-        .args(["-n", verb, "-net", cidr, "-interface", iface])
-        .output()
+/// Runs the `route` program with these arguments. Each `route` command of a
+/// bridge goes through one, so that a test can put its own in the place of
+/// [`sbin_route`].
+type RunRoute<'a> = dyn Fn(&[&str]) -> std::io::Result<std::process::Output> + 'a;
+
+fn sbin_route(args: &[&str]) -> std::io::Result<std::process::Output> {
+    StdCommand::new("/sbin/route").args(args).output()
+}
+
+fn run_route(route: &RunRoute, verb: &str, cidr: &str, iface: &str) -> Result<()> {
+    let output = route(&["-n", verb, "-net", cidr, "-interface", iface])
         .with_context(|| format!("spawning /sbin/route {verb}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1713,12 +1720,9 @@ fn run_route(verb: &str, cidr: &str, iface: &str) -> Result<()> {
     Ok(())
 }
 
-fn specific_route_utun_interface(cidr: &str) -> Option<String> {
+fn specific_route_utun_interface(route: &RunRoute, cidr: &str) -> Option<String> {
     let addr = cidr.split('/').next()?;
-    let Ok(output) = StdCommand::new("/sbin/route")
-        .args(["-n", "get", addr])
-        .output()
-    else {
+    let Ok(output) = route(&["-n", "get", addr]) else {
         return None;
     };
     if !output.status.success() {
@@ -2793,26 +2797,41 @@ destination: 172.18.0.0
         }
     }
 
-    /// On macOS only: the `route` of Linux takes these arguments for a
-    /// request for its usage text and exits with 0.
-    #[cfg(target_os = "macos")]
+    /// What a `route` program gives back that ends with `code` and has
+    /// said `stderr`.
+    fn route_ended(code: i32, stderr: &str) -> std::io::Result<std::process::Output> {
+        use std::os::unix::process::ExitStatusExt;
+
+        Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.into(),
+        })
+    }
+
+    /// As `route` ends for an interface that does not exist.
+    fn no_such_interface(_: &[&str]) -> std::io::Result<std::process::Output> {
+        route_ended(1, "route: bad address: utun-of-no-bridge")
+    }
+
     #[test]
     fn a_route_that_fails_is_a_warning_only_while_the_bridge_holds_its_utun() {
-        let no_such_interface = "utun-of-no-bridge";
-        let pass = [RouteCommand::add("192.0.2.0/24", no_such_interface)];
+        let utun = "utun-of-no-bridge";
+        let pass = [RouteCommand::add("192.0.2.0/24", utun)];
         let (logged, _capture) = Logged::capture();
 
-        remember_own_utun(no_such_interface);
-        reconcile_routes(&pass);
+        remember_own_utun(utun);
+        reconcile_routes(&no_such_interface, &pass);
         let warnings = logged.take_warnings();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
             warnings[0].contains("route reconcile failed"),
             "{warnings:?}"
         );
+        assert!(warnings[0].contains("bad address"), "{warnings:?}");
 
-        forget_own_utun(no_such_interface);
-        reconcile_routes(&pass);
+        forget_own_utun(utun);
+        reconcile_routes(&no_such_interface, &pass);
         assert_eq!(logged.take_warnings(), [] as [&str; 0]);
     }
 
