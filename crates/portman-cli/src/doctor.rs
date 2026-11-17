@@ -2559,4 +2559,14 @@ destination: 172.18.0.0
         );
         assert_eq!(cmd.current_dir, Path::new("/tmp/portman-setup-image"));
     }
+
+    #[test]
+    fn the_embedded_setup_image_says_which_revision_it_is() {
+        let dockerfile = include_str!("../../portman-netbridge/setup-image/Dockerfile");
+        let revision = dockerfile
+            .lines()
+            .find_map(|line| line.strip_prefix("LABEL dev.portman.setup-image-revision="));
+
+        assert_eq!(revision, Some("\"2\""));
+    }
 }
