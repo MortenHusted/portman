@@ -2473,6 +2473,13 @@ mod tests {
             let text = String::from_utf8(bytes).unwrap();
             text.lines().map(String::from).collect()
         }
+
+        /// Takes the lines since the last call and returns the warnings.
+        fn warnings(&self) -> Vec<String> {
+            let mut lines = self.lines();
+            lines.retain(|line| line.contains("WARN"));
+            lines
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -2622,6 +2629,53 @@ mod tests {
         let warnings: Vec<&String> = lines.iter().filter(|l| l.contains("WARN")).collect();
         assert_eq!(warnings.len(), 1, "{lines:?}");
         let cause = format!("err=binding 0.0.0.0:{taken}: Address already in use");
+        assert!(warnings[0].contains(&cause), "{}", warnings[0]);
+    }
+
+    /// The longest that one step of the bridge waits for the engine, as the
+    /// README states it.
+    const STATED_BOUND: Duration = Duration::from_secs(30);
+    const SAYS_NO_ANSWER: &str = "the container engine gave no answer within 30 s";
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cleanup_on_an_engine_that_froze_ends_owed_at_the_stated_bound_and_says_so() {
+        for frozen_at in [SETUP_CONTAINER, FORWARDER, NETWORK] {
+            let (engine, fake) = engine_with_leftovers(FREE_PORT);
+            fake.hang(frozen_at);
+            let (logged, _capture) = Logged::capture();
+
+            let asked = Instant::now();
+            let cleanup = engine.remove_leftovers(Session(1), SetupContainerAndNetwork);
+            let cleanup = tokio::time::timeout(LONGEST_WAIT, cleanup)
+                .await
+                .unwrap_or_else(|_| panic!("the cleanup waited for the engine at {frozen_at}"));
+
+            assert_eq!(cleanup, Cleanup::Owed, "{frozen_at}");
+            assert_eq!(asked.elapsed(), STATED_BOUND, "{frozen_at}");
+            let warnings = logged.warnings();
+            assert_eq!(warnings.len(), 1, "{frozen_at} {warnings:?}");
+            assert!(warnings[0].contains(SAYS_NO_ANSWER), "{}", warnings[0]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_start_on_an_engine_that_froze_fails_at_the_stated_bound_and_says_so() {
+        let (engine, fake) = engine_with_leftovers(FREE_PORT);
+        fake.hang(NETWORK);
+        let (logged, _capture) = Logged::capture();
+
+        let asked = Instant::now();
+        let mut attempts = Attempts::new();
+        let start = try_start(&engine, Session(1), OptIn, &mut attempts);
+        let started = tokio::time::timeout(LONGEST_WAIT, start)
+            .await
+            .expect("the start waited for the engine");
+
+        assert!(started.is_none(), "a bridge started on a frozen engine");
+        assert_eq!(asked.elapsed(), STATED_BOUND);
+        let warnings = logged.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let cause = format!("err={SAYS_NO_ANSWER}");
         assert!(warnings[0].contains(&cause), "{}", warnings[0]);
     }
 

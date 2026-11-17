@@ -2575,6 +2575,9 @@ destination: 172.18.0.0
         /// its body.
         requests: Shared<Vec<(String, String)>>,
         refusals: Shared<HashMap<String, Refusal>>,
+        /// While true, the engine takes each connection and answers
+        /// nothing on it, as a VM does that froze with its socket open.
+        frozen: Shared<bool>,
     }
 
     type Refusal = (&'static str, &'static str);
@@ -2610,9 +2613,16 @@ destination: 172.18.0.0
             let holds = Shared::<HashMap<String, String>>::default();
             let requests = Shared::<Vec<(String, String)>>::default();
             let refusals = Shared::<HashMap<String, Refusal>>::default();
+            let frozen = Shared::<bool>::default();
             let (held, asked, refused) = (holds.clone(), requests.clone(), refusals.clone());
+            let silent = frozen.clone();
             tokio::spawn(async move {
+                let mut unanswered = Vec::new();
                 while let Ok((stream, _)) = listener.accept().await {
+                    if *silent.lock().unwrap() {
+                        unanswered.push(stream);
+                        continue;
+                    }
                     let (held, asked, refused) = (held.clone(), asked.clone(), refused.clone());
                     tokio::spawn(Self::answer(stream, held, asked, refused));
                 }
@@ -2623,6 +2633,7 @@ destination: 172.18.0.0
                 holds,
                 requests,
                 refusals,
+                frozen,
             };
             engine.hold(IMAGE_INSPECT, IMAGE_WITH_DNS_MODE);
             engine.hold(NETWORK_INSPECT, OWN_NETWORK);
@@ -2635,6 +2646,10 @@ destination: 172.18.0.0
 
         fn refuse_delete(&self, path: &str, refusal: Refusal) {
             self.refusals.lock().unwrap().insert(path.into(), refusal);
+        }
+
+        fn freeze(&self) {
+            *self.frozen.lock().unwrap() = true;
         }
 
         fn requests(&self) -> Vec<(String, String)> {
@@ -3649,6 +3664,46 @@ destination: 172.18.0.0
             let cleanup = engine.bridge().await.shutdown_and_remove_network().await;
 
             assert_eq!(cleanup, want, "{fails:?}");
+        }
+    }
+
+    /// How long the daemon's client waits for the head of an answer.
+    const DAEMONS_CLIENT_LIMIT: Duration = Duration::from_secs(120);
+    /// The longest that one step of the bridge waits for the engine, as the
+    /// README states it.
+    const STATED_BOUND: Duration = Duration::from_secs(30);
+
+    #[derive(Debug, Clone, Copy)]
+    enum Step {
+        Stop,
+        StopForADisable,
+        EnsureTheForwarder,
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_step_of_a_bridge_on_an_engine_that_froze_ends_at_the_stated_bound() {
+        for step in [Step::Stop, Step::StopForADisable, Step::EnsureTheForwarder] {
+            let engine = FakeEngine::start().await;
+            let mut bridge = engine.bridge().await;
+            bridge.docker = bridge.docker.clone().with_timeout(DAEMONS_CLIENT_LIMIT);
+            engine.freeze();
+
+            let asked = tokio::time::Instant::now();
+            match step {
+                Step::Stop => bridge.shutdown().await,
+                Step::StopForADisable => {
+                    let cleanup = bridge.shutdown_and_remove_network().await;
+                    assert_eq!(cleanup, Cleanup::Owed);
+                }
+                Step::EnsureTheForwarder => {
+                    let ensured = bridge.ensure_dns_forwarder(&tlds(&["test"])).await;
+                    let said = format!("{:#}", ensured.unwrap_err());
+                    let no_answer = "the container engine gave no answer within 30 s";
+                    assert!(said.contains(no_answer), "{said}");
+                }
+            }
+
+            assert_eq!(asked.elapsed(), STATED_BOUND, "{step:?}");
         }
     }
 
