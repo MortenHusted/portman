@@ -1855,16 +1855,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_stop_of_a_bridge_that_was_turned_off_does_not_pay_the_network_debt() {
+    async fn a_disable_of_a_running_bridge_asks_the_engine_for_the_network_once() {
         let mut rig = Rig::up().await;
 
         rig.send(Control::Disable).await;
 
         assert_eq!(rig.next_stop().await, Stop::RemovesNetwork);
-        assert_eq!(
-            rig.next_sweep().await,
-            (Session(1), SetupContainerAndNetwork)
-        );
         rig.no_sweep_follows().await;
     }
 
