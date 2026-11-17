@@ -847,6 +847,39 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_mode_wait_that_two_modes_contest_counts_from_the_first_and_names_the_last() {
+        let mut statuses = vec![sent(All, Disabled); 5];
+        statuses.push(sent(OptIn, Disabled));
+        let mut script = Script::new(&statuses);
+
+        let failed = wait_for_mode(|| script.read(), Docker, sent(OptIn, Disabled))
+            .await
+            .unwrap_err();
+
+        let since_all_showed: Vec<_> = script
+            .read_at
+            .iter()
+            .map(|at| *at - script.read_at[0])
+            .collect();
+        let [.., opt_in_showed, last_read] = since_all_showed[..] else {
+            panic!("the wait ended at its first read");
+        };
+        assert!(
+            opt_in_showed < Duration::from_millis(500),
+            "{since_all_showed:?}"
+        );
+        assert!(
+            last_read >= Duration::from_millis(500),
+            "{since_all_showed:?}"
+        );
+        assert!(last_read < Duration::from_secs(1), "{since_all_showed:?}");
+        assert_eq!(
+            failed.to_string(),
+            "another command set the netbridge mode to opt-in"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_mode_change_ends_at_once_when_the_bridge_is_disabled_under_it() {
         let mut script = Script::new(&[sent(OptIn, Stopping), sent(Docker, Disabled)]);
 
