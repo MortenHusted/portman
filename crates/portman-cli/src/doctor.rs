@@ -1067,14 +1067,17 @@ const NO_ENGINE: [&str; 3] = [
     "error during connect",
 ];
 
-/// How long the resolver of the lookup container waits for the forwarder.
+/// How long the resolver of the lookup container waits for the forwarder in
+/// one lookup.
 const LOOKUP_RESOLVER_SECS: u64 = 2;
 
 /// How long the lookup container has to end. `docker run` makes the engine
-/// create and start the container, the resolver in it waits for up to
-/// [`LOOKUP_RESOLVER_SECS`], and the engine then removes the container. The
-/// engine gets [`DOCKER_CLI_BOUND`] before the lookup and again after it, as
-/// it gets for any other call.
+/// create and start the container, `getent hosts` in it makes two lookups in
+/// turn that each wait for up to [`LOOKUP_RESOLVER_SECS`], and the engine
+/// then removes the container. That leaves the engine 4 s of the bound.
+/// Measured on colima with Docker Engine 29, a forwarder that never answers
+/// holds the run for 4.8 to 5.6 s, so the run ends at least 2.4 s inside the
+/// bound.
 const LOOKUP_BOUND: Duration =
     Duration::from_secs(2 * DOCKER_CLI_BOUND.as_secs() + LOOKUP_RESOLVER_SECS);
 
