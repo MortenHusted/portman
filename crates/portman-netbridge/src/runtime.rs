@@ -2437,6 +2437,26 @@ destination: 172.18.0.0
             }
         }
 
+        /// A bridge whose pump tasks hold the listen port, as those of a
+        /// running bridge do.
+        async fn bridge_with_pumps(&self) -> Runtime {
+            let mut bridge = self.bridge().await;
+            let udp = &bridge.listen_port.0;
+            let (host, vm) = (Keypair::generate(), Keypair::generate());
+            let peer = Arc::new(Mutex::new(Peer::new(&host, vm.public(), None)));
+            let endpoint = Arc::new(Mutex::new(None));
+            bridge.tasks = vec![
+                spawn_rx(
+                    udp.clone(),
+                    peer.clone(),
+                    endpoint.clone(),
+                    tokio::io::sink(),
+                ),
+                spawn_timer(udp.clone(), peer, endpoint),
+            ];
+            bridge
+        }
+
         async fn answer(
             mut stream: tokio::net::TcpStream,
             holds: Shared<HashMap<String, String>>,
@@ -2646,6 +2666,21 @@ destination: 172.18.0.0
 
             assert_eq!(engine.asked_for(), requests, "disable={disable}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_bridge_that_is_dropped_still_holds_the_listen_port_when_the_drop_returns() {
+        let engine = FakeEngine::start().await;
+        let bridge = engine.bridge_with_pumps().await;
+        let port = bridge.listen_port.0.local_addr().unwrap().port();
+
+        drop(bridge);
+        let next_start = ListenPort::claim(port).await;
+
+        assert_eq!(
+            next_start.err().map(|err| err.kind()),
+            Some(std::io::ErrorKind::AddrInUse)
+        );
     }
 
     #[test]

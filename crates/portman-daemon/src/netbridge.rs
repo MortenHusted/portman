@@ -1232,6 +1232,9 @@ mod tests {
         forwards: mpsc::UnboundedSender<Forwarding>,
         /// How the next ensure ends.
         ensure: Arc<Mutex<Ensure>>,
+        /// Whether a bridge holds the listen port. A start fails while one
+        /// does.
+        port_held: Arc<AtomicBool>,
     }
 
     struct Forwarding {
@@ -1297,12 +1300,16 @@ mod tests {
             });
             match &self.probe {
                 Some(probe) => {
+                    if probe.port_held.swap(true, Ordering::SeqCst) {
+                        anyhow::bail!("an earlier bridge holds the listen port");
+                    }
                     probe.held.fetch_add(1, Ordering::SeqCst);
                     let setup_container = format!("the setup container for {session:?}");
                     *probe.setup_container.lock().unwrap() = Some(setup_container.clone());
                     Ok(TestBridge {
                         probe: probe.clone(),
                         setup_container,
+                        holds_port: true,
                     })
                 }
                 None => anyhow::bail!("the start failed"),
@@ -1330,11 +1337,27 @@ mod tests {
     struct TestBridge {
         probe: Probe,
         setup_container: String,
+        holds_port: bool,
     }
 
+    impl TestBridge {
+        fn free_port(&mut self) {
+            self.holds_port = false;
+            self.probe.port_held.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// As a `Runtime` that is dropped: its tasks hold the listen port until
+    /// the executor has run their abort, which is after the drop returns.
     impl Drop for TestBridge {
         fn drop(&mut self) {
             self.probe.held.fetch_sub(1, Ordering::SeqCst);
+            if self.holds_port {
+                let port_held = self.probe.port_held.clone();
+                if let Ok(executor) = tokio::runtime::Handle::try_current() {
+                    executor.spawn(async move { port_held.store(false, Ordering::SeqCst) });
+                }
+            }
         }
     }
 
@@ -1369,12 +1392,14 @@ mod tests {
             }
         }
 
-        async fn shutdown(self) {
+        async fn shutdown(mut self) {
             self.probe.clone().stop(Stop::KeepsNetwork).await;
+            self.free_port();
         }
 
-        async fn shutdown_and_remove_network(self) {
+        async fn shutdown_and_remove_network(mut self) {
             self.probe.clone().stop(Stop::RemovesNetwork).await;
+            self.free_port();
         }
     }
 
@@ -1456,6 +1481,7 @@ mod tests {
                     stops_may_end: may_end,
                     forwards: forward_seen,
                     ensure: ensure.clone(),
+                    port_held: Arc::default(),
                 }),
             };
             tokio::spawn(converge(
@@ -1910,6 +1936,33 @@ mod tests {
             assert!(rig.no_stop_began(), "a stop of a bridge that is gone");
             assert!(rig.ifindex().is_some());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_runtime_restart_costs_no_failed_start() {
+        let mut rig = Rig::up().await;
+
+        rig.engine_session(None);
+        rig.reaches(BridgePhase::WaitingForDocker).await;
+        rig.engine_runs(None);
+        rig.engine_session(S2);
+        rig.reaches(BridgePhase::Up { epoch: 2 }).await;
+        // The engine restarts once more. The link stays on a session that
+        // ended until the next one opens, so the loop sees session 3 follow
+        // session 2.
+        rig.engine_runs(None);
+        let reopened = Instant::now();
+        rig.engine_session(Some(Session(3)));
+        rig.reaches(BridgePhase::Up { epoch: 3 }).await;
+
+        assert_eq!(
+            reopened.elapsed(),
+            Duration::ZERO,
+            "the start on session 3 failed and waited for its retry"
+        );
+        let rebuilt = [rig.next_attempt().await, rig.next_attempt().await];
+        assert_eq!(rebuilt.map(|a| a.session), [Session(2), Session(3)]);
+        rig.no_attempt_follows().await;
     }
 
     #[tokio::test(start_paused = true)]
