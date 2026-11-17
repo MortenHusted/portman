@@ -1654,11 +1654,13 @@ mod tests {
              program holds the UDP port of the bridge and can run a bridge on them. It does \
              not try again until the next `portman bridge disable`"
         );
-        for held in [
-            BridgeCleanup::Pending,
-            BridgeCleanup::Failed,
-            BridgeCleanup::Unknown,
-        ] {
+        assert_eq!(
+            BridgeCleanup::Failed.disable_words(),
+            "portman could not remove everything that the bridge left in Docker: the daemon \
+             log says what stays and why. It tries again when it next connects to Docker, or \
+             at the next `portman bridge disable`"
+        );
+        for held in [BridgeCleanup::Pending, BridgeCleanup::Unknown] {
             let words = held.disable_words();
             assert!(words.contains("the dns forwarder"), "{held:?}: {words}");
             assert!(!words.contains("unknown"), "{held:?}: {words}");
