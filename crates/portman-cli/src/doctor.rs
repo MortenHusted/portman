@@ -748,7 +748,7 @@ fn bridge_guidance(daemon: &DaemonSnapshot) -> &'static [&'static str] {
 
 fn up_in_docker_mode_guidance(health: BridgeAssessment) -> &'static [&'static str] {
     const LOOK_AT: &str =
-        "`portman bridge status` names each labelled network and the interface of its route";
+        "`portman bridge status` names each labelled network of the `bridge` driver and the interface of its route; a network of another driver is not listed";
     match health {
         BridgeAssessment::Healthy => &[],
         BridgeAssessment::RoutesMissing => &[
@@ -1303,7 +1303,8 @@ mod tests {
     #[test]
     fn doctor_names_what_the_health_found_for_a_bridge_that_is_up_in_docker_mode() {
         use BridgeAssessment::{Offline, RoutesMissing, TunnelDead, Unknown};
-        let status = "`portman bridge status` names each labelled network";
+        let status = "`portman bridge status` names each labelled network of the `bridge` driver \
+                      and the interface of its route; a network of another driver is not listed";
         let table = [
             (RoutesMissing, "has no route through the bridge"),
             (RoutesMissing, status),
