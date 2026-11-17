@@ -228,6 +228,8 @@ trait Uninstall {
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SavedBridge {
+    /// Also a bridge that is off while a disable still owes the removal of
+    /// its forwarder.
     On,
     /// Also a file that is absent or cannot be read as JSON.
     Off,
@@ -237,7 +239,7 @@ enum SavedBridge {
 
 #[cfg(target_os = "macos")]
 fn saved_bridge(saved: &portman_core::netbridge_state::NetbridgeState) -> SavedBridge {
-    if saved.enabled {
+    if saved.enabled || saved.cleanup_owed {
         SavedBridge::On
     } else {
         SavedBridge::Off

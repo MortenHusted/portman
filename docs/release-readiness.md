@@ -172,7 +172,7 @@ the compose line `dns: [192.168.99.129]`.
   engine refuses a removal, the uninstall prints the commands that remove the
   forwarder and the network by hand, says when not to run them, and
   completes. With no engine reachable it prints them only when the saved
-  bridge state is on.
+  bridge state is on, or when a disable still owes its removal.
 - A setup image without the label `dev.portman.dns-forwarder=1` cannot run the
   forwarder. The bridge then works as before, the daemon log and `portman
   doctor` name `portman bridge prepare` as the fix, and the daemon looks at
