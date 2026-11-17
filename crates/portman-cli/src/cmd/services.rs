@@ -307,21 +307,14 @@ impl UpService {
 
 impl InterruptedServices {
     pub(crate) async fn record() -> Self {
-        let Recorded::Services(recorded) = Self::record_from(request).await else {
-            eprintln!(
-                "the daemon gave no answer within 3s, so the install cannot name the services \
-                 that are up. They stop with the daemon. Start each one again with `portman up` \
-                 in its repository."
-            );
-            return Self(Vec::new());
-        };
-        if !recorded.0.is_empty() {
-            eprintln!(
-                "the restart of the daemon stops these services: {}",
-                recorded.names().join(", ")
-            );
+        let recorded = Self::record_from(request).await;
+        for line in recorded.lines() {
+            eprintln!("{line}");
         }
-        recorded
+        match recorded {
+            Recorded::Services(up) => up,
+            Recorded::NoAnswerInTime => Self(Vec::new()),
+        }
     }
 
     async fn record_from<F, Fut>(mut send: F) -> Recorded
@@ -467,6 +460,24 @@ impl InterruptedServices {
 
     fn names(&self) -> Vec<String> {
         self.0.iter().map(|service| service.name.clone()).collect()
+    }
+}
+
+impl Recorded {
+    fn lines(&self) -> Vec<String> {
+        match self {
+            Self::NoAnswerInTime => vec![
+                "the daemon gave no answer within 3s, so the install cannot name the services \
+                 that are up. They stop with the daemon. Start each one again with `portman up` \
+                 in its repository."
+                    .to_string(),
+            ],
+            Self::Services(up) if up.0.is_empty() => Vec::new(),
+            Self::Services(up) => vec![format!(
+                "the restart of the daemon stops these services: {}",
+                up.names().join(", ")
+            )],
+        }
     }
 }
 
@@ -908,6 +919,10 @@ mod tests {
             recorded,
             Recorded::Services(InterruptedServices(vec![up("web"), up("jobs")]))
         );
+        assert_eq!(
+            recorded.lines(),
+            ["the restart of the daemon stops these services: web, jobs"]
+        );
     }
 
     #[tokio::test]
@@ -916,6 +931,7 @@ mod tests {
             std::future::ready(Err(anyhow::anyhow!("no daemon socket")))
         })
         .await;
+        assert_eq!(recorded.lines(), Vec::<String>::new());
         let Recorded::Services(recorded) = recorded else {
             panic!("a refused connection is an answer");
         };
@@ -1171,6 +1187,14 @@ mod tests {
 
         assert_eq!(recorded, Recorded::NoAnswerInTime);
         assert_took(began, Duration::from_secs(3));
+        assert_eq!(
+            recorded.lines(),
+            [
+                "the daemon gave no answer within 3s, so the install cannot name the services \
+                 that are up. They stop with the daemon. Start each one again with `portman up` \
+                 in its repository."
+            ]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1263,6 +1287,33 @@ mod tests {
         assert_eq!(
             report.lines(),
             ["started again: api", "started as a dependency: db"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dependency_that_does_not_get_ready_is_not_named_as_started() {
+        let mut daemon = NewDaemon::holding(&["api", "db"]);
+        daemon.depends.insert("api".into(), vec!["db".into()]);
+        daemon.ends.insert(
+            "db".into(),
+            (ServiceState::Failed, "exited with status 1".into()),
+        );
+        daemon.ends.insert(
+            "api".into(),
+            (
+                ServiceState::Failed,
+                "dependency `db` failed: exited with status 1".into(),
+            ),
+        );
+
+        let report = restore(InterruptedServices(vec![up("api")]), &mut daemon).await;
+
+        assert_eq!(
+            report.lines(),
+            [
+                "could not start api again: failed (dependency `db` failed: exited with status \
+                 1). Run `portman up api` in /Users/dev/acme/api."
+            ]
         );
     }
 
