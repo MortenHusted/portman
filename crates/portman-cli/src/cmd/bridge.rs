@@ -42,7 +42,7 @@ pub(crate) async fn cmd_bridge_status() -> Result<()> {
 
 /// What `portman bridge status` prints. `routes` is what the `docker` CLI
 /// found. A daemon that reports no engine state gets no `docker` line, and
-/// only a cleanup that something holds up gets a `cleanup` line.
+/// one that reports no cleanup state gets no `cleanup` line.
 fn bridge_status_lines(
     assessment: BridgeAssessment,
     phase: BridgePhase,
@@ -56,7 +56,7 @@ fn bridge_status_lines(
         format!("bridge:    {assessment}"),
         format!("netbridge: {}", phase.status_words(retry_in_secs)),
     ];
-    lines.extend(cleanup.map(|held| format!("cleanup:   {}", held.disable_words())));
+    lines.extend(cleanup.map(|held| format!("cleanup:   {}", held.in_words())));
     lines.push(format!("mode:      {}", NetbridgeMode::display_word(mode)));
     lines.extend(docker.map(|docker| format!("docker:    {}", docker.summary())));
     lines.extend(doctor::docker_cli_note(

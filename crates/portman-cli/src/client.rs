@@ -127,9 +127,9 @@ impl Settled {
             Settled::WaitsForDocker => format!("{done}; the bridge starts when Docker connects"),
             Settled::LeftoversStay(BridgeCleanup::Pending) => format!(
                 "{done}; {}. `portman bridge status` prints a `cleanup` line for as long as something holds it up",
-                BridgeCleanup::Pending.disable_words()
+                BridgeCleanup::Pending.in_words()
             ),
-            Settled::LeftoversStay(held) => format!("{done}; {}", held.disable_words()),
+            Settled::LeftoversStay(held) => format!("{done}; {}", held.in_words()),
         }
     }
 }

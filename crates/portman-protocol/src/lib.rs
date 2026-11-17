@@ -201,7 +201,8 @@ pub enum BridgeCleanup {
     /// removes them once the engine has been connected for that long, so
     /// that the bridge of another portman daemon on that engine can take
     /// the UDP port of the bridge first. A client that waits for a disable
-    /// waits until this has passed.
+    /// waits until this has passed, also when the disable itself came in
+    /// those seconds.
     WaitsForBridges {
         #[serde(default)]
         for_secs: u64,
@@ -213,9 +214,10 @@ pub enum BridgeCleanup {
         #[serde(default)]
         within_secs: u64,
     },
-    /// The setup container, the DNS forwarder or the docker network was not
-    /// removed, and the daemon log says which one stays and why. The daemon
-    /// tries again when it next connects to an engine.
+    /// A removal failed, or the daemon could not claim the UDP port of the
+    /// bridge for another reason than a holder of it. The daemon log says
+    /// what stays and why. The daemon tries again when it next connects to
+    /// an engine.
     Failed,
     /// Another process held the UDP port of the bridge, and can run a
     /// bridge on them. The daemon removed nothing and does not try again
@@ -226,10 +228,8 @@ pub enum BridgeCleanup {
 }
 
 impl BridgeCleanup {
-    /// The words that `portman bridge disable` and the TUI put after
-    /// "netbridge disabled", and that `portman status` and `portman bridge
-    /// status` print on their cleanup line.
-    pub fn disable_words(self) -> String {
+    /// What the CLI and the TUI print for this state.
+    pub fn in_words(self) -> String {
         let leftovers = "the dns forwarder and the `portman` network";
         let again =
             "It tries again when it next connects to Docker, or at the next `portman bridge disable`";
@@ -1656,36 +1656,36 @@ mod tests {
     fn a_disable_says_in_plain_words_what_holds_its_cleanup_up() {
         let no_answer = BridgeCleanup::NoAnswer { within_secs: 20 };
         assert_eq!(
-            no_answer.disable_words(),
+            no_answer.in_words(),
             "portman could not remove the dns forwarder and the `portman` network: the \
              container engine gave no answer within 20 s. It tries again when it next \
              connects to Docker, or at the next `portman bridge disable`"
         );
         assert_eq!(
-            BridgeCleanup::WaitsForDocker.disable_words(),
+            BridgeCleanup::WaitsForDocker.in_words(),
             "portman has not removed the dns forwarder and the `portman` network: Docker is \
              not connected. It removes them when Docker connects"
         );
         assert_eq!(
-            BridgeCleanup::WaitsForBridges { for_secs: 10 }.disable_words(),
+            BridgeCleanup::WaitsForBridges { for_secs: 10 }.in_words(),
             "portman has not removed the dns forwarder and the `portman` network yet: it \
              waits until Docker has been connected for 10 s, so that the bridge of another \
              portman daemon can take the UDP port of the bridge first"
         );
         assert_eq!(
-            BridgeCleanup::PortTaken.disable_words(),
+            BridgeCleanup::PortTaken.in_words(),
             "portman has not removed the dns forwarder and the `portman` network: another \
              program holds the UDP port of the bridge and can run a bridge on them. It does \
              not try again until the next `portman bridge disable`"
         );
         assert_eq!(
-            BridgeCleanup::Failed.disable_words(),
+            BridgeCleanup::Failed.in_words(),
             "portman could not remove everything that the bridge left in Docker: the daemon \
              log says what stays and why. It tries again when it next connects to Docker, or \
              at the next `portman bridge disable`"
         );
         for held in [BridgeCleanup::Pending, BridgeCleanup::Unknown] {
-            let words = held.disable_words();
+            let words = held.in_words();
             assert!(words.contains("the dns forwarder"), "{held:?}: {words}");
             assert!(!words.contains("unknown"), "{held:?}: {words}");
         }

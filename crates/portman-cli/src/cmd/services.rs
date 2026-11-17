@@ -109,11 +109,11 @@ fn netbridge_line(phase: portman_protocol::BridgePhase, retry_in_secs: Option<u6
     format!("netbridge:       {}", phase.status_words(retry_in_secs))
 }
 
-/// The `bridge cleanup` line of `portman status`. Status prints it only
-/// while something holds up the cleanup that a disable asked for.
+/// The `bridge cleanup` line of `portman status`. A daemon that reports no
+/// cleanup state gets no line.
 #[cfg(any(target_os = "macos", test))]
 fn bridge_cleanup_line(cleanup: Option<portman_protocol::BridgeCleanup>) -> Option<String> {
-    cleanup.map(|held| format!("bridge cleanup:  {}", held.disable_words()))
+    cleanup.map(|held| format!("bridge cleanup:  {}", held.in_words()))
 }
 
 /// Load and validate this repo's service config (walking up from the cwd).
