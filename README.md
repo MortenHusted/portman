@@ -77,7 +77,7 @@ cargo build --release -p portman && ./target/release/portman install
 
 The install restarts the daemon, and the daemon stops every supervised service when it stops. Before the restart, the install asks the daemon which services are up and names them. After the restart, it starts the same services on the new daemon. A service that was down stays down, unless a service that the install starts depends on it. The daemon then starts that dependency too, and the install names it.
 
-The install waits up to 30 seconds for the new daemon to answer, and then up to 120 seconds for the services to get ready. It prints the services that are ready again. For each service that is not ready, it prints the reason and the command that starts it:
+The install waits up to 30 seconds for the new daemon to answer, up to 30 seconds for its answer to the start request, and then up to 120 seconds for the services to get ready. It prints the services that are ready again. For each service that is not ready, it prints the reason and the command that starts the service. For a service that the daemon tried to start, the reason is the state of the service and the detail that the daemon gives for that state. A service that still waits for a dependency after 120 seconds has no detail, so its line says only `still pending after 120s`.
 
 ```text
 the restart of the daemon stops these services: api, jobs, web
@@ -87,12 +87,13 @@ started as a dependency: db
 could not start jobs again: failed (process exited (exit status: 1) before becoming ready). Run `portman up jobs` in /Users/dev/acme/shop.
 ```
 
-When the first start of a service fails and the daemon tries again, the install does not wait for that service. It prints the reason and says that the daemon keeps trying.
+When the first attempt to start a service fails, the daemon tries again and the install waits for that second attempt. A service that is ready on its second attempt is listed as started again. A service that the daemon gives up on is listed as `failed`. When the second attempt fails too and the daemon tries a third time, the install stops waiting for that service. It prints the reason and says that the daemon keeps trying.
 
-A service that does not start does not fail the install. In three cases the install cannot do its part, and it says so:
+A service that does not start does not fail the install. In four cases the install cannot do its part, and it says so:
 
 - The old daemon gives no answer within 3 seconds. The install cannot name the services, and it restarts the daemon without a record of them.
-- The new daemon does not start. The install fails, and it prints the `portman up` command for each service that was up.
+- `launchctl bootstrap` on macOS or `systemctl restart` on Linux fails. The install fails too, and it prints the `portman up` command for each service that was up.
+- The new daemon launches and gives no answer within 30 seconds. The install succeeds. For each service that was up, it prints that the new daemon did not answer, and the command that starts the service.
 - The new daemon stops answering once the install has sent the start request. The install cannot tell which services started, and it names them.
 
 ### macOS
