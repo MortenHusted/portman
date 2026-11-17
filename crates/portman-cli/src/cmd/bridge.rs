@@ -64,11 +64,14 @@ fn bridge_status_lines(
 }
 
 pub(crate) async fn cmd_doctor() -> Result<()> {
-    let daemon = doctor::DaemonSnapshot::from_status(request(Request::Status).await.ok());
+    // The entries are read before the status, so that no request without a
+    // bound follows the wait for the health. A daemon that stops answering
+    // during that wait would hold such a request with no end.
     let routes = match request(Request::ListEntries).await {
         Ok(Response::Entries { entries }) => entries,
         _ => Vec::new(),
     };
+    let daemon = doctor::settled_daemon(|| async { request(Request::Status).await.ok() }).await;
     let (setup_image, docker_routes, dns_forwarder) = tokio::join!(
         doctor::inspect_setup_image(),
         doctor::collect_docker_routes(),
@@ -100,17 +103,23 @@ pub(crate) async fn cmd_bridge(req: Request, desired_enabled: bool, verb: &str) 
 }
 
 /// What `portman bridge enable` and `portman bridge disable` print when the
-/// bridge has settled. Only a bridge on macOS has a DNS forwarder for a
-/// disable to remove.
+/// bridge has settled.
 fn bridge_command_lines(settled: Settled, desired_enabled: bool, verb: &str) -> Vec<String> {
     let mut lines = vec![settled.line(&format!("netbridge {verb}"))];
-    if !desired_enabled && cfg!(target_os = "macos") {
-        lines.push(format!(
-            "portman removes the dns forwarder at {}; a container that lists it as its only resolver resolves no name until the bridge is enabled again",
-            doctor::DNS_FORWARDER_IP
-        ));
+    if !desired_enabled {
+        lines.extend(disable_note());
     }
     lines
+}
+
+/// Only a bridge on macOS has a DNS forwarder for a disable to remove.
+pub(crate) fn disable_note() -> Option<String> {
+    cfg!(target_os = "macos").then(|| {
+        format!(
+            "portman removes the dns forwarder at {}; a container that lists it as its only resolver resolves no name until the bridge is enabled again",
+            doctor::DNS_FORWARDER_IP
+        )
+    })
 }
 
 pub(crate) async fn cmd_bridge_mode(mode: Option<String>) -> Result<()> {
@@ -129,15 +138,27 @@ pub(crate) async fn cmd_bridge_mode(mode: Option<String>) -> Result<()> {
     match request(Request::BridgeSetMode { mode }).await? {
         Response::Ok => {
             let settled = wait_for_bridge_mode(mode, before).await?;
-            let done = format!(
-                "netbridge mode set to {}",
-                NetbridgeMode::display_word(mode)
-            );
-            println!("{}", settled.line(&done));
+            for line in bridge_mode_lines(settled, mode) {
+                println!("{line}");
+            }
             Ok(())
         }
         other => other.unexpected(),
     }
+}
+
+fn bridge_mode_lines(settled: Settled, mode: NetbridgeMode) -> Vec<String> {
+    let mut lines = vec![format!(
+        "netbridge mode set to {}",
+        NetbridgeMode::display_word(mode)
+    )];
+    if settled == Settled::WaitsForDocker {
+        lines.push(
+            "Docker is not connected; the bridge starts in this mode when Docker connects"
+                .to_string(),
+        );
+    }
+    lines
 }
 
 pub(crate) async fn cmd_bridge_prepare() -> Result<()> {
@@ -249,6 +270,21 @@ mod tests {
         assert_eq!(
             bridge_command_lines(Settled::WaitsForDocker, true, "enabled"),
             ["netbridge enabled; the bridge starts when Docker connects"]
+        );
+    }
+
+    #[test]
+    fn a_mode_change_says_when_docker_is_not_connected_and_when_the_mode_applies() {
+        assert_eq!(
+            bridge_mode_lines(Settled::Reached, NetbridgeMode::Docker),
+            ["netbridge mode set to docker"]
+        );
+        assert_eq!(
+            bridge_mode_lines(Settled::WaitsForDocker, NetbridgeMode::All),
+            [
+                "netbridge mode set to all",
+                "Docker is not connected; the bridge starts in this mode when Docker connects",
+            ]
         );
     }
 

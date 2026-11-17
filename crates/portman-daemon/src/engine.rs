@@ -254,7 +254,7 @@ async fn connect(
                     version: version.version,
                 });
             }
-            Ok(Err(err)) => err.to_string(),
+            Ok(Err(err)) => unanswered(&err),
             Err(_) => format!("no answer in {} s", PROBE_TIMEOUT.as_secs()),
         };
         unreachable.get_or_insert(Absent::Unreachable {
@@ -263,6 +263,24 @@ async fn connect(
         });
     }
     Err(unreachable.unwrap_or_else(|| sockets.none_found()))
+}
+
+/// bollard wraps the error of its HTTP client, and that error's own text
+/// names only the step of the client that failed. The cause at the end of
+/// the chain says what happened.
+fn unanswered(err: &bollard::errors::Error) -> String {
+    let mut cause: &dyn std::error::Error = err;
+    while let Some(deeper) = cause.source() {
+        cause = deeper;
+    }
+    let refused = cause
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused);
+    if refused {
+        "no engine listens on this socket".to_string()
+    } else {
+        cause.to_string()
+    }
 }
 
 /// Publishes that no engine is connected and clears the container routes,
@@ -1644,6 +1662,42 @@ pub(crate) mod tests {
             "{reason:?}"
         );
         assert_eq!(started.elapsed(), PROBE_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_socket_file_that_a_dead_engine_left_reads_as_a_socket_no_engine_listens_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("docker.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+
+        let reason = super::connect(&Sockets::Configured(socket.clone()), &open_socket)
+            .await
+            .err();
+
+        let error = "no engine listens on this socket".to_string();
+        assert_eq!(reason, Some(Absent::Unreachable { socket, error }));
+    }
+
+    #[tokio::test]
+    async fn a_socket_that_closes_every_connection_is_not_reported_in_the_words_of_the_http_client()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("docker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            while let Ok((connection, _)) = listener.accept().await {
+                drop(connection);
+            }
+        });
+
+        let reason = super::connect(&Sockets::Configured(socket), &open_socket)
+            .await
+            .err()
+            .expect("no engine answered");
+
+        let message = reason.to_string();
+        assert!(!message.contains("hyper"), "{message}");
+        assert!(!message.contains("client error"), "{message}");
     }
 
     #[tokio::test(start_paused = true)]

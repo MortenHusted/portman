@@ -388,6 +388,7 @@ pub async fn daemon_main() -> Result<()> {
         engine.clone(),
         bridge_health_shared,
         netbridge_handle.ifindex.clone(),
+        netbridge_handle.phase.clone(),
     );
     let bridge_health_task = tokio::spawn(async move {
         if managed_broker {

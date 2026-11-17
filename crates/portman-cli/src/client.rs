@@ -231,8 +231,11 @@ enum ModePoll {
 /// With `wait_for_up` the bridge was up before the request. A daemon that
 /// sends the phase sends `disabled` only for a bridge that nobody wants, so
 /// that `disabled` is final. A daemon that sends no phase reads as disabled
-/// while it replaces the bridge, so that wait goes on. The new mode beside
-/// `waiting_for_docker` ends the wait, as it ends a wait for up in [`poll`].
+/// while it replaces the bridge, so that wait goes on.
+///
+/// The new mode beside `waiting_for_docker` ends every wait, as that phase
+/// ends a wait for up in [`poll`]: the daemon starts the bridge in the new
+/// mode when an engine connects.
 fn mode_poll(
     wanted: NetbridgeMode,
     wait_for_up: bool,
@@ -247,10 +250,10 @@ fn mode_poll(
             _ => ModePoll::Contested,
         };
     }
-    if !wait_for_up || now.phase() == BridgePhase::Up {
-        ModePoll::Reached
-    } else if now.sent_phase == BridgePhase::WaitingForDocker {
+    if now.sent_phase == BridgePhase::WaitingForDocker {
         ModePoll::WaitsForDocker
+    } else if !wait_for_up || now.phase() == BridgePhase::Up {
+        ModePoll::Reached
     } else if now.sent_phase == BridgePhase::Disabled {
         ModePoll::TurnedOff
     } else {
@@ -502,7 +505,14 @@ mod tests {
                 mode_only,
                 OptIn,
                 sent(Docker, WaitingForDocker),
-                ModePoll::Reached,
+                ModePoll::WaitsForDocker,
+            ),
+            (
+                Docker,
+                mode_only,
+                OptIn,
+                sent(OptIn, WaitingForDocker),
+                ModePoll::Pending,
             ),
             (
                 Docker,
@@ -758,12 +768,18 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_mode_change_on_a_bridge_that_was_not_up_ends_when_the_new_mode_shows() {
-        for not_up in [Disabled, Starting, WaitingForDocker] {
+        // the phase of a bridge that is not up → how the wait ends
+        let table = [
+            (Disabled, Settled::Reached),
+            (Starting, Settled::Reached),
+            (WaitingForDocker, Settled::WaitsForDocker),
+        ];
+        for (not_up, ends) in table {
             let mut script = Script::new(&[sent(OptIn, not_up), sent(Docker, not_up)]);
 
             let settled = wait_for_mode(|| script.read(), Docker, sent(OptIn, not_up)).await;
 
-            assert_eq!(settled.unwrap(), Settled::Reached, "{not_up:?}");
+            assert_eq!(settled.unwrap(), ends, "{not_up:?}");
             assert_eq!(script.read_at.len(), 2, "{not_up:?}");
         }
     }

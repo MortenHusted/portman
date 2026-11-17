@@ -14,7 +14,7 @@ const LABEL_MODE: &str = "dev.portman.mode";
 const LABEL_PROJECT: &str = "dev.portman.project";
 
 /// The one network whose addresses portman's own bridge always routes.
-const PORTMAN_NETWORK: &str = "portman";
+pub(crate) const PORTMAN_NETWORK: &str = "portman";
 
 /// A running container that carries `dev.portman.host`, parsed once from the
 /// Docker list response.
@@ -210,13 +210,17 @@ fn short(id: &str) -> &str {
     &id[..id.len().min(12)]
 }
 
-/// The address on the `portman` network, otherwise the address on the network
-/// whose name sorts first.
-pub(crate) fn pick_address(addresses: &[(String, Ipv4Addr)]) -> Option<Ipv4Addr> {
+/// The network and the address the registry routes a container to: those of
+/// the `portman` network, otherwise those of the network whose name sorts
+/// first.
+pub(crate) fn pick(addresses: &[(String, Ipv4Addr)]) -> Option<&(String, Ipv4Addr)> {
     addresses
         .iter()
         .min_by_key(|&(network, _)| (network != PORTMAN_NETWORK, network))
-        .map(|&(_, ip)| ip)
+}
+
+pub(crate) fn pick_address(addresses: &[(String, Ipv4Addr)]) -> Option<Ipv4Addr> {
+    pick(addresses).map(|&(_, ip)| ip)
 }
 
 #[cfg(test)]
