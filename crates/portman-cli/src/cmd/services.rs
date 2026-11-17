@@ -1,8 +1,11 @@
 //! Service-runner commands: status, up, down, logs.
 
+use std::future::Future;
+use std::path::PathBuf;
+
 use anyhow::{bail, Context, Result};
-use portman_protocol::ServiceState;
-use tokio::time::{sleep, Duration};
+use portman_protocol::{ServiceState, ServiceStatusInfo};
+use tokio::time::{sleep, Duration, Instant};
 
 use crate::client::request;
 use portman_protocol::{Request, Response};
@@ -252,6 +255,90 @@ pub(crate) fn readiness_timeout_message(
     )
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct InterruptedServices(Vec<UpService>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpService {
+    name: String,
+    root: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RestartReport {
+    started: Vec<String>,
+    not_started: Vec<NotStarted>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NotStarted {
+    service: UpService,
+    why: String,
+}
+
+impl InterruptedServices {
+    pub(crate) async fn record() -> Self {
+        let recorded = Self::record_from(request).await;
+        if !recorded.0.is_empty() {
+            eprintln!(
+                "the restart of the daemon stops these services: {}",
+                recorded.names().join(", ")
+            );
+        }
+        recorded
+    }
+
+    async fn record_from<F, Fut>(_send: F) -> Self
+    where
+        F: FnMut(Request) -> Fut,
+        Fut: Future<Output = Result<Response>>,
+    {
+        Self(Vec::new())
+    }
+
+    pub(crate) async fn restore(self) {
+        if !self.0.is_empty() {
+            eprintln!("starting them again on the new daemon…");
+        }
+        for line in self.restore_through(request).await.lines() {
+            eprintln!("{line}");
+        }
+    }
+
+    async fn restore_through<F, Fut>(self, _send: F) -> RestartReport
+    where
+        F: FnMut(Request) -> Fut,
+        Fut: Future<Output = Result<Response>>,
+    {
+        drop(self);
+        RestartReport::default()
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.0.iter().map(|service| service.name.clone()).collect()
+    }
+}
+
+impl RestartReport {
+    fn lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if !self.started.is_empty() {
+            lines.push(format!("started again: {}", self.started.join(", ")));
+        }
+        for NotStarted { service, why } in &self.not_started {
+            let place = match &service.root {
+                Some(root) => root.display().to_string(),
+                None => "its repository".to_string(),
+            };
+            lines.push(format!(
+                "could not start {name} again: {why}. Run `portman up {name}` in {place}.",
+                name = service.name
+            ));
+        }
+        lines
+    }
+}
+
 pub(crate) async fn cmd_down(
     names: Vec<String>,
     forget: bool,
@@ -453,6 +540,248 @@ mod tests {
         assert_eq!(
             line(r#"{"kind":"status","docker":{"state":"paused"}}"#).as_deref(),
             Some("docker:          unknown")
+        );
+    }
+
+    fn service(name: &str, state: ServiceState, desired_up: bool) -> ServiceStatusInfo {
+        ServiceStatusInfo {
+            name: name.into(),
+            root: Some(format!("/Users/dev/acme/{name}").into()),
+            repo: None,
+            config_missing: false,
+            state,
+            detail: String::new(),
+            pid: None,
+            restarts: 0,
+            host: None,
+            port: None,
+            desired_up,
+            groups: Vec::new(),
+            project: None,
+        }
+    }
+
+    fn up(name: &str) -> UpService {
+        UpService {
+            name: name.into(),
+            root: Some(format!("/Users/dev/acme/{name}").into()),
+        }
+    }
+
+    #[derive(Default)]
+    struct NewDaemon {
+        refused_connections: usize,
+        services: Vec<ServiceStatusInfo>,
+        ends: std::collections::HashMap<String, (ServiceState, String)>,
+        start_requests: Vec<Vec<String>>,
+    }
+
+    impl NewDaemon {
+        fn holding(names: &[&str]) -> Self {
+            Self {
+                services: names
+                    .iter()
+                    .map(|name| service(name, ServiceState::Stopped, false))
+                    .collect(),
+                ..Self::default()
+            }
+        }
+
+        fn answer(&mut self, request: Request) -> Result<Response> {
+            if self.refused_connections > 0 {
+                self.refused_connections -= 1;
+                bail!("connection refused");
+            }
+            if let Request::ServiceUp { names } = request {
+                for row in self
+                    .services
+                    .iter_mut()
+                    .filter(|row| names.contains(&row.name))
+                {
+                    let (state, detail) = self
+                        .ends
+                        .get(&row.name)
+                        .cloned()
+                        .unwrap_or((ServiceState::Ready, String::new()));
+                    row.desired_up = true;
+                    row.state = state;
+                    row.detail = detail;
+                }
+                self.start_requests.push(names);
+            }
+            Ok(Response::ServiceStatuses {
+                services: self.services.clone(),
+            })
+        }
+    }
+
+    async fn restore(interrupted: InterruptedServices, daemon: &mut NewDaemon) -> RestartReport {
+        interrupted
+            .restore_through(|request| std::future::ready(daemon.answer(request)))
+            .await
+    }
+
+    #[tokio::test]
+    async fn the_install_records_only_the_services_that_are_up() {
+        let old_daemon = vec![
+            service("web", ServiceState::Ready, true),
+            service("jobs", ServiceState::Backoff, true),
+            service("idle", ServiceState::Stopped, false),
+            service("broken", ServiceState::Failed, true),
+        ];
+
+        let recorded = InterruptedServices::record_from(|_| {
+            std::future::ready(Ok(Response::ServiceStatuses {
+                services: old_daemon.clone(),
+            }))
+        })
+        .await;
+
+        assert_eq!(recorded, InterruptedServices(vec![up("web"), up("jobs")]));
+    }
+
+    #[tokio::test]
+    async fn a_first_install_records_nothing_and_asks_the_new_daemon_nothing() {
+        let recorded = InterruptedServices::record_from(|_| {
+            std::future::ready(Err(anyhow::anyhow!("no daemon socket")))
+        })
+        .await;
+        assert_eq!(recorded, InterruptedServices(Vec::new()));
+
+        let report = recorded
+            .restore_through(|request| -> std::future::Ready<Result<Response>> {
+                panic!("a first install sent {request:?}")
+            })
+            .await;
+
+        assert_eq!(report.lines(), Vec::<String>::new());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_install_starts_what_was_up_once_the_new_daemon_answers() {
+        let mut daemon = NewDaemon {
+            refused_connections: 3,
+            ..NewDaemon::holding(&["idle", "jobs", "web"])
+        };
+
+        let report = restore(
+            InterruptedServices(vec![up("web"), up("jobs")]),
+            &mut daemon,
+        )
+        .await;
+
+        assert_eq!(daemon.start_requests, [["web", "jobs"]]);
+        assert_eq!(report.lines(), ["started again: web, jobs"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_service_that_fails_to_start_again_is_named_with_its_command() {
+        let mut daemon = NewDaemon::holding(&["jobs", "web"]);
+        daemon.ends.insert(
+            "jobs".into(),
+            (ServiceState::Failed, "exited with status 3".into()),
+        );
+
+        let report = restore(
+            InterruptedServices(vec![up("web"), up("jobs")]),
+            &mut daemon,
+        )
+        .await;
+
+        assert_eq!(
+            report.lines(),
+            [
+                "started again: web",
+                "could not start jobs again: failed (exited with status 3). \
+                 Run `portman up jobs` in /Users/dev/acme/jobs.",
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_service_that_stays_in_backoff_is_named_after_the_wait() {
+        let mut daemon = NewDaemon::holding(&["web"]);
+        daemon.ends.insert(
+            "web".into(),
+            (ServiceState::Backoff, "port 3000 is taken".into()),
+        );
+
+        let report = restore(InterruptedServices(vec![up("web")]), &mut daemon).await;
+
+        assert_eq!(
+            report.lines(),
+            [
+                "could not start web again: still backoff after 120s (port 3000 is taken). \
+              Run `portman up web` in /Users/dev/acme/web."
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_started_service_that_still_reads_stopped_is_waited_for() {
+        let mut daemon = NewDaemon::holding(&["web"]);
+        daemon
+            .ends
+            .insert("web".into(), (ServiceState::Stopped, String::new()));
+        let mut reads_after_start = 0;
+
+        let report = InterruptedServices(vec![up("web")])
+            .restore_through(|request| {
+                if !daemon.start_requests.is_empty() && matches!(request, Request::ServiceStatus) {
+                    reads_after_start += 1;
+                    if reads_after_start == 2 {
+                        daemon.services[0].state = ServiceState::Ready;
+                    }
+                }
+                std::future::ready(daemon.answer(request))
+            })
+            .await;
+
+        assert_eq!(report.lines(), ["started again: web"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_service_that_the_new_daemon_does_not_hold_is_named() {
+        let mut daemon = NewDaemon::holding(&["web"]);
+
+        let report = restore(
+            InterruptedServices(vec![up("web"), up("jobs")]),
+            &mut daemon,
+        )
+        .await;
+
+        assert_eq!(daemon.start_requests, [["web"]]);
+        assert_eq!(
+            report.lines(),
+            [
+                "started again: web",
+                "could not start jobs again: the new daemon has no definition for it. \
+                 Run `portman up jobs` in /Users/dev/acme/jobs.",
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_service_is_named_when_the_new_daemon_never_answers() {
+        let mut daemon = NewDaemon {
+            refused_connections: usize::MAX,
+            ..NewDaemon::default()
+        };
+
+        let report = restore(
+            InterruptedServices(vec![up("web"), up("jobs")]),
+            &mut daemon,
+        )
+        .await;
+
+        assert_eq!(
+            report.lines(),
+            [
+                "could not start web again: the new daemon did not answer within 30s. \
+                 Run `portman up web` in /Users/dev/acme/web.",
+                "could not start jobs again: the new daemon did not answer within 30s. \
+                 Run `portman up jobs` in /Users/dev/acme/jobs.",
+            ]
         );
     }
 

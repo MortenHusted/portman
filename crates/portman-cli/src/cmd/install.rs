@@ -3,6 +3,7 @@
 
 #[cfg(target_os = "macos")]
 use crate::client::request;
+use crate::cmd::services::InterruptedServices;
 use crate::cmd::{locate_repo_root, run, run_sudo, sudo_write};
 use anyhow::{bail, Context, Result};
 #[cfg(target_os = "macos")]
@@ -100,6 +101,7 @@ pub(crate) async fn cmd_install_macos() -> Result<()> {
         run_sudo(&["chmod", "0644", DAEMON_PLIST_PATH])?;
     }
 
+    let interrupted = InterruptedServices::record().await;
     eprintln!("loading launchd service…");
     let _ = StdCommand::new("sudo")
         .args(["launchctl", "bootout", &format!("system/{DAEMON_LABEL}")])
@@ -113,6 +115,7 @@ pub(crate) async fn cmd_install_macos() -> Result<()> {
     // daemon by pid has no safe passwordless sudoers form.
     wait_for_old_daemon_exit();
     run_sudo(&["launchctl", "bootstrap", "system", DAEMON_PLIST_PATH])?;
+    interrupted.restore().await;
 
     print_install_success(&log_dir);
     Ok(())
@@ -136,12 +139,14 @@ pub(crate) async fn cmd_install_linux() -> Result<()> {
     eprintln!("writing {} (sudo required)", DAEMON_UNIT_PATH);
     sudo_write(std::path::Path::new(DAEMON_UNIT_PATH), &unit)?;
 
+    let interrupted = InterruptedServices::record().await;
     eprintln!("enabling systemd service…");
     run_sudo(&["systemctl", "daemon-reload"])?;
     run_sudo(&["systemctl", "enable", "--now", "portman-daemon"])?;
     // `enable --now` is a no-op when the unit is already active — an
     // upgrade must actually swap onto the new binary.
     run_sudo(&["systemctl", "restart", "portman-daemon"])?;
+    interrupted.restore().await;
 
     print_install_success(log_dir);
     Ok(())
