@@ -2056,6 +2056,8 @@ mod tests {
             self.sessions.send_replace(Link::Connected {
                 session: Session(session),
                 docker: self.engine.docker().unwrap(),
+                socket: "/run/demo/docker.sock".into(),
+                version: None,
             });
             tokio::time::sleep(LONGEST_WAIT).await;
         }
