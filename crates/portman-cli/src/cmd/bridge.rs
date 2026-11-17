@@ -100,21 +100,25 @@ pub(crate) async fn cmd_bridge(req: Request, desired_enabled: bool, verb: &str) 
 }
 
 /// What `portman bridge enable` and `portman bridge disable` print when the
-/// bridge has settled. Only a bridge on macOS has a DNS forwarder for a
-/// disable to remove.
-pub(crate) fn bridge_command_lines(
-    settled: Settled,
-    desired_enabled: bool,
-    verb: &str,
-) -> Vec<String> {
+/// bridge has settled.
+fn bridge_command_lines(settled: Settled, desired_enabled: bool, verb: &str) -> Vec<String> {
     let mut lines = vec![settled.line(&format!("netbridge {verb}"))];
-    if !desired_enabled && cfg!(target_os = "macos") {
-        lines.push(format!(
-            "portman removes the dns forwarder at {}; a container that lists it as its only resolver resolves no name until the bridge is enabled again",
-            doctor::DNS_FORWARDER_IP
-        ));
+    if !desired_enabled {
+        lines.extend(disable_note());
     }
     lines
+}
+
+/// What a disable removes besides the tunnel, in the words that the CLI and
+/// the TUI both show. Only a bridge on macOS has a DNS forwarder for a
+/// disable to remove.
+pub(crate) fn disable_note() -> Option<String> {
+    cfg!(target_os = "macos").then(|| {
+        format!(
+            "portman removes the dns forwarder at {}; a container that lists it as its only resolver resolves no name until the bridge is enabled again",
+            doctor::DNS_FORWARDER_IP
+        )
+    })
 }
 
 pub(crate) async fn cmd_bridge_mode(mode: Option<String>) -> Result<()> {

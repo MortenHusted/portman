@@ -233,6 +233,10 @@ enum Modal {
         tls: bool,
     },
     ConfirmBridgeDisable,
+    /// What a disable removed besides the tunnel, until the user closes it.
+    BridgeDisabled {
+        note: String,
+    },
     Help,
 }
 
@@ -493,6 +497,7 @@ async fn fetch_resource_usage() -> Result<ResourceUsageSnapshot> {
 
 use crate::client::request as send;
 use crate::client::{wait_for_bridge_state, Settled};
+use crate::cmd::bridge::disable_note;
 use crate::fmt::{
     format_bytes as format_resource_bytes, format_rate as format_resource_rate, open_browser,
     truncate as truncate_for_tui,
@@ -574,10 +579,17 @@ async fn handle_key(
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                     state.modal = Modal::None;
                     let res = mutate_bridge(Request::BridgeDisable, false).await;
+                    state.modal = after_disable(&res);
                     apply_bridge_result(state, res, "netbridge disabled");
                     refresh(state).await;
                 }
                 _ => {}
+            }
+            return Outcome::Continue;
+        }
+        Modal::BridgeDisabled { .. } => {
+            if matches!(k.code, KeyCode::Esc | KeyCode::Enter) {
+                state.modal = Modal::None;
             }
             return Outcome::Continue;
         }
@@ -776,6 +788,15 @@ fn apply_result(state: &mut State, res: Result<()>) {
 /// `done` says what the command did, in the words the CLI prints. The CLI's
 /// line shows only when it says more than `done`, since the status panel
 /// shows a bridge that is up or off.
+/// The modal that follows a disable. One that succeeded says what it removed
+/// besides the tunnel, in the words the CLI prints, where it removes anything.
+fn after_disable(res: &Result<Settled>) -> Modal {
+    match (res, disable_note()) {
+        (Ok(_), Some(note)) => Modal::BridgeDisabled { note },
+        _ => Modal::None,
+    }
+}
+
 fn apply_bridge_result(state: &mut State, res: Result<Settled>, done: &str) {
     let notice = match &res {
         Ok(Settled::WaitsForDocker) => Some(Settled::WaitsForDocker.line(done)),
@@ -981,6 +1002,7 @@ fn view(f: &mut ratatui::Frame<'_>, state: &State) {
         } => render_add_entry(f, area, host, target, *tcp, *field),
         Modal::AddTld { name, tls } => render_add_tld(f, area, name, *tls),
         Modal::ConfirmBridgeDisable => render_confirm_bridge_disable(f, area),
+        Modal::BridgeDisabled { note } => render_bridge_disabled(f, area, note),
         Modal::Help => render_help(f, area),
     }
 }
@@ -2081,35 +2103,86 @@ fn render_add_tld(f: &mut ratatui::Frame<'_>, area: Rect, name: &str, tls: bool)
 }
 
 fn render_confirm_bridge_disable(f: &mut ratatui::Frame<'_>, area: Rect) {
-    let modal = centered_rect(area, 62, 10);
-    f.render_widget(Clear, modal);
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Disable the v1 netbridge?",
-            Style::default().fg(Color::Yellow).bold(),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  This tears down the Portman tunnel and persists netbridge=off.",
-            Style::default().fg(Color::Gray),
-        )),
-        Line::from(Span::styled(
-            "  Containers stay attached to the docker network, but host routes go away.",
-            Style::default().fg(Color::Gray),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  [y] disable   [n] keep running   [Esc] cancel",
-            Style::default().fg(Color::Gray),
-        )),
+    let mut removes = vec![
+        "This tears down the Portman tunnel and persists netbridge=off.".to_string(),
+        "Host routes go away. The `portman` docker network goes too, unless a running \
+         container is attached to it."
+            .to_string(),
     ];
+    removes.extend(disable_note());
+    render_text_modal(
+        f,
+        area,
+        " confirm netbridge disable ",
+        Some("Disable the v1 netbridge?"),
+        &removes,
+        &["[y] disable", "[n] keep running", "[Esc] cancel"],
+    );
+}
+
+fn render_bridge_disabled(f: &mut ratatui::Frame<'_>, area: Rect, note: &str) {
+    let removed = [note.to_string()];
+    let title = " netbridge disabled ";
+    render_text_modal(f, area, title, None, &removed, &["[Enter] close"]);
+}
+
+/// A modal that is as tall as its text. Paragraphs break between words and
+/// the key hints break between hints, so a narrow terminal cuts neither.
+fn render_text_modal(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    title: &str,
+    heading: Option<&str>,
+    paragraphs: &[String],
+    hints: &[&str],
+) {
+    let indent = "  ";
+    let borders = 2;
+    let columns = centered_rect(area, 62, area.height).width;
+    let text_width = usize::from(columns).saturating_sub(borders + indent.len());
+    let gray = Style::default().fg(Color::Gray);
+    let row = |text: &str, style: Style| Line::from(Span::styled(format!("{indent}{text}"), style));
+
+    let mut lines = vec![Line::from("")];
+    if let Some(heading) = heading {
+        lines.push(row(heading, Style::default().fg(Color::Yellow).bold()));
+        lines.push(Line::from(""));
+    }
+    for paragraph in paragraphs {
+        for wrapped in pack(paragraph.split_whitespace(), " ", text_width) {
+            lines.push(row(&wrapped, gray));
+        }
+    }
+    lines.push(Line::from(""));
+    for wrapped in pack(hints.iter().copied(), "   ", text_width) {
+        lines.push(row(&wrapped, gray));
+    }
+
+    let height = u16::try_from(lines.len() + borders).unwrap_or(area.height);
+    let modal = centered_rect(area, 62, height);
+    f.render_widget(Clear, modal);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(" confirm netbridge disable ")
+        .title(title)
         .border_style(Style::default().fg(Color::Yellow));
     f.render_widget(Paragraph::new(lines).block(block), modal);
+}
+
+/// `pieces` in rows of at most `width` columns, with `gap` between two
+/// pieces of a row. A piece longer than `width` gets a row of its own.
+fn pack<'a>(pieces: impl Iterator<Item = &'a str>, gap: &str, width: usize) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    for piece in pieces {
+        match rows.last_mut() {
+            Some(row) if row.len() + gap.len() + piece.len() <= width => {
+                row.push_str(gap);
+                row.push_str(piece);
+            }
+            _ => rows.push(piece.to_string()),
+        }
+    }
+    rows
 }
 
 fn render_help(f: &mut ratatui::Frame<'_>, area: Rect) {
@@ -2487,13 +2560,15 @@ mod tests {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(columns, 40)).unwrap();
         terminal.draw(|f| view(f, state)).unwrap();
         let buffer = terminal.backend().buffer();
-        let row = |y: u16| -> String { (0..columns).map(|x| buffer[(x, y)].symbol()).collect() };
-        let top = (0..40)
-            .find(|y| row(*y).contains(title))
+        let titled = format!("╭{title}");
+        let starts_title = |x: u16, y: u16| {
+            let cells = (x..columns).map(|x| buffer[(x, y)].symbol());
+            cells.collect::<String>().starts_with(&titled)
+        };
+        let (left, top) = (0..40)
+            .flat_map(|y| (0..columns).map(move |x| (x, y)))
+            .find(|&(x, y)| starts_title(x, y))
             .unwrap_or_else(|| panic!("no modal titled {title:?}"));
-        let left = (0..columns)
-            .find(|x| buffer[(*x, top)].symbol() == "╭" && buffer[(*x, top + 1)].symbol() == "│")
-            .expect("the modal has a top left corner");
         let right = (left + 1..columns)
             .find(|x| buffer[(*x, top)].symbol() == "╮")
             .expect("the modal has a top right corner");
@@ -2514,8 +2589,7 @@ mod tests {
 
     #[test]
     fn the_disable_confirmation_says_what_a_disable_removes_in_the_words_of_the_cli() {
-        let cli = crate::cmd::bridge::bridge_command_lines(Settled::Reached, false, "disabled");
-        for columns in [120, 80] {
+        for columns in [120, 80, 60] {
             let mut state = status_state(BridgePhase::Up, None);
             state.modal = Modal::ConfirmBridgeDisable;
 
@@ -2530,13 +2604,32 @@ mod tests {
                 ),
                 "{at}"
             );
-            for line in &cli[1..] {
-                assert!(text.contains(line.as_str()), "{at}");
+            if let Some(note) = disable_note() {
+                assert!(text.contains(&note), "{at}");
             }
             assert!(
                 text.ends_with("[y] disable [n] keep running [Esc] cancel"),
                 "{at}"
             );
+        }
+    }
+
+    #[test]
+    fn a_disable_that_succeeded_says_what_it_removed_in_the_words_of_the_cli() {
+        let failed = Err(anyhow::anyhow!("the daemon did not answer"));
+        assert!(matches!(after_disable(&failed), Modal::None));
+
+        let Some(note) = disable_note() else {
+            assert!(matches!(after_disable(&Ok(Settled::Reached)), Modal::None));
+            return;
+        };
+        for columns in [120, 80, 60] {
+            let mut state = status_state(BridgePhase::Disabled, None);
+            state.modal = after_disable(&Ok(Settled::Reached));
+
+            let text = modal_text(columns, &state, " netbridge disabled ");
+
+            assert_eq!(text, format!("{note} [Enter] close"), "columns={columns}");
         }
     }
 
