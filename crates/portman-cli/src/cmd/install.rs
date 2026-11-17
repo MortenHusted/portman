@@ -386,7 +386,7 @@ fn bridge_leftover_lines(leftovers: &BridgeLeftovers) -> Vec<String> {
         BridgeLeftovers::Owed { socket } => [
             vec![
                 format!(
-                    "bridge: Docker at {} may still hold the dns forwarder. Another process holds the bridge's UDP port, or Docker refused a removal",
+                    "bridge: Docker at {} may still hold the dns forwarder. Another process holds the bridge's UDP port, or Docker refused a removal or gave no answer",
                     socket.display()
                 ),
                 "bridge: to remove the forwarder and its network by hand, run:".to_string(),

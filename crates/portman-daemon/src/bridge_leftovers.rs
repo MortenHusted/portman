@@ -25,7 +25,8 @@ pub enum BridgeLeftovers {
     /// while a running container is attached to it.
     NoneLeft { socket: PathBuf },
     /// The engine at `socket` can still hold them. Another process holds
-    /// the listen port, or a removal failed.
+    /// the listen port, a removal failed, or the engine gave no answer in
+    /// the time that a cleanup gives it.
     Owed { socket: PathBuf },
     /// No engine answered. `reason` says where the removal looked.
     NoEngine { reason: String },
