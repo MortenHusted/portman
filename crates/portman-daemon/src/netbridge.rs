@@ -3426,8 +3426,43 @@ mod tests {
         }
     }
 
+    /// A client of the daemon that the bridge loop of `handle` runs in.
+    struct Client {
+        state: crate::DaemonState,
+        _dir: TempDir,
+    }
+
+    impl Client {
+        fn of(handle: &Handle) -> Self {
+            let dir = tempdir().unwrap();
+            let mut state = crate::handlers::tests::test_state(&dir);
+            state.netbridge = handle.clone();
+            Self { state, _dir: dir }
+        }
+
+        /// Sends what `portman bridge disable` sends, and returns when the
+        /// daemon has answered. The loop has not acted on it by then.
+        async fn disable(&self) {
+            let request = portman_core::Request::BridgeDisable;
+            let answer = crate::handlers::dispatch(request, &self.state).await;
+            assert!(matches!(answer, portman_core::Response::Ok), "{answer:?}");
+        }
+
+        /// What status says about the cleanup that a disable asked for.
+        async fn bridge_cleanup(&self) -> serde_json::Value {
+            let request = portman_core::Request::Status;
+            let status = crate::handlers::dispatch(request, &self.state).await;
+            serde_json::to_value(&status).unwrap()["bridge_cleanup"].clone()
+        }
+    }
+
+    fn no_answer_in_status() -> serde_json::Value {
+        serde_json::json!({"state": "no_answer", "within_secs": ENGINE_STEP_BUDGET.as_secs()})
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn the_debt_is_saved_until_a_cleanup_ends_it() {
+    async fn a_debt_that_no_cleanup_ended_is_saved_and_status_says_what_holds_it() {
+        use serde_json::json;
         #[derive(Debug)]
         enum Engine {
             RemovesTheNetwork,
@@ -3435,14 +3470,15 @@ mod tests {
             FailsTheRemoval,
             GivesNoAnswer,
         }
-        // how the engine takes the removal of the network → the debt that is saved
+        // how the engine takes the removal of the network
+        //     → (the debt that is saved, what status says of the cleanup)
         let table = [
-            (Engine::RemovesTheNetwork, false),
-            (Engine::RefusesANetworkInUse, false),
-            (Engine::FailsTheRemoval, true),
-            (Engine::GivesNoAnswer, true),
+            (Engine::RemovesTheNetwork, false, json!(null)),
+            (Engine::RefusesANetworkInUse, false, json!(null)),
+            (Engine::FailsTheRemoval, true, json!({"state": "failed"})),
+            (Engine::GivesNoAnswer, true, no_answer_in_status()),
         ];
-        for (engine, owed) in table {
+        for (engine, owed, says) in table {
             let daemon = OnFakeEngine::start(&[(NETWORK, OWN_NETWORK)]).await;
             match engine {
                 Engine::RemovesTheNetwork => {}
@@ -3450,11 +3486,71 @@ mod tests {
                 Engine::FailsTheRemoval => daemon.fake.fail_delete(NETWORK, Some(ENGINE_FAILED)),
                 Engine::GivesNoAnswer => daemon.fake.hang(NETWORK),
             }
+            let client = Client::of(&daemon.handle);
 
-            daemon.disable().await;
+            client.disable().await;
+            tokio::time::sleep(LONGEST_WAIT).await;
 
             assert_eq!(saved_debt(&daemon.state_path), owed, "{engine:?}");
+            assert_eq!(client.bridge_cleanup().await, says, "{engine:?}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_reads_as_pending_from_its_request_until_its_cleanup_has_ended() {
+        use serde_json::json;
+        let daemon = OnFakeEngine::start(&[(NETWORK, OWN_NETWORK)]).await;
+        daemon.fake.hang(NETWORK);
+        let client = Client::of(&daemon.handle);
+        let pending = json!({"state": "pending"});
+        assert_eq!(client.bridge_cleanup().await, json!(null));
+
+        client.disable().await;
+
+        let cleanup = client.bridge_cleanup().await;
+        assert_eq!(cleanup, pending, "before the loop has acted on the request");
+        let second = Duration::from_secs(1);
+        tokio::time::sleep(ENGINE_STEP_BUDGET - second).await;
+        let cleanup = client.bridge_cleanup().await;
+        assert_eq!(cleanup, pending, "while the cleanup is in flight");
+        tokio::time::sleep(second * 2).await;
+        assert_eq!(client.bridge_cleanup().await, no_answer_in_status());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_says_that_a_cleanup_waits_for_docker_until_a_session_has_paid_it() {
+        use serde_json::json;
+        let (engine, publisher) = crate::engine::channel();
+        let engine = LinkedEngine {
+            link: engine.watch(),
+            listen_port: FREE_PORT,
+        };
+        let (handle, rx, phase_tx) = handle_pair();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("netbridge.json");
+        let tlds = KnownTlds::default();
+        tokio::spawn(converge(
+            engine,
+            handle.clone(),
+            rx,
+            phase_tx,
+            state_path,
+            false,
+            tlds,
+        ));
+        let client = Client::of(&handle);
+
+        client.disable().await;
+        tokio::time::sleep(LONGEST_WAIT).await;
+
+        let cleanup = client.bridge_cleanup().await;
+        assert_eq!(cleanup, json!({"state": "waits_for_docker"}));
+
+        let fake = crate::engine::tests::connect(&publisher);
+        fake.hold(NETWORK, OWN_NETWORK);
+        tokio::time::sleep(LONGEST_WAIT).await;
+
+        assert_eq!(client.bridge_cleanup().await, json!(null));
     }
 
     #[tokio::test(start_paused = true)]
@@ -3463,11 +3559,14 @@ mod tests {
         let taken = another_daemons_bridge.local_addr().unwrap().port();
         let held = [(NETWORK, OWN_NETWORK), (FORWARDER, OWN_FORWARDER)];
         let daemon = OnFakeEngine::start_on(taken, &held).await;
+        let client = Client::of(&daemon.handle);
         let (logged, _capture) = Logged::capture();
 
         daemon.disable().await;
 
         assert_eq!(daemon.fake.calls(), [] as [&str; 0]);
+        let cleanup = client.bridge_cleanup().await;
+        assert_eq!(cleanup, serde_json::json!({"state": "port_taken"}));
         let lines = logged.lines();
         assert_eq!(lines.len(), 1, "{lines:?}");
         let final_for_this_disable = "the listen port is taken, and its holder may run a bridge \
