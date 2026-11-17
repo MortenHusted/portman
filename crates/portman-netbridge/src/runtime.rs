@@ -1624,10 +1624,13 @@ fn remember_own_utun(name: &str) {
 }
 
 /// Ends the claim on `name` and waits for the `route` command that runs at
-/// this moment. The lock is one for the process, so that command can be
-/// another bridge's. No later command runs for the name, so the wait is for
-/// one command: at most [`ROUTE_LIMIT`], and [`KILL_GRACE`] after it for a
-/// command that was killed.
+/// this moment. No later command runs for the name. With one bridge in the
+/// process the wait is for that one command: at most [`ROUTE_LIMIT`], and
+/// [`KILL_GRACE`] after it for a command that was killed. The daemon has one
+/// bridge, because it ends a bridge before it starts the next, and two
+/// bridges cannot hold the one listen port. The lock is one for the process
+/// and it is not fair. So among several bridges the commands of the others
+/// can go ahead of the let-go, and the wait is then for more than one.
 fn forget_own_utun(name: &str) {
     own_utuns().remove(name);
     drop(route_in_flight());
