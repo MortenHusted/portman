@@ -282,7 +282,14 @@ struct NotStarted {
 
 impl InterruptedServices {
     pub(crate) async fn record() -> Self {
-        let recorded = Self::record_from(request).await;
+        let Some(recorded) = Self::record_from(request).await else {
+            eprintln!(
+                "the daemon gave no answer within 3s, so the install cannot name the services \
+                 that are up. They stop with the daemon. Start each one again with `portman up` \
+                 in its repository."
+            );
+            return Self(Vec::new());
+        };
         if !recorded.0.is_empty() {
             eprintln!(
                 "the restart of the daemon stops these services: {}",
@@ -292,15 +299,16 @@ impl InterruptedServices {
         recorded
     }
 
-    async fn record_from<F, Fut>(mut send: F) -> Self
+    /// `None` when the daemon took the connection and gave no answer in time.
+    async fn record_from<F, Fut>(mut send: F) -> Option<Self>
     where
         F: FnMut(Request) -> Fut,
         Fut: Future<Output = Result<Response>>,
     {
         let Ok(Response::ServiceStatuses { services }) = send(Request::ServiceStatus).await else {
-            return Self(Vec::new());
+            return Some(Self(Vec::new()));
         };
-        Self(
+        Some(Self(
             services
                 .into_iter()
                 .filter(is_up)
@@ -309,7 +317,7 @@ impl InterruptedServices {
                     root: status.root,
                 })
                 .collect(),
-        )
+        ))
     }
 
     pub(crate) async fn restore(self) {
@@ -773,7 +781,10 @@ mod tests {
         })
         .await;
 
-        assert_eq!(recorded, InterruptedServices(vec![up("web"), up("jobs")]));
+        assert_eq!(
+            recorded,
+            Some(InterruptedServices(vec![up("web"), up("jobs")]))
+        );
     }
 
     #[tokio::test]
@@ -781,7 +792,8 @@ mod tests {
         let recorded = InterruptedServices::record_from(|_| {
             std::future::ready(Err(anyhow::anyhow!("no daemon socket")))
         })
-        .await;
+        .await
+        .expect("a refused connection is an answer");
         assert_eq!(recorded, InterruptedServices(Vec::new()));
 
         let report = recorded
@@ -919,6 +931,105 @@ mod tests {
                  Run `portman up jobs` in /Users/dev/acme/jobs.",
             ]
         );
+    }
+
+    fn no_answer(_: Request) -> std::future::Pending<Result<Response>> {
+        std::future::pending()
+    }
+
+    async fn returned<T>(call: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(3600), call)
+            .await
+            .expect("the call did not return within an hour")
+    }
+
+    fn assert_took(began: Instant, limit: Duration) {
+        let took = began.elapsed();
+        assert!(
+            took >= limit && took < limit + Duration::from_secs(1),
+            "took {took:?}, the limit is {limit:?}"
+        );
+    }
+
+    async fn restore_with_requests_unanswered(
+        interrupted: InterruptedServices,
+        daemon: &mut NewDaemon,
+        unanswered: impl Fn(&Request, &NewDaemon) -> bool,
+    ) -> RestartReport {
+        returned(interrupted.restore_through(|request| {
+            let answer = (!unanswered(&request, daemon)).then(|| daemon.answer(request));
+            async move {
+                match answer {
+                    Some(answer) => answer,
+                    None => std::future::pending().await,
+                }
+            }
+        }))
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_install_records_nothing_when_the_daemon_accepts_and_does_not_answer() {
+        let began = Instant::now();
+
+        let recorded = returned(InterruptedServices::record_from(no_answer)).await;
+
+        assert_eq!(recorded, None);
+        assert_took(began, Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_for_the_new_daemon_ends_after_30s_when_it_accepts_and_does_not_answer() {
+        let began = Instant::now();
+
+        let report =
+            returned(InterruptedServices(vec![up("web")]).restore_through(no_answer)).await;
+
+        assert_took(began, Duration::from_secs(30));
+        assert_eq!(
+            report.lines(),
+            [
+                "could not start web again: the new daemon did not answer within 30s. \
+                 Run `portman up web` in /Users/dev/acme/web."
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_install_gives_up_on_a_start_request_that_gets_no_answer() {
+        let mut daemon = NewDaemon::holding(&["web"]);
+        let began = Instant::now();
+
+        let report = restore_with_requests_unanswered(
+            InterruptedServices(vec![up("web")]),
+            &mut daemon,
+            |request, _| matches!(request, Request::ServiceUp { .. }),
+        )
+        .await;
+
+        assert_took(began, Duration::from_secs(30));
+        assert_eq!(
+            report.lines(),
+            [
+                "could not start web again: the new daemon did not answer the start request \
+                 within 30s. Run `portman up web` in /Users/dev/acme/web."
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_for_readiness_ends_after_120s_when_the_daemon_stops_answering() {
+        let mut daemon = NewDaemon::holding(&["web"]);
+        let began = Instant::now();
+
+        restore_with_requests_unanswered(
+            InterruptedServices(vec![up("web")]),
+            &mut daemon,
+            |_, daemon| !daemon.start_requests.is_empty(),
+        )
+        .await;
+
+        assert_took(began, Duration::from_secs(120));
     }
 
     #[test]
