@@ -123,7 +123,8 @@ the compose line `dns: [192.168.99.129]`.
 - A daemon stop, a lost Docker session, and a bridge mode change leave the
   container running. `portman bridge disable` removes it before it removes the
   `portman` network, also when the engine then keeps a network that is in
-  use. With no engine reachable at the disable, the daemon
+  use. A forwarder that could not be removed beside such a network stays
+  until the next disable. With no engine reachable at the disable, the daemon
   removes both in the next Docker session, unless the daemon restarts first.
 - A setup image without the label `dev.portman.dns-forwarder=1` cannot run the
   forwarder. The bridge then works as before, the daemon log and `portman

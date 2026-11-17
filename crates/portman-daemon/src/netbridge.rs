@@ -46,7 +46,8 @@
 //!     The forwarder outlives
 //!     the bridge and the daemon. Only the user's `Disable` removes it,
 //!     before the docker network. It goes also when the engine then keeps
-//!     a network that is in use.
+//!     a network that is in use. A forwarder that could not be removed
+//!     beside such a network stays until the next `Disable`.
 //!   - [`publish`] tells the rest of the daemon what the bridge is doing:
 //!     the [`phase`], the mode, and the interface index of the utun.
 
