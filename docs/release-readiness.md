@@ -152,9 +152,17 @@ the compose line `dns: [192.168.99.129]`.
   until the next disable. With no engine reachable at the disable, the daemon
   removes both in the next Docker session, unless the daemon restarts first.
 - `portman uninstall` removes the setup container, the forwarder and the
-  network by the same rules once the daemon is gone, and leaves the saved
-  bridge state as it is. With no engine reachable it prints the commands
-  that remove the forwarder and the network, and completes.
+  network by the same rules, and leaves the saved bridge state as it is. It
+  removes the plist and the daemon's binary first and waits up to 30 s for
+  the daemon to exit. It then asks the engine whether or not the daemon is
+  gone. A daemon that still runs a bridge holds the bridge's UDP port, and
+  nothing is removed then.
+- The uninstall gives the engine 35 s for the removal. When the engine gives
+  no answer in that time, when another process holds the port, or when the
+  engine refuses a removal, the uninstall prints the commands that remove the
+  forwarder and the network by hand, says when not to run them, and
+  completes. With no engine reachable it prints them only when the saved
+  bridge state is on.
 - A setup image without the label `dev.portman.dns-forwarder=1` cannot run the
   forwarder. The bridge then works as before, the daemon log and `portman
   doctor` name `portman bridge prepare` as the fix, and the daemon looks at

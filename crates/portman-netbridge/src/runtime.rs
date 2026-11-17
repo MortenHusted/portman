@@ -1295,8 +1295,8 @@ pub enum Leftovers {
     /// Also the DNS forwarder, which listens on the network's gateway
     /// address and goes before the network does. The engine removes a
     /// network that a stopped container refers to, and that container then
-    /// fails to start. Only a user's request to turn the bridge off calls
-    /// for this.
+    /// fails to start. Only a user's request calls for this: to turn the
+    /// bridge off, or to uninstall portman.
     SetupContainerAndNetwork,
 }
 

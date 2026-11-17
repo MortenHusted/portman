@@ -1,4 +1,5 @@
-//! What `portman uninstall` removes from the engine once the daemon is gone.
+//! What `portman uninstall` removes from the engine after it stopped the
+//! daemon.
 //!
 //! A daemon that stops leaves the setup container, the DNS forwarder and
 //! the `portman` network in the engine, so that containers keep their
