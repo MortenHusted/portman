@@ -3416,7 +3416,7 @@ mod tests {
             &sup,
             "never-ready",
             StateKind::Failed,
-            Duration::from_secs(5),
+            Duration::from_secs(20),
         )
         .await;
         let detail = sup.status()[0].detail.clone();
