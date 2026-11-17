@@ -1363,6 +1363,7 @@ mod tests {
 
     fn daemon_that_reports(
         phase: &'static str,
+        mode: &'static str,
         healths: &[Option<&'static str>],
     ) -> (
         impl FnMut() -> std::future::Ready<Option<Response>>,
@@ -1376,7 +1377,7 @@ mod tests {
             counted.set(counted.get() + 1);
             std::future::ready(health.map(|health| {
                 let json = format!(
-                    r#"{{"kind":"status","version":"0.1.7","bridge_enabled":true,"bridge_phase":"{phase}","bridge_mode":"docker","bridge_assessment":"{health}"}}"#
+                    r#"{{"kind":"status","version":"0.1.7","bridge_enabled":true,"bridge_phase":"{phase}","bridge_mode":"{mode}","bridge_assessment":"{health}"}}"#
                 );
                 serde_json::from_str(&json).unwrap()
             }))
@@ -1392,7 +1393,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn doctor_reads_the_status_again_for_an_up_bridge_until_its_health_is_healthy() {
-        let (read, reads) = daemon_that_reports("up", &[Some("routes_missing"), Some("healthy")]);
+        let turns_healthy = [Some("routes_missing"), Some("healthy")];
+        let (read, reads) = daemon_that_reports("up", "docker", &turns_healthy);
         let asked_at = tokio::time::Instant::now();
 
         let rendered = rendered_with(settled_daemon(read).await);
@@ -1410,7 +1412,7 @@ mod tests {
     async fn doctor_waits_a_little_more_than_one_health_period_for_a_health_that_stays_behind() {
         let period = BridgeAssessment::PERIOD;
         for health in ["routes_missing", "tunnel_dead", "offline", "unknown"] {
-            let (read, _) = daemon_that_reports("up", &[Some(health)]);
+            let (read, _) = daemon_that_reports("up", "docker", &[Some(health)]);
             let asked_at = tokio::time::Instant::now();
 
             let rendered = rendered_with(settled_daemon(read).await);
@@ -1430,34 +1432,60 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn doctor_reads_the_status_once_where_the_health_is_not_behind_an_up_bridge() {
+    async fn doctor_reads_the_status_once_where_no_later_health_can_change_its_verdict() {
         use BridgeAssessment::{Healthy, RoutesMissing};
         let turns_healthy = [Some("routes_missing"), Some("healthy")];
         let table = [
             (
                 "up",
+                "docker",
                 &[Some("healthy"), Some("routes_missing")][..],
                 Some(Healthy),
             ),
-            ("disabled", &turns_healthy[..], Some(RoutesMissing)),
+            ("up", "opt_in", &turns_healthy[..], Some(RoutesMissing)),
+            ("up", "all", &turns_healthy[..], Some(RoutesMissing)),
             (
-                "waiting_for_docker",
+                "disabled",
+                "docker",
                 &turns_healthy[..],
                 Some(RoutesMissing),
             ),
-            ("starting", &turns_healthy[..], Some(RoutesMissing)),
-            ("stopping", &turns_healthy[..], Some(RoutesMissing)),
-            ("up", &[None][..], None),
+            (
+                "waiting_for_docker",
+                "docker",
+                &turns_healthy[..],
+                Some(RoutesMissing),
+            ),
+            (
+                "starting",
+                "docker",
+                &turns_healthy[..],
+                Some(RoutesMissing),
+            ),
+            (
+                "stopping",
+                "docker",
+                &turns_healthy[..],
+                Some(RoutesMissing),
+            ),
+            ("up", "docker", &[None][..], None),
         ];
-        for (phase, healths, taken) in table {
-            let (read, reads) = daemon_that_reports(phase, healths);
+        for (phase, mode, healths, taken) in table {
+            let (read, reads) = daemon_that_reports(phase, mode, healths);
             let asked_at = tokio::time::Instant::now();
 
             let daemon = settled_daemon(read).await;
 
-            assert_eq!(daemon.bridge_assessment, taken, "{phase} {healths:?}");
-            assert_eq!(reads.get(), 1, "{phase} {healths:?}");
-            assert_eq!(asked_at.elapsed(), Duration::ZERO, "{phase} {healths:?}");
+            assert_eq!(
+                daemon.bridge_assessment, taken,
+                "{phase} {mode} {healths:?}"
+            );
+            assert_eq!(reads.get(), 1, "{phase} {mode} {healths:?}");
+            assert_eq!(
+                asked_at.elapsed(),
+                Duration::ZERO,
+                "{phase} {mode} {healths:?}"
+            );
         }
     }
 
