@@ -296,6 +296,21 @@ mod tests {
         assert!(issue(&reloaded, "run-2", START + 120).is_err());
     }
     #[test]
+    fn revoked_grant_is_denied_and_cannot_be_issued_again_before_it_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grants.json");
+        let clock = TestClock::at(START);
+        let store = GrantStore::with_clock(path.clone(), clock.clone());
+        issue(&store, "run-1", START + 3600).unwrap();
+        assert!(store.permits("qwen.localhost", "route-v1", &headers()));
+        store.revoke("run-1".into()).unwrap();
+        assert!(!store.permits("qwen.localhost", "route-v1", &headers()));
+        assert!(issue(&store, "run-1", START + 3600).is_err());
+        let reloaded = GrantStore::with_clock(path, clock);
+        assert!(!reloaded.permits("qwen.localhost", "route-v1", &headers()));
+        assert!(issue(&reloaded, "run-1", START + 3600).is_err());
+    }
+    #[test]
     fn concurrent_callers_keep_a_valid_grant_while_the_clock_advances() {
         let dir = tempfile::tempdir().unwrap();
         let clock = TestClock::at(START);
