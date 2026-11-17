@@ -3903,6 +3903,21 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn the_stop_of_a_bridge_on_a_young_session_reads_as_a_removal_that_runs() {
+        let mut rig = Rig::up().await;
+        rig.hold_stops();
+
+        rig.send(Control::Disable).await;
+        assert_eq!(rig.next_stop().await, Stop::RemovesNetwork);
+
+        assert_eq!(rig.handle.cleanup(), Some(BridgeCleanup::Pending));
+
+        rig.end_stops();
+        rig.reaches(BridgePhase::Disabled).await;
+        assert_eq!(rig.handle.cleanup(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn an_enable_inside_the_head_start_is_served_at_once_and_ends_the_debt() {
         let mut rig = Rig::boot_on(Some(OWES_A_CLEANUP));
         tokio::time::sleep(HEAD_START / 2).await;
