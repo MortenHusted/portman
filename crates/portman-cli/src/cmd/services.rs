@@ -1163,6 +1163,35 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_service_is_not_reported_from_an_answer_that_came_before_the_daemon_stopped() {
+        let mut daemon = NewDaemon::holding(&["web"]);
+        daemon
+            .ends
+            .insert("web".into(), (ServiceState::Starting, String::new()));
+        let mut reads_after_start = 0;
+
+        let report = InterruptedServices(vec![up("web")])
+            .restore_through(|request| {
+                if !daemon.start_requests.is_empty() && matches!(request, Request::ServiceStatus) {
+                    reads_after_start += 1;
+                    if reads_after_start == 3 {
+                        daemon.refused_connections = usize::MAX;
+                    }
+                }
+                std::future::ready(daemon.answer(request))
+            })
+            .await;
+
+        assert_eq!(
+            report.lines(),
+            [
+                "could not start web again: the new daemon stopped answering after the start \
+                 request. Run `portman up web` in /Users/dev/acme/web."
+            ]
+        );
+    }
+
     #[test]
     fn status_says_when_a_failed_bridge_start_runs_again() {
         let line = |json: &str| match serde_json::from_str(json).unwrap() {
