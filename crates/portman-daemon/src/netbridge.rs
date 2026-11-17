@@ -17,10 +17,10 @@
 //!     or a retry timer. Before each step it takes the messages that are in
 //!     the channel. A message that arrives later waits for the step to end:
 //!     the loop does not cancel a step in flight. The bridge gives the
-//!     engine [`ENGINE_STEP_BUDGET`] for each step and
-//!     [`ENGINE_START_BUDGET`] for a start, so a message waits no longer
-//!     than that for an engine that froze. A start that is cut there fails
-//!     and is retried, and a cleanup stays owed.
+//!     engine [`runtime::ENGINE_STEP_BUDGET`] for each step and
+//!     [`runtime::ENGINE_START_BUDGET`] for a start, so a message waits no
+//!     longer than that for an engine that froze. A start that is cut
+//!     there fails and is retried, and a cleanup stays owed.
 //!   - a bridge is built on one engine session. When no session exists the
 //!     loop ends the bridge and asks the engine nothing. When another
 //!     session opens, the loop keeps the bridge if that engine says within
@@ -72,8 +72,7 @@ use bollard::Docker;
 use portman_core::netbridge_state::{self, NetbridgeState};
 use portman_core::NetbridgeMode;
 use portman_netbridge::runtime::{
-    Cleanup, DnsForwarder, Leftovers, Runtime, RuntimeOptions, ENGINE_START_BUDGET,
-    ENGINE_STEP_BUDGET,
+    self, CleanupEnd, DnsForwarder, Leftovers, Runtime, RuntimeOptions,
 };
 use portman_netbridge::tunnel::{Keypair, HOST_WG_LISTEN_PORT};
 use tokio::sync::{mpsc, watch, Notify, RwLock};
@@ -94,8 +93,8 @@ const ENABLE_ENV: &str = "PORTMAN_NETBRIDGE";
 /// head, so a VM that froze with its socket open would never end this
 /// check. The budget bounds this check alone. A later step that asks the
 /// same engine holds the loop, and with it every control message, for the
-/// [`ENGINE_STEP_BUDGET`] that the bridge gives the engine for a step, or
-/// for the [`ENGINE_START_BUDGET`] of a start.
+/// [`runtime::ENGINE_STEP_BUDGET`] that the bridge gives the engine for a
+/// step, or for the [`runtime::ENGINE_START_BUDGET`] of a start.
 const SETUP_CHECK_BUDGET: Duration = Duration::from_secs(3);
 
 const RETRY_BASE: Duration = Duration::from_secs(5);
@@ -417,12 +416,25 @@ impl Debt {
     }
 
     /// A cleanup that did not finish is not tried again on its session.
-    fn settle(&mut self, session: Session, leftovers: Leftovers, cleanup: Cleanup) {
+    fn settle(&mut self, session: Session, leftovers: Leftovers, swept: Swept) {
         self.swept = Some(session);
-        if leftovers == Leftovers::SetupContainerAndNetwork && cleanup == Cleanup::Complete {
+        let complete = swept == Swept::Ended(CleanupEnd::Complete);
+        if leftovers == Leftovers::SetupContainerAndNetwork && complete {
             self.network = false;
         }
     }
+}
+
+/// How a cleanup that the loop planned ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Swept {
+    Ended(CleanupEnd),
+    /// The UDP port that a bridge listens on was taken, so the engine was
+    /// not asked. Another daemon's bridge holds that port, and so can a
+    /// process that is not portman.
+    PortTaken,
+    /// Another session existed at the call, so the engine was not asked.
+    SessionEnded,
 }
 
 /// What the bridge should be: the intent the user saved, with the
@@ -591,14 +603,14 @@ async fn converge<E: BridgeEngine>(
             }
             Step::Teardown => {
                 if let Some(old) = running.take() {
-                    let cleanup = old.bridge.shutdown_and_remove_network().await;
+                    let ended = old.bridge.shutdown_and_remove_network().await;
                     let asked_for = Leftovers::SetupContainerAndNetwork;
-                    debt.settle(old.built.session, asked_for, cleanup);
+                    debt.settle(old.built.session, asked_for, Swept::Ended(ended));
                 }
             }
             Step::Sweep(session, leftovers) => {
-                let cleanup = engine.remove_leftovers(session, leftovers).await;
-                debt.settle(session, leftovers, cleanup);
+                let swept = engine.remove_leftovers(session, leftovers).await;
+                debt.settle(session, leftovers, swept);
             }
         }
     }
@@ -772,11 +784,10 @@ pub(crate) trait BridgeEngine {
     async fn runs_container(&self, session: Session, id: &str) -> bool;
 
     /// Removes `leftovers` that carry portman's label from the engine of
-    /// `session`, and says whether any is still owed. Does nothing when another
+    /// `session`, and says how that ended. Does nothing when another
     /// session exists at the call, or when the UDP port that a bridge
-    /// listens on is taken. Another daemon's bridge holds that port, and so
-    /// can a process that is not portman.
-    async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) -> Cleanup;
+    /// listens on is taken.
+    async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) -> Swept;
 }
 
 /// A bridge that is up. The control loop holds it only through this, so
@@ -794,9 +805,9 @@ pub(crate) trait Bridge {
     /// Stops the bridge and keeps the docker network and the DNS forwarder.
     async fn shutdown(self);
     /// Stops the bridge and removes the DNS forwarder and the docker
-    /// network. Says whether any of them is still owed, as
-    /// [`BridgeEngine::remove_leftovers`] does.
-    async fn shutdown_and_remove_network(self) -> Cleanup;
+    /// network, and says how that ended. The bridge holds the listen port,
+    /// so its engine is always asked.
+    async fn shutdown_and_remove_network(self) -> CleanupEnd;
 }
 
 /// The engine behind the daemon's link. Its bridges listen on UDP port
@@ -857,15 +868,26 @@ impl BridgeEngine for LinkedEngine {
             .is_ok_and(|container| container.state.and_then(|state| state.running) == Some(true))
     }
 
-    async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) -> Cleanup {
+    async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) -> Swept {
         let Ok(docker) = docker_of(&self.link, session) else {
             info!(
                 session = session.0,
                 "netbridge cleanup skipped: the engine session that it was planned on has ended"
             );
-            return Cleanup::Owed;
+            return Swept::SessionEnded;
         };
-        portman_netbridge::runtime::remove_leftovers(&docker, self.listen_port, leftovers).await
+        let listen_port = self.listen_port;
+        match runtime::try_remove_leftovers(&docker, listen_port, leftovers).await {
+            Ok(ended) => Swept::Ended(ended),
+            Err(err) => {
+                info!(
+                    listen_port,
+                    %err,
+                    "netbridge leftovers stay in the engine: the listen port is taken, and its holder may run a bridge on them"
+                );
+                Swept::PortTaken
+            }
+        }
     }
 }
 
@@ -899,7 +921,7 @@ impl Bridge for Runtime {
         Runtime::shutdown(self).await;
     }
 
-    async fn shutdown_and_remove_network(self) -> Cleanup {
+    async fn shutdown_and_remove_network(self) -> CleanupEnd {
         Runtime::shutdown_and_remove_network(self).await
     }
 }
@@ -937,6 +959,7 @@ fn forces_enabled(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runtime::{ENGINE_START_BUDGET, ENGINE_STEP_BUDGET};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tempfile::{tempdir, TempDir};
@@ -1277,7 +1300,7 @@ mod tests {
         /// How the next ensure ends.
         ensure: Arc<Mutex<Ensure>>,
         port_held: Arc<AtomicBool>,
-        cleanups_end: Arc<Mutex<Cleanup>>,
+        cleanups_end: Arc<Mutex<CleanupEnd>>,
     }
 
     struct Forwarding {
@@ -1312,7 +1335,7 @@ mod tests {
         seen: mpsc::UnboundedSender<Attempt>,
         swept: mpsc::UnboundedSender<(Session, Leftovers)>,
         /// How each cleanup ends.
-        cleanups_end: Arc<Mutex<Cleanup>>,
+        cleanups_end: Arc<Mutex<CleanupEnd>>,
         /// `None` fails every start.
         probe: Option<Probe>,
     }
@@ -1371,9 +1394,9 @@ mod tests {
             probe.setup_container.lock().unwrap().as_deref() == Some(id)
         }
 
-        async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) -> Cleanup {
+        async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) -> Swept {
             let _ = self.swept.send((session, leftovers));
-            *self.cleanups_end.lock().unwrap()
+            Swept::Ended(*self.cleanups_end.lock().unwrap())
         }
     }
 
@@ -1444,7 +1467,7 @@ mod tests {
             self.free_port();
         }
 
-        async fn shutdown_and_remove_network(mut self) -> Cleanup {
+        async fn shutdown_and_remove_network(mut self) -> CleanupEnd {
             self.probe.clone().stop(Stop::RemovesNetwork).await;
             self.free_port();
             *self.probe.cleanups_end.lock().unwrap()
@@ -1458,7 +1481,7 @@ mod tests {
         state_path: PathBuf,
         attempts: mpsc::UnboundedReceiver<Attempt>,
         sweeps: mpsc::UnboundedReceiver<(Session, Leftovers)>,
-        cleanups_end: Arc<Mutex<Cleanup>>,
+        cleanups_end: Arc<Mutex<CleanupEnd>>,
         stops: mpsc::UnboundedReceiver<Stop>,
         stops_may_end: watch::Sender<bool>,
         phase_at_utun_ask: Arc<Mutex<Vec<BridgePhase>>>,
@@ -1500,7 +1523,7 @@ mod tests {
             let state_path = dir.path().join("netbridge.json");
             let (seen, attempts) = mpsc::unbounded_channel();
             let (swept, sweeps) = mpsc::unbounded_channel();
-            let cleanups_end = Arc::new(Mutex::new(Cleanup::Complete));
+            let cleanups_end = Arc::new(Mutex::new(CleanupEnd::Complete));
             let (stop_seen, stops) = mpsc::unbounded_channel();
             let (stops_may_end, may_end) = watch::channel(true);
             let phase_at_utun_ask = Arc::new(Mutex::new(Vec::new()));
@@ -1627,7 +1650,7 @@ mod tests {
             self.container_asks.lock().unwrap().clone()
         }
 
-        fn cleanups_end(&self, cleanup: Cleanup) {
+        fn cleanups_end(&self, cleanup: CleanupEnd) {
             *self.cleanups_end.lock().unwrap() = cleanup;
         }
 
@@ -1894,7 +1917,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_stop_that_left_the_network_owed_is_followed_up_at_the_next_session() {
         let mut rig = Rig::up().await;
-        rig.cleanups_end(Cleanup::Owed);
+        rig.cleanups_end(CleanupEnd::Failed);
 
         rig.send(Control::Disable).await;
 
@@ -1969,7 +1992,7 @@ mod tests {
             state_path: PathBuf::new(),
             seen,
             swept,
-            cleanups_end: Arc::new(Mutex::new(Cleanup::Complete)),
+            cleanups_end: Arc::new(Mutex::new(CleanupEnd::Complete)),
             probe: None,
         };
         (engine, sessions)
@@ -2585,7 +2608,7 @@ mod tests {
             .await;
 
         assert_eq!(fake.calls(), [] as [&str; 0]);
-        assert_eq!(cleanup, Cleanup::Owed);
+        assert_eq!(cleanup, Swept::SessionEnded);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2599,7 +2622,7 @@ mod tests {
             .await;
 
         assert_eq!(fake.calls(), [] as [&str; 0]);
-        assert_eq!(cleanup, Cleanup::Owed);
+        assert_eq!(cleanup, Swept::PortTaken);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2659,7 +2682,7 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("the cleanup waited for the engine at {frozen_at}"));
 
-            assert_eq!(cleanup, Cleanup::Owed, "{frozen_at}");
+            assert_eq!(cleanup, Swept::Ended(CleanupEnd::NoAnswer), "{frozen_at}");
             assert_eq!(asked.elapsed(), ENGINE_STEP_BUDGET, "{frozen_at}");
             let warnings = logged.take_warnings();
             assert_eq!(warnings.len(), 1, "{frozen_at} {warnings:?}");
@@ -2735,7 +2758,7 @@ mod tests {
 
             let cleanup = engine.remove_leftovers(Session(1), leftovers).await;
 
-            assert_eq!(cleanup, Cleanup::Complete, "{leftovers:?}");
+            assert_eq!(cleanup, Swept::Ended(CleanupEnd::Complete), "{leftovers:?}");
             let calls = fake.calls();
             let removed: Vec<_> = calls
                 .iter()
@@ -2786,25 +2809,25 @@ mod tests {
         let own_container = Some(OWN_SETUP_CONTAINER);
         // (setup container, network, asked for) → how the cleanup ends
         let cases = [
-            (None, None, both, Cleanup::Complete),
+            (None, None, both, CleanupEnd::Complete),
             (
                 own_container,
                 Some(anothers_network),
                 both,
-                Cleanup::Complete,
+                CleanupEnd::Complete,
             ),
             (
                 own_container,
                 Some(unreadable),
                 container_only,
-                Cleanup::Complete,
+                CleanupEnd::Complete,
             ),
-            (own_container, Some(unreadable), both, Cleanup::Owed),
+            (own_container, Some(unreadable), both, CleanupEnd::Failed),
             (
                 Some(anothers_container),
                 Some(OWN_NETWORK),
                 both,
-                Cleanup::Complete,
+                CleanupEnd::Complete,
             ),
         ];
         for (container, network, leftovers, want) in cases {
@@ -2818,7 +2841,11 @@ mod tests {
 
             let cleanup = engine.remove_leftovers(Session(1), leftovers).await;
 
-            assert_eq!(cleanup, want, "{container:?} {network:?} {leftovers:?}");
+            assert_eq!(
+                cleanup,
+                Swept::Ended(want),
+                "{container:?} {network:?} {leftovers:?}"
+            );
             let calls = fake.calls();
             let removed = |path: &str| calls.contains(&format!("DELETE {path}"));
             assert_eq!(
@@ -2845,13 +2872,13 @@ mod tests {
         let connection_cut = None;
         // the removals that fail, and how → how the cleanup ends
         let cases = [
-            (vec![(NETWORK, Some(IN_USE))], Cleanup::Complete),
-            (vec![(NETWORK, Some(ENGINE_FAILED))], Cleanup::Owed),
-            (vec![(NETWORK, connection_cut)], Cleanup::Owed),
-            (vec![(container, Some(ENGINE_FAILED))], Cleanup::Owed),
+            (vec![(NETWORK, Some(IN_USE))], CleanupEnd::Complete),
+            (vec![(NETWORK, Some(ENGINE_FAILED))], CleanupEnd::Failed),
+            (vec![(NETWORK, connection_cut)], CleanupEnd::Failed),
+            (vec![(container, Some(ENGINE_FAILED))], CleanupEnd::Failed),
             (
                 vec![(container, Some(ENGINE_FAILED)), (NETWORK, Some(IN_USE))],
-                Cleanup::Complete,
+                CleanupEnd::Complete,
             ),
         ];
         for (failures, want) in cases {
@@ -2864,7 +2891,7 @@ mod tests {
                 .remove_leftovers(Session(1), SetupContainerAndNetwork)
                 .await;
 
-            assert_eq!(cleanup, want, "{failures:?}");
+            assert_eq!(cleanup, Swept::Ended(want), "{failures:?}");
         }
     }
 
@@ -3001,14 +3028,14 @@ mod tests {
         let both = SetupContainerAndNetwork;
         let network_in_use = Some((NETWORK, IN_USE));
         let forwarder_stays = Some((FORWARDER_BY_ID, ENGINE_FAILED));
-        let (complete, owed) = (Cleanup::Complete, Cleanup::Owed);
+        let (complete, failed) = (CleanupEnd::Complete, CleanupEnd::Failed);
         // (forwarder, the removal that fails, asked for)
         //     → (how the cleanup ends, the engine was asked to remove the forwarder)
         let cases = [
             (OWN_FORWARDER, None, both, complete, true),
             (OWN_FORWARDER, network_in_use, both, complete, true),
-            (OWN_FORWARDER, forwarder_stays, both, owed, true),
-            (unreadable, None, both, owed, false),
+            (OWN_FORWARDER, forwarder_stays, both, failed, true),
+            (unreadable, None, both, failed, false),
             (unreadable, network_in_use, both, complete, false),
             (anothers_container, None, both, complete, false),
             (unreadable, None, SetupContainer, complete, false),
@@ -3023,7 +3050,7 @@ mod tests {
 
             let cleanup = engine.remove_leftovers(Session(1), leftovers).await;
 
-            assert_eq!(cleanup, want, "{case}");
+            assert_eq!(cleanup, Swept::Ended(want), "{case}");
             let calls = fake.calls();
             let removal_of = |path: &str| {
                 calls
@@ -3155,7 +3182,7 @@ mod tests {
         assert_eq!(rig.next_sweep().await, (Session(1), SetupContainer));
         let network_owed = |session| (Session(session), SetupContainerAndNetwork);
 
-        rig.cleanups_end(Cleanup::Owed);
+        rig.cleanups_end(CleanupEnd::Failed);
         rig.send(Control::Disable).await;
         assert_eq!(rig.next_sweep().await, network_owed(1));
         rig.no_sweep_follows().await;
@@ -3164,7 +3191,7 @@ mod tests {
         assert_eq!(rig.next_sweep().await, network_owed(2));
         rig.no_sweep_follows().await;
 
-        rig.cleanups_end(Cleanup::Complete);
+        rig.cleanups_end(CleanupEnd::Complete);
         rig.engine_session(Some(Session(3)));
         assert_eq!(rig.next_sweep().await, network_owed(3));
         rig.no_sweep_follows().await;
