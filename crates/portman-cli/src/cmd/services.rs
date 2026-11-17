@@ -551,8 +551,9 @@ where
             Ok(Ok(Response::ServiceStatuses { services })) => Some(services),
             _ => None,
         };
-        let next_request_gets_a_full_pause = Instant::now() + POLL_PAUSE * 2 <= deadline;
-        if rows.as_deref().is_some_and(&done) || !next_request_gets_a_full_pause {
+        let next_request_starts = Instant::now() + POLL_PAUSE;
+        let next_request_can_be_answered = next_request_starts + POLL_PAUSE <= deadline;
+        if rows.as_deref().is_some_and(&done) || !next_request_can_be_answered {
             return rows;
         }
         sleep(POLL_PAUSE).await;
