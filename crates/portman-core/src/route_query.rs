@@ -1,5 +1,4 @@
-//! The question that the bridge health and `portman doctor` put to macOS
-//! `route(8)` about a Docker subnet.
+//! The question that portman puts to macOS `route(8)` about a Docker subnet.
 
 /// The arguments for `/sbin/route` that ask which route carries the network
 /// address of the IPv4 subnet `cidr`.
