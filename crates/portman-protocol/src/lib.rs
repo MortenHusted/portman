@@ -251,7 +251,7 @@ impl BridgeCleanup {
                 "portman could not remove everything that the bridge left in Docker: the daemon log says what stays and why. {again}"
             ),
             BridgeCleanup::PortTaken => format!(
-                "portman has not removed {leftovers}: another program holds the UDP port of the bridge and can run a bridge on them. It does not try again until the next `portman bridge disable`"
+                "portman has not removed {leftovers}: another program held the UDP port of the bridge when portman came to remove them, and may run a bridge on them. portman does not try again until the next `portman bridge disable`"
             ),
             BridgeCleanup::Unknown => {
                 format!("portman could not remove {leftovers}; the daemon log says why")
@@ -1677,8 +1677,9 @@ mod tests {
         assert_eq!(
             BridgeCleanup::PortTaken.in_words(),
             "portman has not removed the dns forwarder and the `portman` network: another \
-             program holds the UDP port of the bridge and can run a bridge on them. It does \
-             not try again until the next `portman bridge disable`"
+             program held the UDP port of the bridge when portman came to remove them, and \
+             may run a bridge on them. portman does not try again until the next `portman \
+             bridge disable`"
         );
         assert_eq!(
             BridgeCleanup::Failed.in_words(),

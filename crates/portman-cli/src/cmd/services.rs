@@ -1429,8 +1429,9 @@ mod tests {
             .as_deref(),
             Some(
                 "bridge cleanup:  portman has not removed the dns forwarder and the `portman` \
-                 network: another program holds the UDP port of the bridge and can run a \
-                 bridge on them. It does not try again until the next `portman bridge disable`"
+                 network: another program held the UDP port of the bridge when portman came \
+                 to remove them, and may run a bridge on them. portman does not try again \
+                 until the next `portman bridge disable`"
             )
         );
     }
