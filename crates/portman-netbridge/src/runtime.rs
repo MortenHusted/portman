@@ -954,12 +954,12 @@ async fn remove_existing_setup_container(docker: &Docker, _held: &ListenPort) ->
 /// Poll until the setup container no longer exists. Bounded: if docker is wedged
 /// we want a named error, not a hung daemon start.
 async fn wait_for_setup_container_gone(docker: &Docker) -> Result<()> {
-    let deadline = std::time::Instant::now() + SETUP_REMOVE_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + SETUP_REMOVE_TIMEOUT;
     loop {
         if setup_container_snapshot(docker).await?.is_none() {
             return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "netbridge setup container `{SETUP_CONTAINER}` still present {}s after removal",
                 SETUP_REMOVE_TIMEOUT.as_secs()
