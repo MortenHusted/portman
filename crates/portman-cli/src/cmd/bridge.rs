@@ -64,7 +64,7 @@ fn bridge_status_lines(
 }
 
 pub(crate) async fn cmd_doctor() -> Result<()> {
-    let daemon = doctor::DaemonSnapshot::from_status(request(Request::Status).await.ok());
+    let daemon = doctor::settled_daemon(|| async { request(Request::Status).await.ok() }).await;
     let routes = match request(Request::ListEntries).await {
         Ok(Response::Entries { entries }) => entries,
         _ => Vec::new(),

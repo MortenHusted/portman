@@ -70,6 +70,15 @@ impl DaemonSnapshot {
     }
 }
 
+/// The status that doctor gives its verdict on. `read` asks the daemon for
+/// its status, and gives `None` for a daemon that did not answer.
+pub(crate) async fn settled_daemon<F>(mut read: impl FnMut() -> F) -> DaemonSnapshot
+where
+    F: Future<Output = Option<Response>>,
+{
+    DaemonSnapshot::from_status(read().await)
+}
+
 /// Why a `docker` CLI call gave no output to read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DockerCliError {
@@ -1225,6 +1234,109 @@ mod tests {
                 "phase={phase:?}\n{rendered}"
             );
             assert!(guidance.contains(names), "phase={phase:?}\n{rendered}");
+        }
+    }
+
+    /// Answers each status read with the next of `healths`, and with the
+    /// last one from then on. `None` is a daemon that does not answer.
+    fn daemon_that_reports(
+        phase: &'static str,
+        healths: &[Option<&'static str>],
+    ) -> (
+        impl FnMut() -> std::future::Ready<Option<Response>>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+    ) {
+        let healths = healths.to_vec();
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = reads.clone();
+        let read = move || {
+            let health = healths[counted.get().min(healths.len() - 1)];
+            counted.set(counted.get() + 1);
+            std::future::ready(health.map(|health| {
+                let json = format!(
+                    r#"{{"kind":"status","version":"0.1.7","bridge_enabled":true,"bridge_phase":"{phase}","bridge_mode":"docker","bridge_assessment":"{health}"}}"#
+                );
+                serde_json::from_str(&json).unwrap()
+            }))
+        };
+        (read, reads)
+    }
+
+    fn rendered_with(daemon: DaemonSnapshot) -> String {
+        let mut report = ready_but_for_the_bridge(BridgePhase::Up);
+        report.daemon = daemon;
+        render_report(&report)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn doctor_reads_the_status_again_for_an_up_bridge_until_its_health_is_healthy() {
+        let (read, reads) = daemon_that_reports("up", &[Some("routes_missing"), Some("healthy")]);
+        let asked_at = tokio::time::Instant::now();
+
+        let rendered = rendered_with(settled_daemon(read).await);
+
+        let daemon_line = "daemon: ok v0.1.7 bridge: healthy netbridge: up mode: docker";
+        assert!(
+            rendered.contains(&format!("replacement: ready\n{daemon_line}\n")),
+            "{rendered}"
+        );
+        assert_eq!(reads.get(), 2);
+        assert!(asked_at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn doctor_waits_a_little_more_than_one_health_period_for_a_health_that_stays_behind() {
+        let period = BridgeAssessment::PERIOD;
+        for health in ["routes_missing", "tunnel_dead", "offline", "unknown"] {
+            let (read, _) = daemon_that_reports("up", &[Some(health)]);
+            let asked_at = tokio::time::Instant::now();
+
+            let rendered = rendered_with(settled_daemon(read).await);
+
+            let waited = asked_at.elapsed();
+            assert!(
+                waited > period && waited <= period + period / 4,
+                "{health}: waited {waited:?}"
+            );
+            let daemon_line =
+                format!("daemon: ok v0.1.7 bridge: {health} netbridge: up mode: docker");
+            assert!(
+                rendered.contains(&format!("replacement: needs attention\n{daemon_line}\n")),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn doctor_reads_the_status_once_where_the_health_is_not_behind_an_up_bridge() {
+        use BridgeAssessment::{Healthy, RoutesMissing};
+        let turns_healthy = [Some("routes_missing"), Some("healthy")];
+        // (the phase, the healths that the daemon reports in turn) → the health doctor takes
+        let table = [
+            (
+                "up",
+                &[Some("healthy"), Some("routes_missing")][..],
+                Some(Healthy),
+            ),
+            ("disabled", &turns_healthy[..], Some(RoutesMissing)),
+            (
+                "waiting_for_docker",
+                &turns_healthy[..],
+                Some(RoutesMissing),
+            ),
+            ("starting", &turns_healthy[..], Some(RoutesMissing)),
+            ("stopping", &turns_healthy[..], Some(RoutesMissing)),
+            ("up", &[None][..], None),
+        ];
+        for (phase, healths, taken) in table {
+            let (read, reads) = daemon_that_reports(phase, healths);
+            let asked_at = tokio::time::Instant::now();
+
+            let daemon = settled_daemon(read).await;
+
+            assert_eq!(daemon.bridge_assessment, taken, "{phase} {healths:?}");
+            assert_eq!(reads.get(), 1, "{phase} {healths:?}");
+            assert_eq!(asked_at.elapsed(), Duration::ZERO, "{phase} {healths:?}");
         }
     }
 
