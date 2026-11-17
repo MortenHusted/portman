@@ -3404,7 +3404,7 @@ mod tests {
         let sup = test_supervisor(&dir, CollectSink::new());
         let port = free_port(); // never bound
 
-        let mut svc = def("never-ready", &["/bin/sleep", "10"], dir.path());
+        let mut svc = def("never-ready", &["/bin/sleep", "30"], dir.path());
         svc.ready = ReadyCheck::Port(port);
         svc.restart = RestartPolicy::Never;
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
