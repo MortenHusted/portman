@@ -272,6 +272,7 @@ struct UpService {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct RestartReport {
     started: Vec<String>,
+    in_backoff: Vec<NotStarted>,
     not_started: Vec<NotStarted>,
 }
 
@@ -400,7 +401,11 @@ impl InterruptedServices {
                 Some(row) if row.state == ServiceState::Ready => report.started.push(service.name),
                 Some(row) => {
                     let why = why_not_ready(row);
-                    report.not_started.push(NotStarted { service, why });
+                    let outcome = match row.state {
+                        ServiceState::Backoff => &mut report.in_backoff,
+                        _ => &mut report.not_started,
+                    };
+                    outcome.push(NotStarted { service, why });
                 }
                 None => report.fail(vec![service], "the new daemon no longer lists it"),
             }
@@ -426,6 +431,13 @@ impl RestartReport {
         let mut lines = Vec::new();
         if !self.started.is_empty() {
             lines.push(format!("started again: {}", self.started.join(", ")));
+        }
+        for NotStarted { service, why } in &self.in_backoff {
+            lines.push(format!(
+                "could not start {name} again yet: {why}. The daemon keeps trying. \
+                 See `portman logs {name}`, or stop it with `portman down {name}`.",
+                name = service.name
+            ));
         }
         for NotStarted { service, why } in &self.not_started {
             let place = match &service.root {
@@ -454,7 +466,7 @@ fn is_up(status: &ServiceStatusInfo) -> bool {
 
 fn start_ended(row: &ServiceStatusInfo) -> bool {
     match row.state {
-        ServiceState::Ready | ServiceState::Failed => true,
+        ServiceState::Ready | ServiceState::Failed | ServiceState::Backoff => true,
         ServiceState::Stopped => !row.desired_up,
         _ => false,
     }
