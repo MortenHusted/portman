@@ -407,7 +407,7 @@ The forwarder sends only names under your managed TLDs to portman. Every other n
 
 HTTP routes need no extra network. Their names resolve to portman's proxy at `192.168.99.1`, which a container on a compose network reaches without joining another network.
 
-A TCP route to a container resolves to the address of that container. Docker blocks traffic between two bridge networks, so a container connects to such a route by name only when it also joins the `portman` network:
+A TCP route resolves to the address of its target. When that target is a container on the `portman` network, registered at its address there, another container connects to the route by name only when it also joins the `portman` network, because Docker blocks traffic between two bridge networks:
 
 ```yaml
 services:
@@ -421,26 +421,29 @@ networks:
     external: true
 ```
 
-For a TCP service on the host, keep using `host.docker.internal:<port>`.
+Joining the `portman` network does not make a TCP route to any other target reachable. For a TCP service on the host, keep using `host.docker.internal:<port>`.
+
+`portman tld add` and `portman tld remove` make portman replace the forwarder with one for the new set of TLDs. Lookups through the forwarder fail for the moment that this takes.
 
 ### When portman is down
 
-The forwarder keeps running when the daemon stops or the bridge is down. Its restart policy is `always`, so the engine starts it again after a VM restart. The times below were measured on colima with Docker Engine 29.
+The forwarder keeps running when the daemon stops or the bridge is down. Its restart policy is `always`, which asks the engine to start it again after a VM restart. The times below are prototype measurements, taken on colima with Docker Engine 29 from a `dnsmasq` with the same two upstreams for a managed TLD and the first of them down.
 
 | Lookup | While portman is down |
 |---|---|
 | A name outside your managed TLDs | Resolves as before, with no added delay. |
 | `host.docker.internal` | Resolves as before, with no added delay. |
-| A portman hostname | Fails, after about 10 s with musl and 16 s with glibc. |
-| Another name under a managed TLD | Resolves, after 5 to 9 s. The forwarder waits for portman before it asks the VM's resolver. |
+| A name under a managed TLD | Takes 5 to 9 s. The forwarder waits for portman before it asks the VM's resolver, which holds no portman hostname. |
 
-`portman bridge disable` removes the forwarder together with the `portman` network. A container that still has `192.168.99.129` as its only resolver then resolves no name at all. Remove the `dns` line from that container, or enable the bridge again.
+`portman bridge disable` removes the forwarder together with the `portman` network. A container that still has `192.168.99.129` as its only resolver then resolves no name at all. Remove the `dns` line from that container, or enable the bridge again. A compose project that names `portman` as an `external` network fails to start while the network is gone.
+
+When Docker is not running at the time of the disable, portman removes the forwarder and the network once Docker runs again. A daemon restart in between ends that, and `docker rm -f portman-netbridge-dns` then removes the forwarder.
 
 `portman uninstall` stops the daemon and leaves the forwarder running. To remove the forwarder too, run `portman bridge disable` before you uninstall, or run `docker rm -f portman-netbridge-dns` afterwards.
 
 ### Check the forwarder
 
-`portman doctor` prints one `dns forwarder` line. For a forwarder that runs while the bridge is up, it starts a short-lived container that looks one registered hostname up through `192.168.99.129`, and prints the answer.
+`portman doctor` prints one `dns forwarder` line. For a forwarder that runs while the bridge is up, it starts a short-lived container that looks one registered hostname up through `192.168.99.129`, and prints the answer. It looks no name up when every registered hostname is a wildcard or is under `.localhost`.
 
 The forwarder needs a setup image that has `dnsmasq`. An install from before this feature has an older image. The bridge then works as before, and `portman doctor` reports the forwarder as unavailable. Run `portman bridge prepare` to build the current image. A bridge that is up gets the forwarder within a minute.
 

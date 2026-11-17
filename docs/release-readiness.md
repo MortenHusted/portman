@@ -69,8 +69,9 @@ subnets, and explicit commands for stopping the legacy bridge. It does not stop
 or uninstall any legacy service. It also reports the DNS forwarder. For a
 forwarder that runs while the bridge is up, it starts one short-lived
 container that looks a registered hostname up through `192.168.99.129`. The
-engine removes that container when the lookup ends. Nothing else that doctor
-does changes Docker state.
+engine removes that container when the lookup ends. Doctor ends a lookup that
+takes longer than 8 s and removes the container by its name. Nothing else
+that doctor does changes Docker state.
 
 ## Container-Facing Host Access
 
@@ -113,16 +114,23 @@ the compose line `dns: [192.168.99.129]`.
   of the managed TLD set. It replaces a container that does not run, runs
   another command, or comes from another build of the setup image, and leaves
   it as it is otherwise.
+- A container with the right command from the current image that the engine
+  starts again and again is also left as it is. The daemon log says so once
+  and names `docker logs portman-netbridge-dns`.
+- The forwarder keeps no negative answer, so a denial from the VM's resolver
+  does not hide a name that portman registers afterwards.
 - A daemon stop, a lost Docker session, and a bridge mode change leave the
   container running. `portman bridge disable` removes it before it removes the
-  `portman` network.
+  `portman` network. With no engine reachable at the disable, the daemon
+  removes both in the next Docker session, unless the daemon restarts first.
 - A setup image without the label `dev.portman.dns-forwarder=1` cannot run the
   forwarder. The bridge then works as before, the daemon log and `portman
   doctor` name `portman bridge prepare` as the fix, and the daemon looks at
   the image again every minute while the bridge is up.
 
 Manual gates, on an installed build with the bridge up and a registered HTTP
-route `web.demo.test` and TCP route `db.demo.test`:
+route `web.demo.test` and a TCP route `db.demo.test` to a container on the
+`portman` network:
 
 1. Start a container with no `dns` option, before and after the upgrade.
    Confirm that `example.com` resolves in both and that `/etc/resolv.conf` in
@@ -158,6 +166,11 @@ route `web.demo.test` and TCP route `db.demo.test`:
     bridge comes up and that doctor prints `dns forwarder: unavailable`. Run
     `portman bridge prepare`. Confirm that `portman-netbridge-dns` runs within
     a minute.
+11. From a container with `--dns 192.168.99.129`, look `late.demo.test` up
+    before it is registered. Register it, and confirm that the next lookup
+    resolves it.
+12. Stop the VM, run `portman bridge disable`, and start the VM. Confirm that
+    `portman-netbridge-dns` and the `portman` network are gone.
 
 ## Current Evidence
 
