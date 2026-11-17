@@ -824,17 +824,40 @@ mod tests {
         let said = bridge_leftover_lines(&owed)
             .into_iter()
             .map(|line| format!("say: {line}"));
-        let steps = [
-            vec![
-                "ask the daemon for its engine".to_string(),
-                "stop the daemon".to_string(),
-                "wait for the daemon to exit".to_string(),
-                r#"ask the engine at Some("/run/demo/docker.sock") for the removal"#.to_string(),
-            ],
-            said.collect(),
-            vec!["remove the plist and the daemon's binary".to_string()],
-        ];
+        let steps = [UP_TO_THE_REMOVAL.map(String::from).to_vec(), said.collect()];
         assert_eq!(mac.did(), steps.concat());
+    }
+
+    #[cfg(target_os = "macos")]
+    const UP_TO_THE_REMOVAL: [&str; 5] = [
+        "ask the daemon for its engine",
+        "stop the daemon",
+        "remove the plist and the daemon's binary",
+        "wait for the daemon to exit",
+        r#"ask the engine at Some("/run/demo/docker.sock") for the removal"#,
+    ];
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(start_paused = true)]
+    async fn an_engine_that_stalls_does_not_hold_an_uninstall_up() {
+        let mac = StandInMac::new(None);
+        let began = tokio::time::Instant::now();
+
+        let ended = tokio::time::timeout(Duration::from_secs(3600), uninstall(&mac)).await;
+
+        assert!(ended.is_ok(), "still waiting for the engine after an hour");
+        assert_eq!(began.elapsed(), Duration::from_secs(35));
+        let did = mac.did();
+        assert_eq!(did[..5], UP_TO_THE_REMOVAL);
+        assert_eq!(
+            did[5..],
+            [
+                "say: bridge: Docker gave no answer in 35 s and may still hold the dns forwarder",
+                "say: bridge: when Docker answers again, remove the forwarder and its network with:",
+                "say:     docker rm -f portman-netbridge-dns",
+                "say:     docker network rm portman",
+            ]
+        );
     }
 
     #[cfg(target_os = "macos")]
