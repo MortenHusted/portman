@@ -1412,6 +1412,20 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn the_stop_of_a_bridge_that_was_turned_off_does_not_pay_the_network_debt() {
+        let mut rig = Rig::up().await;
+
+        rig.send(Control::Disable).await;
+
+        assert_eq!(rig.next_stop().await, Stop::RemovesNetwork);
+        assert_eq!(
+            rig.next_sweep().await,
+            (Session(1), SetupContainerAndNetwork)
+        );
+        rig.no_sweep_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_disable_during_a_mode_change_ends_it_without_a_new_start() {
         let mut rig = Rig::up().await;
         rig.hold_stops();
