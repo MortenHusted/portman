@@ -603,6 +603,7 @@ fn reconcile_routes(route: &RunRoute, cmds: &[RouteCommand]) {
             continue;
         };
         if !is_own_utun(&cmd.iface) {
+            info!(iface = %cmd.iface, "netbridge route pass ended with its bridge");
             return;
         }
         warn!(cidr = %cmd.cidr, iface = %cmd.iface, %err, "netbridge route reconcile failed");
@@ -2833,11 +2834,16 @@ destination: 172.18.0.0
             (logged, capture)
         }
 
-        fn take_warnings(&self) -> Vec<String> {
+        fn take_lines(&self) -> Vec<String> {
             let bytes = std::mem::take(&mut *self.0.lock().unwrap());
             let text = String::from_utf8(bytes).unwrap();
-            let warnings = text.lines().filter(|line| line.contains(" WARN "));
-            warnings.map(String::from).collect()
+            text.lines().map(String::from).collect()
+        }
+
+        fn take_warnings(&self) -> Vec<String> {
+            let mut lines = self.take_lines();
+            lines.retain(|line| line.contains(" WARN "));
+            lines
         }
     }
 
@@ -2888,9 +2894,11 @@ destination: 172.18.0.0
             ran.borrow_mut().push(args.join(" "));
             route_ended(0, "")
         };
+        let (logged, _capture) = Logged::capture();
 
         remember_own_utun(utun);
         reconcile_routes(&route, &pass);
+        assert_eq!(logged.take_lines(), [] as [&str; 0]);
         assert_eq!(
             ran.take(),
             [
@@ -2904,6 +2912,13 @@ destination: 172.18.0.0
         forget_own_utun(utun);
         reconcile_routes(&route, &pass);
         assert_eq!(ran.take(), [] as [&str; 0]);
+        let said = logged.take_lines();
+        assert_eq!(said.len(), 1, "{said:?}");
+        let ended = "netbridge route pass ended with its bridge iface=utun-let-go-before-the-pass";
+        assert!(
+            said[0].contains(" INFO ") && said[0].ends_with(ended),
+            "{said:?}"
+        );
     }
 
     #[test]
