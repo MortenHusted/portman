@@ -19,6 +19,10 @@ const DNS_CONTAINER: &str = "portman-netbridge-dns";
 /// The gateway address of the `portman` docker network, where the DNS
 /// forwarder listens.
 const DNS_FORWARDER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 99, 129);
+/// The subnet of the `portman` docker network. The netbridge crate names it
+/// `DOCKER_BRIDGE_CIDR` and builds on macOS only, so doctor has its own
+/// copy, and a test holds the two together.
+const PORTMAN_NETWORK_CIDR: &str = "192.168.99.128/25";
 /// The label of a setup image that has the `dns` mode, and its value.
 const DNS_IMAGE_LABEL: (&str, &str) = ("dev.portman.dns-forwarder", "1");
 const ENDPOINT_TIMEOUT: Duration = Duration::from_millis(200);
@@ -175,7 +179,8 @@ pub(crate) enum ForwarderQuery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DnsForwarderReport {
     pub status: DnsForwarderStatus,
-    /// The hostnames of the registered TCP routes.
+    /// The hostnames of the TCP routes whose target is on the `portman`
+    /// docker network.
     pub tcp_routes: Vec<String>,
 }
 
@@ -325,7 +330,7 @@ pub(crate) async fn inspect_dns_forwarder(
 ) -> DnsForwarderReport {
     DnsForwarderReport {
         status: dns_forwarder_status(phase, routes).await,
-        tcp_routes: tcp_route_names(routes),
+        tcp_routes: tcp_routes_on_the_portman_network(routes),
     }
 }
 
@@ -407,14 +412,31 @@ fn forwarder_query_name(phase: Option<BridgePhase>, routes: &[Entry]) -> Result<
         .ok_or_else(|| "no hostname is registered".to_string())
 }
 
-fn tcp_route_names(routes: &[Entry]) -> Vec<String> {
+/// The TCP routes that a container reaches only from the `portman` network:
+/// a name of such a route resolves to its target, a container on that
+/// network, and Docker carries no traffic between two bridge networks. A
+/// TCP route to any other target is left out, because joining the network
+/// is not what a container needs to reach it.
+fn tcp_routes_on_the_portman_network(routes: &[Entry]) -> Vec<String> {
     let mut names: Vec<String> = routes
         .iter()
-        .filter(|route| route.mode == Mode::Tcp)
+        .filter(|route| route.mode == Mode::Tcp && targets_the_portman_network(&route.target))
         .map(|route| route.host.clone())
         .collect();
     names.sort();
     names
+}
+
+fn targets_the_portman_network(target: &str) -> bool {
+    let (network, prefix_len) = PORTMAN_NETWORK_CIDR
+        .split_once('/')
+        .expect("a subnet is an address and a prefix length");
+    let network: Ipv4Addr = network.parse().expect("an IPv4 subnet");
+    let mask = u32::MAX << (32 - prefix_len.parse::<u32>().expect("a prefix length"));
+    match target.parse() {
+        Ok(SocketAddr::V4(target)) => u32::from(*target.ip()) & mask == u32::from(network),
+        _ => false,
+    }
 }
 
 /// Looks `name` up from a container on the default bridge network that has
@@ -502,7 +524,7 @@ fn check_dns_forwarder(report: &DnsForwarderReport) -> CheckOutcome {
     let running = matches!(report.status, DnsForwarderStatus::Running(_));
     if running && !report.tcp_routes.is_empty() {
         lines.push(format!(
-            "  tcp routes ({}): a container resolves them through the forwarder and connects only when it also joins the `portman` network",
+            "  tcp routes to the `portman` network ({}): a container resolves them through the forwarder and connects only when it also joins that network",
             report.tcp_routes.join(", ")
         ));
     }
@@ -1492,7 +1514,7 @@ mod tests {
 
     #[test]
     fn doctor_names_the_portman_network_when_a_tcp_route_exists() {
-        let note = "  tcp routes (db.demo.test, mq.demo.test): a container resolves them through the forwarder and connects only when it also joins the `portman` network";
+        let note = "  tcp routes to the `portman` network (db.demo.test, mq.demo.test): a container resolves them through the forwarder and connects only when it also joins that network";
         let with_tcp_routes = |status| DnsForwarderReport {
             status,
             tcp_routes: vec!["db.demo.test".to_string(), "mq.demo.test".to_string()],
@@ -1635,16 +1657,44 @@ mod tests {
     }
 
     #[test]
-    fn the_tcp_routes_are_the_registered_names_in_tcp_mode() {
+    fn the_note_lists_only_the_tcp_routes_whose_target_is_on_the_portman_network() {
+        let to = |host: &str, target: &str, mode| Entry {
+            target: target.to_string(),
+            ..route(host, mode)
+        };
         let routes = [
-            route("web.demo.test", Mode::Http),
-            route("mq.demo.test", Mode::Tcp),
-            route("db.demo.test", Mode::Tcp),
-            route("api.acme.test", Mode::Egress),
+            to("web.demo.test", "192.168.99.131:80", Mode::Http),
+            to("mq.demo.test", "192.168.99.255:5672", Mode::Tcp),
+            to("db.demo.test", "192.168.99.128:5432", Mode::Tcp),
+            to("api.acme.test", "192.168.99.132:443", Mode::Egress),
+            to("below.demo.test", "192.168.99.127:5432", Mode::Tcp),
+            to("above.demo.test", "192.168.100.0:5432", Mode::Tcp),
+            to("bridge.demo.test", "172.17.0.2:5432", Mode::Tcp),
+            to("host.demo.test", "127.0.0.1:5432", Mode::Tcp),
+            to("named.demo.test", "db.acme.test:5432", Mode::Tcp),
+            to("v6.demo.test", "[fd00::1]:5432", Mode::Tcp),
         ];
 
-        assert_eq!(tcp_route_names(&routes), ["db.demo.test", "mq.demo.test"]);
-        assert_eq!(tcp_route_names(&routes[..1]), [] as [&str; 0]);
+        assert_eq!(
+            tcp_routes_on_the_portman_network(&routes),
+            ["db.demo.test", "mq.demo.test"]
+        );
+        assert_eq!(
+            tcp_routes_on_the_portman_network(&routes[..1]),
+            [] as [&str; 0]
+        );
+    }
+
+    #[test]
+    fn doctor_and_the_netbridge_name_one_subnet_for_the_portman_network() {
+        let tunnel = include_str!("../../portman-netbridge/src/tunnel.rs");
+        let netbridge_names =
+            format!("pub const DOCKER_BRIDGE_CIDR: &str = \"{PORTMAN_NETWORK_CIDR}\";");
+
+        assert!(
+            tunnel.lines().any(|line| line == netbridge_names),
+            "{netbridge_names}"
+        );
     }
 
     #[test]
