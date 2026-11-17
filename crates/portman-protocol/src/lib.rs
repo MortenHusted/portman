@@ -619,8 +619,9 @@ pub enum Response {
         #[serde(default)]
         bridge_phase: BridgePhase,
         /// The seconds until the daemon starts the bridge again, rounded
-        /// up, while a start that failed waits for its retry. `None`
-        /// otherwise, and from a daemon that predates the field.
+        /// up and so never 0, while a start that failed waits for its
+        /// retry. `None` otherwise, and from a daemon that predates the
+        /// field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bridge_retry_in_secs: Option<u64>,
         /// Route ownership mode for the native netbridge: the mode of the
