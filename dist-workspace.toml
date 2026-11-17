@@ -20,3 +20,10 @@ install-updater = false
 # portman repo itself is public, or the formula will point at private assets.
 tap = "MortenHusted/homebrew-tap"
 publish-jobs = ["homebrew"]
+
+# dist 0.32 builds Apple Silicon on `macos-14`, an image that GitHub no longer
+# offers: the job is cancelled before it starts. The Intel build already runs
+# on the `macos-15` family.
+[dist.github-custom-runners.aarch64-apple-darwin]
+runner = "macos-15"
+host = "aarch64-apple-darwin"
