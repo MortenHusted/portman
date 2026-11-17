@@ -2786,6 +2786,31 @@ mod tests {
         assert_eq!(cleanup, Swept::PortTaken);
     }
 
+    #[test]
+    fn only_a_listen_port_that_is_taken_ends_the_debt_of_a_cleanup_that_did_not_get_it() {
+        let (logged, _capture) = Logged::capture();
+
+        let taken = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        let swept = unclaimed(HOST_WG_LISTEN_PORT, SetupContainerAndNetwork, &taken);
+
+        assert_eq!(swept, Swept::PortTaken);
+        assert_eq!(logged.take_warnings(), [] as [&str; 0]);
+
+        let out_of_descriptors = std::io::Error::from(nix::errno::Errno::EMFILE);
+        let swept = unclaimed(
+            HOST_WG_LISTEN_PORT,
+            SetupContainerAndNetwork,
+            &out_of_descriptors,
+        );
+
+        assert!(!swept.ends_the_debt(), "{swept:?}");
+        assert_eq!(swept.holds(), Some(BridgeCleanup::Failed));
+        let warnings = logged.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("Too many open files"), "{warnings:?}");
+        assert!(!warnings[0].contains("is taken"), "{warnings:?}");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_start_asks_the_engine_nothing_until_it_holds_the_listen_port() {
         let another_daemons_bridge = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
