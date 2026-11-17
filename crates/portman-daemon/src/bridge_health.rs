@@ -28,6 +28,7 @@ use std::sync::{Arc, RwLock};
 use bollard::models::ContainerSummary;
 use bollard::query_parameters::{ListContainersOptionsBuilder, ListNetworksOptionsBuilder};
 use bollard::Docker;
+use portman_core::route_query::carrying_route_query;
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
@@ -216,14 +217,8 @@ fn has_portman_host_label(labels: Option<&std::collections::HashMap<String, Stri
 /// the daemon (PF_ROUTE lives in the `portman-netbridge` crate, which is
 /// where the deeper observer will land).
 async fn route_utun_for_subnet(subnet: &str) -> Option<String> {
-    // CIDR → address (strip the "/NN"). `route get` takes a host
-    // address; for our purposes passing the subnet's network address
-    // works — if the subnet is routed, `route get` reports the matching
-    // route.
-    let addr = subnet.split('/').next()?;
-
     let output = tokio::process::Command::new("/sbin/route")
-        .args(["-n", "get", addr])
+        .args(carrying_route_query(subnet))
         .output()
         .await
         .ok()?;

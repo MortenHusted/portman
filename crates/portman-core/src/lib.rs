@@ -11,6 +11,7 @@ pub mod netbridge_state;
 pub mod paths;
 pub mod platform;
 pub mod registry;
+pub mod route_query;
 pub mod service_config;
 pub mod static_store;
 #[cfg(target_os = "linux")]
