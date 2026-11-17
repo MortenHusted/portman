@@ -197,6 +197,15 @@ pub enum BridgeCleanup {
     /// No container engine is connected. The daemon removes them when one
     /// connects, also when the daemon restarted in between.
     WaitsForDocker,
+    /// A container engine connected less than `for_secs` ago. The daemon
+    /// removes them once the engine has been connected for that long, so
+    /// that the bridge of another portman daemon on that engine can take
+    /// the UDP port of the bridge first. A client that waits for a disable
+    /// waits until this has passed.
+    WaitsForBridges {
+        #[serde(default)]
+        for_secs: u64,
+    },
     /// The engine gave no answer in the `within_secs` that the bridge gives
     /// it for a step. The daemon tries again when it next connects to an
     /// engine.
@@ -230,6 +239,9 @@ impl BridgeCleanup {
             }
             BridgeCleanup::WaitsForDocker => format!(
                 "portman has not removed {leftovers}: Docker is not connected. It removes them when Docker connects"
+            ),
+            BridgeCleanup::WaitsForBridges { for_secs } => format!(
+                "portman has not removed {leftovers} yet: it waits until Docker has been connected for {for_secs} s, so that the bridge of another portman daemon can take the UDP port of the bridge first"
             ),
             BridgeCleanup::NoAnswer { within_secs } => format!(
                 "portman could not remove {leftovers}: the container engine gave no answer within {within_secs} s. {again}"
@@ -1604,6 +1616,10 @@ mod tests {
                 BridgeCleanup::WaitsForDocker,
             ),
             (
+                r#"{"state":"waits_for_bridges","for_secs":10}"#,
+                BridgeCleanup::WaitsForBridges { for_secs: 10 },
+            ),
+            (
                 r#"{"state":"no_answer","within_secs":20}"#,
                 BridgeCleanup::NoAnswer { within_secs: 20 },
             ),
@@ -1649,6 +1665,12 @@ mod tests {
             BridgeCleanup::WaitsForDocker.disable_words(),
             "portman has not removed the dns forwarder and the `portman` network: Docker is \
              not connected. It removes them when Docker connects"
+        );
+        assert_eq!(
+            BridgeCleanup::WaitsForBridges { for_secs: 10 }.disable_words(),
+            "portman has not removed the dns forwarder and the `portman` network yet: it \
+             waits until Docker has been connected for 10 s, so that the bridge of another \
+             portman daemon can take the UDP port of the bridge first"
         );
         assert_eq!(
             BridgeCleanup::PortTaken.disable_words(),

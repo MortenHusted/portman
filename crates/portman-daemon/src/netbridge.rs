@@ -52,7 +52,11 @@
 //!     moment. A claim on the port that fails for any other reason says
 //!     nothing about a bridge, and the debt stays owed. The debt is saved
 //!     in `netbridge.json` with the flag, so a daemon that restarts still
-//!     owes it. An `Enable` ends it.
+//!     owes it. An `Enable` ends it. A debt that is older than a session
+//!     is paid there only when the session has been open for the
+//!     [`HEAD_START`], so that the bridge of another daemon on that engine
+//!     holds the port by then. The cleanup of a `Disable` that the loop
+//!     took on the session runs at once.
 //!   - a failed start is retried with a growing delay. The wait does not
 //!     hold up control messages, and a new session starts the delay over.
 //!   - a bridge that is up gets the DNS forwarder in the VM: the loop makes
@@ -93,7 +97,7 @@ use tokio::sync::{mpsc, watch, Notify, RwLock};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use crate::engine::{Engine, Link, Session};
+use crate::engine::{Engine, Link, Session, SESSION_OPENS_WITHIN};
 
 /// Env var override. Useful for the first-run path where the user's
 /// `netbridge.json` doesn't exist yet and they want to flip the bridge
@@ -110,6 +114,22 @@ const ENABLE_ENV: &str = "PORTMAN_NETBRIDGE";
 /// [`runtime::ENGINE_STEP_BUDGET`] that the bridge gives the engine for a
 /// step, or for the [`runtime::ENGINE_START_BUDGET`] of a start.
 const SETUP_CHECK_BUDGET: Duration = Duration::from_secs(3);
+
+/// How long a session is open before the loop pays a debt on it that is
+/// older than the session. The bridge of another portman daemon on the same
+/// engine runs on the DNS forwarder and the docker network, and it holds
+/// the listen port only once its start has begun. That daemon has a session
+/// within [`SESSION_OPENS_WITHIN`] of the moment the engine answers, and
+/// its start claims the port before it asks the engine anything. The two
+/// seconds on top are for its loop to reach that start. After the head
+/// start such a bridge holds the port, and the cleanup ends as a taken port
+/// does. This holds for a daemon that was built with the same limits and
+/// whose first socket is that engine's. Until the head start is over the
+/// loop asks the engine nothing and does not claim the port, also not for
+/// the setup container: a claim can fail the other daemon's start, and the
+/// retry of that start comes [`RETRY_BASE`] later, which can be after the
+/// head start.
+const HEAD_START: Duration = Duration::from_secs(SESSION_OPENS_WITHIN.as_secs() + 2);
 
 const RETRY_BASE: Duration = Duration::from_secs(5);
 const RETRY_CAP: Duration = Duration::from_secs(60);
@@ -453,21 +473,51 @@ struct Debt {
     held: Option<BridgeCleanup>,
     /// The `Disable` messages that the loop has acted on.
     disables: u64,
+    /// The session that was open when the loop took the last `Disable`.
+    /// The debt of that `Disable` is older than every other session.
+    asked_on: Option<Session>,
+}
+
+/// What a cleanup on a session is to remove, and from when it may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Owed {
+    leftovers: Leftovers,
+    from: Instant,
 }
 
 impl Debt {
-    fn owed_on(&self, session: Option<Session>, network_owed: bool) -> Option<Leftovers> {
-        (self.swept != session).then_some(if network_owed {
-            Leftovers::SetupContainerAndNetwork
-        } else {
-            Leftovers::SetupContainer
+    /// What the cleanup of `session` is to remove. `None` once the session
+    /// had its cleanup, and while no session exists. `opened` is when the
+    /// loop saw the session open. A debt that is older than the session
+    /// waits out the [`HEAD_START`], and with it the whole cleanup.
+    fn owed_on(
+        &self,
+        session: Option<Session>,
+        opened: Instant,
+        network_owed: bool,
+    ) -> Option<Owed> {
+        let session = session.filter(|session| self.swept != Some(*session))?;
+        Some(match network_owed {
+            false => Owed {
+                leftovers: Leftovers::SetupContainer,
+                from: opened,
+            },
+            true if self.asked_on == Some(session) => Owed {
+                leftovers: Leftovers::SetupContainerAndNetwork,
+                from: opened,
+            },
+            true => Owed {
+                leftovers: Leftovers::SetupContainerAndNetwork,
+                from: opened + HEAD_START,
+            },
         })
     }
 
-    fn disabled(&mut self) {
+    fn disabled(&mut self, session: Option<Session>) {
         self.swept = None;
         self.held = None;
         self.disables += 1;
+        self.asked_on = session;
     }
 
     /// A cleanup that did not finish is not tried again on its session.
@@ -481,7 +531,14 @@ impl Debt {
     /// What status says about the cleanup that the last `Disable` asked
     /// for. A port that was taken stays reported until the next `Disable`,
     /// because no cleanup asks again before that.
-    fn status(&self, intent: &NetbridgeState, session: Option<Session>) -> Option<BridgeCleanup> {
+    /// `owed` is [`Debt::owed_on`] for `session`.
+    fn status(
+        &self,
+        intent: &NetbridgeState,
+        session: Option<Session>,
+        owed: Option<Owed>,
+        now: Instant,
+    ) -> Option<BridgeCleanup> {
         if intent.enabled {
             return None;
         }
@@ -491,10 +548,13 @@ impl Debt {
         if !intent.cleanup_owed {
             return None;
         }
-        match session {
-            None => Some(BridgeCleanup::WaitsForDocker),
-            Some(session) if self.swept != Some(session) => Some(BridgeCleanup::Pending),
-            Some(_) => self.held,
+        match (session, owed) {
+            (None, _) => Some(BridgeCleanup::WaitsForDocker),
+            (Some(_), Some(owed)) if owed.from > now => Some(BridgeCleanup::WaitsForBridges {
+                for_secs: HEAD_START.as_secs(),
+            }),
+            (Some(_), Some(_)) => Some(BridgeCleanup::Pending),
+            (Some(_), None) => self.held,
         }
     }
 }
@@ -636,6 +696,7 @@ async fn converge<E: BridgeEngine>(
     );
 
     let mut session = None;
+    let mut opened = Instant::now();
     let mut running: Option<Running<E::Bridge>> = None;
     let mut attempts = Attempts::new();
     let mut epoch = 0;
@@ -643,7 +704,14 @@ async fn converge<E: BridgeEngine>(
 
     loop {
         while let Ok(msg) = rx.try_recv() {
-            take(msg, &mut wanted, &mut attempts, &mut debt, &state_path);
+            take(
+                msg,
+                session,
+                &mut wanted,
+                &mut attempts,
+                &mut debt,
+                &state_path,
+            );
         }
         if wanted.unsaved {
             wanted.save(&state_path);
@@ -651,6 +719,7 @@ async fn converge<E: BridgeEngine>(
         // A start sequence serves one session, as it serves one intent.
         if session != engine.session() {
             session = engine.session();
+            opened = Instant::now();
             attempts = Attempts::new();
             if let (Some(session), Some(running)) = (session, running.as_mut()) {
                 let setup_container = running.bridge.setup_container_id();
@@ -665,7 +734,10 @@ async fn converge<E: BridgeEngine>(
         }
         let intent = wanted.intent();
         let built = running.as_ref().map(|r| r.built);
-        handle.publish_cleanup(debt.status(&intent, session), debt.disables);
+        let now = Instant::now();
+        let owed = debt.owed_on(session, opened, wanted.saved.cleanup_owed);
+        let cleanup = debt.status(&intent, session, owed, now);
+        handle.publish_cleanup(cleanup, debt.disables);
         publish(
             &handle,
             &phase_tx,
@@ -677,23 +749,34 @@ async fn converge<E: BridgeEngine>(
         .await;
         let may_start = attempts.retry_at.is_none();
         let tlds = managed_tlds(&known_tlds);
-        let now = Instant::now();
         let forwarded = running.as_ref().map(|r| r.forwarded.as_ref());
         let forwarder_due = forwarded.is_some_and(|last| forwarder_due(last, &tlds, now));
-        let owed = debt.owed_on(session, wanted.saved.cleanup_owed);
-        match plan(&intent, session, built, may_start, owed, forwarder_due) {
+        let due = owed.filter(|owed| owed.from <= now);
+        let due = due.map(|owed| owed.leftovers);
+        match plan(&intent, session, built, may_start, due, forwarder_due) {
             Step::Keep => {
-                // A start waits only while no bridge runs, and a forwarder
-                // only while one does, so one timer serves both.
+                // A start waits only while the user wants a bridge and none
+                // runs, a forwarder only while one runs, and a head start
+                // only while the user wants none, so one timer serves all
+                // three.
                 let forwarder_retry = forwarded.flatten().and_then(|last| last.retry_at);
+                let head_start_over = owed.filter(|_| !intent.enabled).map(|owed| owed.from);
                 let retry_after = attempts
                     .retry_at
                     .or(forwarder_retry)
+                    .or(head_start_over.filter(|over| *over > now))
                     .map(|at| at.saturating_duration_since(now));
                 let tlds_changed = &handle.tlds_changed;
                 match next_wake(&mut rx, &mut engine, tlds_changed, retry_after).await {
                     Wake::Control(msg) => {
-                        take(msg, &mut wanted, &mut attempts, &mut debt, &state_path);
+                        take(
+                            msg,
+                            session,
+                            &mut wanted,
+                            &mut attempts,
+                            &mut debt,
+                            &state_path,
+                        );
                     }
                     Wake::RetryDue => attempts.retry_at = None,
                     Wake::SessionChanged | Wake::TldsChanged => {}
@@ -763,13 +846,14 @@ fn settle(wanted: &mut Wanted, state_path: &Path, asked_for: Leftovers, swept: S
 /// remove the docker network.
 fn take(
     msg: Control,
+    taken_on: Option<Session>,
     wanted: &mut Wanted,
     attempts: &mut Attempts,
     debt: &mut Debt,
     state_path: &Path,
 ) {
     if matches!(msg, Control::Disable) {
-        debt.disabled();
+        debt.disabled(taken_on);
     }
     wanted.apply(msg);
     wanted.save(state_path);
@@ -3781,7 +3865,6 @@ mod tests {
         assert_eq!(client.bridge_cleanup().await, json!(null));
     }
 
-    const HEAD_START: Duration = Duration::from_secs(10);
     const OWES_A_CLEANUP: &str = r#"{"enabled":false,"cleanup_owed":true}"#;
 
     #[tokio::test(start_paused = true)]
@@ -3843,6 +3926,33 @@ mod tests {
         assert_eq!(enabled.elapsed(), Duration::ZERO);
         assert_eq!(saved_debt(&rig.state_path), false);
         rig.no_sweep_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_on_an_open_session_is_paid_at_once_also_inside_a_head_start() {
+        let mut rig = Rig::boot_on(Some(OWES_A_CLEANUP));
+        tokio::time::sleep(HEAD_START / 2).await;
+
+        let disabled = Instant::now();
+        rig.send(Control::Disable).await;
+
+        assert_eq!(
+            rig.next_sweep().await,
+            (Session(1), SetupContainerAndNetwork)
+        );
+        assert_eq!(disabled.elapsed(), Duration::ZERO);
+        rig.no_sweep_follows().await;
+    }
+
+    #[test]
+    fn the_readme_states_the_head_start_that_a_bridge_of_another_daemon_gets() {
+        let readme = include_str!("../../../README.md");
+        let stated = format!(
+            "waits until Docker has been connected for {} s",
+            HEAD_START.as_secs()
+        );
+
+        assert_eq!(readme.matches(&stated).count(), 2, "{stated}");
     }
 
     /// Every leftover of a bridge, as [`engine_with_leftovers`] holds them.

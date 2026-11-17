@@ -177,9 +177,9 @@ fn timed_out(desired_enabled: bool, last: BridgePhase) -> String {
 
 /// Poll until the bridge is up, or until it is off and gone and the daemon
 /// has said what became of the cleanup that a disable asks for. The daemon
-/// applies bridge changes asynchronously. A cleanup that still runs when
-/// the 60 s are used up ends the wait with no error, because the bridge is
-/// off.
+/// applies bridge changes asynchronously. A cleanup that still runs or is
+/// still to come when the 60 s are used up ends the wait with no error,
+/// because the bridge is off.
 pub(crate) async fn wait_for_bridge_state(desired_enabled: bool) -> Result<Settled> {
     wait_for_state(bridge_status, desired_enabled).await
 }
@@ -194,18 +194,21 @@ where
         let status = read().await?;
         let phase = status.phase();
         let cleanup = status.cleanup.filter(|_| !desired_enabled);
-        let off_with_a_cleanup_in_flight = match (poll(desired_enabled, previous, phase), cleanup) {
+        let off_with_a_cleanup_to_come = match (poll(desired_enabled, previous, phase), cleanup) {
             (Poll::Reached, None) => return Ok(Settled::Reached),
-            (Poll::Reached, Some(BridgeCleanup::Pending)) => true,
+            (
+                Poll::Reached,
+                Some(to_come @ (BridgeCleanup::Pending | BridgeCleanup::WaitsForBridges { .. })),
+            ) => Some(to_come),
             (Poll::Reached, Some(held)) => return Ok(Settled::LeftoversStay(held)),
             (Poll::WaitsForDocker, _) => return Ok(Settled::WaitsForDocker),
             (Poll::TurnedOff, _) => bail!("netbridge was disabled before it came up"),
-            (Poll::Pending, _) => false,
+            (Poll::Pending, _) => None,
         };
         previous = Some(phase);
         if !pauses.pause().await {
-            if off_with_a_cleanup_in_flight {
-                return Ok(Settled::LeftoversStay(BridgeCleanup::Pending));
+            if let Some(to_come) = off_with_a_cleanup_to_come {
+                return Ok(Settled::LeftoversStay(to_come));
             }
             bail!(timed_out(desired_enabled, phase));
         }
@@ -727,11 +730,17 @@ mod tests {
     async fn a_disable_waits_for_its_cleanup_and_says_what_held_it_up() {
         let no_answer = BridgeCleanup::NoAnswer { within_secs: 20 };
         let (pending, off) = (off_with(BridgeCleanup::Pending), sent(OptIn, Disabled));
+        let gives_a_head_start = off_with(BridgeCleanup::WaitsForBridges { for_secs: 10 });
         let stays = Settled::LeftoversStay;
         // the statuses that a disable reads → how its wait ends
         let table = [
             (vec![off], Settled::Reached),
             (vec![pending, pending, off], Settled::Reached),
+            (vec![gives_a_head_start, pending, off], Settled::Reached),
+            (
+                vec![gives_a_head_start, off_with(BridgeCleanup::PortTaken)],
+                stays(BridgeCleanup::PortTaken),
+            ),
             (
                 vec![sent(OptIn, Stopping), pending, off_with(no_answer)],
                 stays(no_answer),
