@@ -88,6 +88,14 @@ The daemon starts this container. The command above shows what it runs.
   network that file is the VM's own.
 - The entrypoint exits with status 2 and a message when `/etc/resolv.conf`
   names no nameserver or when no argument follows `dns`.
+- `--strict-order` makes dnsmasq ask the servers of a managed TLD in the
+  order given, portman first. It has a cost for every other name
+  ([issue 50](https://github.com/MortenHusted/portman/issues/50)). In strict
+  order dnsmasq 2.91 tries the next server after a `SERVFAIL` or a
+  `REFUSED`, and for a name outside the managed TLDs the VM's resolver is
+  the last server. dnsmasq then sends the client no reply over UDP, and the
+  client waits for its own timeout. dnsmasq 2.90 does the same for a query
+  without an EDNS option. Over TCP the error comes through.
 - `--cache-size=0` makes dnsmasq keep no answer. A name that portman
   registers then resolves to portman's address at the next lookup, also
   when the VM's resolver answered or denied that name before.

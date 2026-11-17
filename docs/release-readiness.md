@@ -134,7 +134,13 @@ the compose line `dns: [192.168.99.129]`.
   Alpine 3.22 or later. Over TCP dnsmasq asks the first server only, so a
   name that portman does not hold gets `REFUSED` there.
 - `host.docker.internal` and every other name go to the VM's own resolver
-  only.
+  only, and the container gets that resolver's answer. One answer does not
+  come through
+  ([issue 50](https://github.com/MortenHusted/portman/issues/50)). When the
+  VM's resolver fails a lookup with `SERVFAIL` or `REFUSED`, dnsmasq in
+  strict order tries the next server and has none, so it sends no reply over
+  UDP. The client then waits for its own timeout, where Docker's own
+  resolver passes the error on at once. Over TCP the error comes through.
 - The daemon looks at the container at each bridge start, at each change of
   the managed TLD set, and once more a minute after it started one. It replaces a container that does not run, runs
   another command, or comes from another build of the setup image, and leaves
