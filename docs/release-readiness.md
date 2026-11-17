@@ -139,8 +139,9 @@ the compose line `dns: [192.168.99.129]`.
 - A container with the right command from the current image that the engine
   starts again and again is also left as it is. The daemon log says so once
   and names `docker logs portman-netbridge-dns`.
-- The forwarder keeps no negative answer, so a denial from the VM's resolver
-  does not hide a name that portman registers afterwards.
+- The forwarder keeps no answer (`--cache-size=0`), so neither an answer nor
+  a denial from the VM's resolver hides a name that portman registers
+  afterwards.
 - A daemon stop, a lost Docker session, and a bridge mode change leave the
   container running. `portman bridge disable` removes it before it removes the
   `portman` network, also when the engine then keeps a network that is in

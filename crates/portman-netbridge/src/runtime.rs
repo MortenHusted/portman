@@ -1065,9 +1065,10 @@ fn docker_removal_already_underway(err: &DockerError) -> bool {
 /// strict order it asks portman first and the VM's resolver second for a
 /// name under a managed TLD, so a name that portman refuses still resolves.
 /// Every other name goes to the resolvers in the VM's `/etc/resolv.conf`,
-/// which dnsmasq reads itself. It keeps no negative answer: portman can
-/// register a moment later the name that the VM's resolver just denied, and
-/// a cached denial would hide it for as long as that resolver's SOA says.
+/// which dnsmasq reads itself. It keeps no answer: portman can register a
+/// moment later the name that the VM's resolver just answered or denied,
+/// and a cached answer would hide the registration for as long as that
+/// resolver's TTL says. Docker's own resolver keeps no answer either.
 /// It logs to stderr, where `docker logs` finds what it wrote.
 pub fn dns_forwarder_args(managed_tlds: &BTreeSet<String>) -> Vec<String> {
     let mut args = vec![
@@ -1077,7 +1078,7 @@ pub fn dns_forwarder_args(managed_tlds: &BTreeSet<String>) -> Vec<String> {
         format!("--listen-address={DOCKER_BRIDGE_GATEWAY}"),
         "--bind-interfaces".to_string(),
         "--strict-order".to_string(),
-        "--no-negcache".to_string(),
+        "--cache-size=0".to_string(),
         "--log-facility=-".to_string(),
     ];
     let forwarded = managed_tlds

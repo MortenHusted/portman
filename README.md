@@ -405,6 +405,8 @@ With `docker run`, pass `--dns 192.168.99.129`.
 
 The forwarder sends only names under your managed TLDs to portman. Every other name goes to the resolver that the VM already uses, so the other lookups of the container keep their answers. A name under a managed TLD that portman does not hold also goes on to the VM's resolver, and `host.docker.internal` never goes to portman. portman changes nothing in `/etc/resolver` or in the Mac's own name resolution for this.
 
+The forwarder keeps no answer, as Docker's own resolver keeps none. A hostname that you register resolves to portman at the next lookup, whatever the VM's resolver answered for that name before.
+
 HTTP routes need no extra network. Their names resolve to portman's proxy at `192.168.99.1`, which a container on a compose network reaches without joining another network.
 
 A TCP route resolves to the address of its target. When that target is a container on the `portman` network, registered at its address there, another container connects to the route by name only when it also joins the `portman` network, because Docker blocks traffic between two bridge networks:
@@ -423,7 +425,7 @@ networks:
 
 Joining the `portman` network does not make a TCP route to any other target reachable. For a TCP service on the host, keep using `host.docker.internal:<port>`.
 
-`portman tld add` and `portman tld remove` make portman replace the forwarder with one for the new set of TLDs. Lookups through the forwarder fail for the moment that this takes.
+`portman tld add` and `portman tld remove` make portman replace the forwarder with one for the new set of TLDs. Lookups through the forwarder fail for the moment that this takes. An upgrade from portman 0.1.7 replaces the forwarder once in the same way, when the bridge next comes up.
 
 ### When portman is down
 

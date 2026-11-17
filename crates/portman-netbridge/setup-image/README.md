@@ -74,7 +74,7 @@ docker run -d --name portman-netbridge-dns \
   portman-netbridge/setup:local \
   dns --keep-in-foreground --no-hosts \
   --listen-address=192.168.99.129 --bind-interfaces --strict-order \
-  --no-negcache --log-facility=- \
+  --cache-size=0 --log-facility=- \
   --server=/test/192.168.99.1 --server=/test/@vm-resolver@ \
   --server=/host.docker.internal/#
 ```
@@ -88,6 +88,9 @@ The daemon starts this container. The command above shows what it runs.
   network that file is the VM's own.
 - The entrypoint exits with status 2 and a message when `/etc/resolv.conf`
   names no nameserver or when no argument follows `dns`.
+- `--cache-size=0` makes dnsmasq keep no answer. A name that portman
+  registers then resolves to portman's address at the next lookup, also
+  when the VM's resolver answered or denied that name before.
 - The image label `dev.portman.dns-forwarder=1` marks an image that has this
   mode. The daemon starts the forwarder only from an image with the label.
 
