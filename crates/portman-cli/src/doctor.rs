@@ -2005,6 +2005,58 @@ mod tests {
     }
 
     #[test]
+    fn doctor_takes_its_verdict_on_the_routes_from_the_health_that_the_daemon_reports() {
+        use portman_protocol::BridgeAssessment::{
+            Healthy, Offline, RoutesMissing, TunnelDead, Unknown,
+        };
+        let route = |network: &str, subnet: &str, iface: &str| DockerRouteDiagnostic {
+            network: network.to_string(),
+            subnet: subnet.to_string(),
+            hosts: vec!["web.demo.test".to_string()],
+            route_iface: Some(iface.to_string()),
+        };
+        let on_portman_and_a_second_network = DockerRouteStatus::Routes(vec![
+            route("demo_default", "172.18.0.0/16", "en0"),
+            route("portman", "192.168.99.128/25", "utun9"),
+        ]);
+        let through_the_utun_of_a_vpn =
+            DockerRouteStatus::Routes(vec![route("demo_default", "172.18.0.0/16", "utun4")]);
+        let none = DockerRouteStatus::NoLabelledContainers;
+        // (the health, what the docker CLI and the routing table show) → ready
+        let table = [
+            (Healthy, &on_portman_and_a_second_network, true),
+            (Healthy, &through_the_utun_of_a_vpn, true),
+            (Healthy, &none, true),
+            (RoutesMissing, &on_portman_and_a_second_network, false),
+            (RoutesMissing, &through_the_utun_of_a_vpn, false),
+            (RoutesMissing, &none, false),
+            (TunnelDead, &through_the_utun_of_a_vpn, false),
+            (Offline, &none, false),
+            (Unknown, &none, false),
+        ];
+        for (health, routes, ready) in table {
+            let mut report = ready_but_for_the_bridge(BridgePhase::Up);
+            report.daemon.bridge_assessment = Some(health);
+            report.docker_routes = routes.clone();
+
+            let rendered = render_report(&report);
+
+            assert!(
+                rendered.contains(&format!("bridge: {health} netbridge: up")),
+                "{rendered}"
+            );
+            assert_eq!(
+                rendered.contains("replacement: ready"),
+                ready,
+                "health={health} routes={routes:?}\n{rendered}"
+            );
+            for line in render_docker_routes(routes) {
+                assert!(rendered.contains(&line), "{line}\n{rendered}");
+            }
+        }
+    }
+
+    #[test]
     fn doctor_report_marks_docker_mode_ready_when_routes_are_owned() {
         let report = DoctorReport {
             daemon: docker_daemon(),
