@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
+use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
 
 use portman_protocol::{BridgePhase, DockerState, DockerStatus, NetbridgeMode, Response};
@@ -62,7 +62,8 @@ impl DaemonSnapshot {
 pub(crate) enum DockerCliError {
     /// The `docker` program did not start, as when none is installed.
     NotStarted(String),
-    /// The CLI reached no engine.
+    /// The CLI reached no engine, or the call was killed at
+    /// [`DOCKER_CLI_BOUND`].
     NoAnswer(String),
     /// Any other failure. An engine that answers with an error, as it does
     /// for a container that is gone, ends here.
@@ -160,9 +161,10 @@ pub(crate) struct SetupImageBuildCommand {
     pub current_dir: PathBuf,
 }
 
-pub(crate) fn inspect_setup_image() -> SetupImageStatus {
+pub(crate) async fn inspect_setup_image() -> SetupImageStatus {
     let format = "{{.Id}}\t{{.Created}}";
-    let stdout = match docker_stdout(&["image", "inspect", SETUP_IMAGE, "--format", format]) {
+    let inspect = ["image", "inspect", SETUP_IMAGE, "--format", format];
+    let stdout = match docker_stdout(&inspect).await {
         Ok(stdout) => stdout,
         Err(DockerCliError::Failed(message))
             if message.contains("No such image") || message.contains("No such object") =>
@@ -219,8 +221,9 @@ pub(crate) fn detect_legacy_bridge() -> LegacyBridgeStatus {
     }
 }
 
-pub(crate) fn collect_docker_routes() -> DockerRouteStatus {
-    let ids_output = match docker_stdout(&["ps", "--filter", "label=dev.portman.host", "-q"]) {
+pub(crate) async fn collect_docker_routes() -> DockerRouteStatus {
+    let labelled = ["ps", "--filter", "label=dev.portman.host", "-q"];
+    let ids_output = match docker_stdout(&labelled).await {
         Ok(output) => output,
         Err(error) => return DockerRouteStatus::Unavailable(error),
     };
@@ -231,7 +234,7 @@ pub(crate) fn collect_docker_routes() -> DockerRouteStatus {
 
     let mut inspect_args = vec!["container", "inspect"];
     inspect_args.extend(ids.iter().copied());
-    let container_json = match docker_stdout(&inspect_args) {
+    let container_json = match docker_stdout(&inspect_args).await {
         Ok(output) => output,
         Err(error) => return DockerRouteStatus::Unavailable(error),
     };
@@ -251,7 +254,7 @@ pub(crate) fn collect_docker_routes() -> DockerRouteStatus {
 
     let mut network_args = vec!["network", "inspect"];
     network_args.extend(networks.iter().copied());
-    let network_json = match docker_stdout(&network_args) {
+    let network_json = match docker_stdout(&network_args).await {
         Ok(output) => output,
         Err(error) => return DockerRouteStatus::Unavailable(error),
     };
@@ -731,8 +734,14 @@ fn route_interface_for_cidr(cidr: &str) -> Option<String> {
     parse_route_get_interface(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn docker_stdout(args: &[&str]) -> Result<String, DockerCliError> {
-    run_docker("docker", args)
+/// How long one `docker` CLI call has to end. A healthy call ends in tens
+/// of milliseconds. The daemon gives an engine the same three seconds before
+/// it reports the engine unreachable, so the CLI and the daemon call an
+/// engine silent after the same wait.
+const DOCKER_CLI_BOUND: Duration = Duration::from_secs(3);
+
+async fn docker_stdout(args: &[&str]) -> Result<String, DockerCliError> {
+    run_docker("docker", args, DOCKER_CLI_BOUND).await
 }
 
 /// What the `docker` CLI prints when it reaches no engine. Docker 29 names
@@ -743,11 +752,30 @@ const NO_ENGINE: [&str; 3] = [
     "error during connect",
 ];
 
-fn run_docker(program: &str, args: &[&str]) -> Result<String, DockerCliError> {
-    let output = StdCommand::new(program)
+/// Runs `program`, and kills it when it has not ended after `bound`. The
+/// `docker` CLI sets no time limit of its own, and waits without end on a
+/// socket that accepts a connection and never answers.
+async fn run_docker(
+    program: &str,
+    args: &[&str],
+    bound: Duration,
+) -> Result<String, DockerCliError> {
+    let child = tokio::process::Command::new(program)
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
         .map_err(|err| DockerCliError::NotStarted(err.to_string()))?;
+    let output = match tokio::time::timeout(bound, child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => return Err(DockerCliError::Failed(err.to_string())),
+        Err(_) => {
+            let waited = bound.as_secs_f32();
+            return Err(DockerCliError::NoAnswer(format!("no answer in {waited} s")));
+        }
+    };
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
     }
@@ -1025,8 +1053,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_docker_cli_call_says_whether_an_engine_answered_it() {
+    #[tokio::test]
+    async fn a_docker_cli_call_says_whether_an_engine_answered_it() {
+        let run = |program: &'static str, script: String| async move {
+            run_docker(program, &["-c", &script], Duration::from_secs(10)).await
+        };
         let fails_with = |stderr: &str| format!("echo '{stderr}' >&2; exit 1");
         let no_engine = "failed to connect to the docker API at unix:///run/demo/docker.sock; \
                          check if the path is correct and if the daemon is running";
@@ -1050,19 +1081,35 @@ mod tests {
             ),
         ];
         for (script, want) in table {
-            assert_eq!(run_docker("sh", &["-c", &script]), want, "{script}");
+            assert_eq!(run("sh", script.clone()).await, want, "{script}");
         }
 
-        let silent_failure = run_docker("sh", &["-c", "exit 3"]);
+        let silent_failure = run("sh", "exit 3".to_string()).await;
         assert!(
             matches!(silent_failure, Err(DockerCliError::Failed(_))),
             "{silent_failure:?}"
         );
-        let no_program = run_docker("/run/demo/no-such-docker", &["ps"]);
+        let no_program = run("/run/demo/no-such-docker", "exit 0".to_string()).await;
         assert!(
             matches!(no_program, Err(DockerCliError::NotStarted(_))),
             "{no_program:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_docker_cli_call_that_does_not_end_is_killed_at_its_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let outlived = dir.path().join("outlived");
+        let script = format!("sleep 0.3; touch '{}'", outlived.display());
+
+        let result = run_docker("sh", &["-c", &script], Duration::from_millis(50)).await;
+
+        assert_eq!(
+            result,
+            Err(DockerCliError::NoAnswer("no answer in 0.05 s".to_string()))
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(!outlived.exists(), "the call ran on after its bound");
     }
 
     fn open_container_facing() -> ContainerFacingStatus {

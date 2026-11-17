@@ -25,7 +25,7 @@ pub(crate) async fn cmd_bridge_status() -> Result<()> {
                 bridge_phase.or_from_enabled(bridge_enabled).display_word()
             );
             println!("mode:      {}", NetbridgeMode::display_word(bridge_mode));
-            let routes = doctor::collect_docker_routes();
+            let routes = doctor::collect_docker_routes().await;
             if let Some(docker) = &docker {
                 println!("docker:    {}", docker.summary());
             }
@@ -47,11 +47,16 @@ pub(crate) async fn cmd_bridge_status() -> Result<()> {
 }
 
 pub(crate) async fn cmd_doctor() -> Result<()> {
+    let daemon = doctor::DaemonSnapshot::from_status(request(Request::Status).await.ok());
+    let (setup_image, docker_routes) = tokio::join!(
+        doctor::inspect_setup_image(),
+        doctor::collect_docker_routes()
+    );
     let report = doctor::DoctorReport {
-        daemon: doctor::DaemonSnapshot::from_status(request(Request::Status).await.ok()),
-        setup_image: doctor::inspect_setup_image(),
+        daemon,
+        setup_image,
         legacy_bridge: doctor::detect_legacy_bridge(),
-        docker_routes: doctor::collect_docker_routes(),
+        docker_routes,
         container_facing: doctor::inspect_container_facing(),
     };
     print!("{}", doctor::render_report(&report));
