@@ -329,25 +329,27 @@ impl Runtime {
     }
 
     async fn end_tasks(&mut self) {
+        // The kernel recycles utun names. Keep claiming this one after the
+        // device is gone and route repair would treat a *recycled* utun —
+        // somebody else's VPN — as ours to repoint. The claim goes before
+        // the tasks that hold the device, so that a route command that
+        // fails because the interface is gone finds the claim gone too.
+        forget_own_utun(&self.utun_name);
         for t in &self.tasks {
             t.abort();
         }
         for t in self.tasks.drain(..) {
             let _ = t.await;
         }
-        // The kernel recycles utun names. Keep claiming this one after the
-        // device is gone and route repair would treat a *recycled* utun —
-        // somebody else's VPN — as ours to repoint.
-        forget_own_utun(&self.utun_name);
     }
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        forget_own_utun(&self.utun_name);
         for t in &self.tasks {
             t.abort();
         }
-        forget_own_utun(&self.utun_name);
     }
 }
 
@@ -594,12 +596,19 @@ fn spawn_route_reconciler(docker: Docker, mode: NetbridgeMode, iface: String) ->
 }
 
 /// One pass of the route reconciler. It runs on a blocking thread, and the
-/// abort of the reconciler task does not end it.
+/// abort of the reconciler task does not end it. A bridge lets go of its
+/// utun before the interface goes, and the routes go with the interface. So
+/// a command that fails for a utun that the bridge let go of is no failure,
+/// and the pass ends there.
 fn reconcile_routes(cmds: &[RouteCommand]) {
     for cmd in cmds {
-        if let Err(err) = ensure_route_command(cmd) {
-            warn!(cidr = %cmd.cidr, iface = %cmd.iface, %err, "netbridge route reconcile failed");
+        let Err(err) = ensure_route_command(cmd) else {
+            continue;
+        };
+        if !is_own_utun(&cmd.iface) {
+            return;
         }
+        warn!(cidr = %cmd.cidr, iface = %cmd.iface, %err, "netbridge route reconcile failed");
     }
 }
 
