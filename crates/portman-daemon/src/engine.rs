@@ -254,7 +254,7 @@ async fn connect(
                     version: version.version,
                 });
             }
-            Ok(Err(err)) => err.to_string(),
+            Ok(Err(err)) => unanswered(&err),
             Err(_) => format!("no answer in {} s", PROBE_TIMEOUT.as_secs()),
         };
         unreachable.get_or_insert(Absent::Unreachable {
@@ -263,6 +263,24 @@ async fn connect(
         });
     }
     Err(unreachable.unwrap_or_else(|| sockets.none_found()))
+}
+
+/// Why a probe got no version from the socket. bollard wraps the error of
+/// its HTTP client, and that error's own text names only the step of the
+/// client that failed. The cause at the end of the chain says what happened.
+fn unanswered(err: &bollard::errors::Error) -> String {
+    let mut cause: &dyn std::error::Error = err;
+    while let Some(deeper) = cause.source() {
+        cause = deeper;
+    }
+    let refused = cause
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused);
+    if refused {
+        "no engine listens on this socket".to_string()
+    } else {
+        cause.to_string()
+    }
 }
 
 /// Publishes that no engine is connected and clears the container routes,
