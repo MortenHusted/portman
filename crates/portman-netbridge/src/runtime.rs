@@ -2209,12 +2209,10 @@ destination: 172.18.0.0
         use std::os::unix::fs::PermissionsExt;
         use std::process::Stdio;
 
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        static RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir =
-            std::env::temp_dir().join(format!("portman-dns-mode-{}-{nanos}", std::process::id()));
+            std::env::temp_dir().join(format!("portman-dns-mode-{}-{run}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let program = dir.join("dnsmasq");
         std::fs::write(&program, dnsmasq).unwrap();
