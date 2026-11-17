@@ -129,7 +129,10 @@ host network and listens on `192.168.99.129:53`, the gateway address of the
 the compose line `dns: [192.168.99.129]`.
 
 - A name under a managed TLD goes to `192.168.99.1` first and to the VM's own
-  resolver second, in strict order.
+  resolver second, in strict order. That holds for a query with or without
+  EDNS options from dnsmasq 2.91 on, which is why the setup image is built on
+  Alpine 3.22 or later. Over TCP dnsmasq asks the first server only, so a
+  name that portman does not hold gets `REFUSED` there.
 - `host.docker.internal` and every other name go to the VM's own resolver
   only.
 - The daemon looks at the container at each bridge start, at each change of

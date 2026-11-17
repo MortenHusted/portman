@@ -403,7 +403,7 @@ services:
 
 With `docker run`, pass `--dns 192.168.99.129`.
 
-The forwarder sends only names under your managed TLDs to portman. Every other name goes to the resolver that the VM already uses, so the other lookups of the container keep their answers. A name under a managed TLD that portman does not hold also goes on to the VM's resolver, and `host.docker.internal` never goes to portman. portman changes nothing in `/etc/resolver` or in the Mac's own name resolution for this.
+The forwarder sends only names under your managed TLDs to portman. Every other name goes to the resolver that the VM already uses, so the other lookups of the container keep their answers. A name under a managed TLD that portman does not hold also goes on to the VM's resolver, and `host.docker.internal` never goes to portman. A lookup over TCP is the exception. The forwarder then asks portman only, and a name under a managed TLD that portman does not hold gets `REFUSED`. A resolver turns to TCP when the answer does not fit in a UDP packet, so this affects a name with a large record set under a managed TLD that is a real domain. portman changes nothing in `/etc/resolver` or in the Mac's own name resolution for this.
 
 The forwarder keeps no answer, as Docker's own resolver keeps none. A hostname that you register resolves to portman at the next lookup, whatever the VM's resolver answered for that name before.
 
@@ -447,7 +447,7 @@ When Docker is not running at the time of the disable, portman removes the forwa
 
 `portman doctor` prints one `dns forwarder` line. For a forwarder that runs while the bridge is up, it starts a short-lived container that looks one registered hostname up through `192.168.99.129`, and prints the answer. It looks no name up when every registered hostname is a wildcard or is under `.localhost`.
 
-The forwarder needs a setup image that has `dnsmasq`. An install from before this feature has an older image. The bridge then works as before, and `portman doctor` reports the forwarder as unavailable. Run `portman bridge prepare` to build the current image. A bridge that is up gets the forwarder within a minute.
+The forwarder needs a setup image that has `dnsmasq`. An install from before this feature has an older image. The bridge then works as before, and `portman doctor` reports the forwarder as unavailable. Run `portman bridge prepare` to build the current image. A bridge that is up gets the forwarder within a minute. The image that portman 0.1.7 built has `dnsmasq` 2.90. Through it, a query that carries a DNS cookie, as `dig` sends it, gets `REFUSED` for a name under a managed TLD that portman does not hold. `portman install` builds the current image, and the daemon then replaces the forwarder.
 
 ## Status
 

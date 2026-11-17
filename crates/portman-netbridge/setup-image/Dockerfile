@@ -40,7 +40,11 @@
 # tells the daemon that the image has the mode, so that it never starts the
 # forwarder from an image without it.
 
-FROM alpine:3.21
+# Alpine 3.22 is the first release with dnsmasq 2.91. dnsmasq 2.90 does not
+# ask the next server when the first one refuses a query that carries EDNS
+# options, such as a DNS cookie. Such a query then got portman's REFUSED
+# for a name that portman does not hold, and not the VM resolver's answer.
+FROM alpine:3.22
 
 LABEL dev.portman.dns-forwarder="1"
 

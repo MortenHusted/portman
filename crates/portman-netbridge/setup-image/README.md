@@ -91,6 +91,11 @@ The daemon starts this container. The command above shows what it runs.
 - `--cache-size=0` makes dnsmasq keep no answer. A name that portman
   registers then resolves to portman's address at the next lookup, also
   when the VM's resolver answered or denied that name before.
+- The image needs dnsmasq 2.91 or later, which Alpine 3.22 is the first
+  release to ship. dnsmasq 2.90 passes a refused query on to the VM's
+  resolver only when the query carries no EDNS option. A query with a DNS
+  cookie, as `dig` sends it, then got `REFUSED` for a name under a managed
+  TLD that portman does not hold.
 - The image label `dev.portman.dns-forwarder=1` marks an image that has this
   mode. The daemon starts the forwarder only from an image with the label.
 
