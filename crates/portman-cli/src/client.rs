@@ -189,15 +189,16 @@ where
     }
 }
 
-/// How long the mode of another command has to stay reported before a mode
-/// wait ends with [`ModePoll::SetByAnother`]. The daemon takes `mode`
-/// requests in the order they arrive, so of two commands that start a few
-/// milliseconds apart, the second can read the mode of the first before its
-/// own shows. In a live run of 164 such pairs, the daemon published a mode
-/// 10 to 90 ms after the request for it. The grace time is more than five
-/// times the longest of those. A wait that the other command did win ends at
-/// the first read after the grace time, and no pause between reads is longer
-/// than 500 ms.
+/// How long a mode wait goes on after the mode of another command first
+/// showed, before it ends with [`ModePoll::SetByAnother`]. The daemon takes
+/// `mode` requests in the order they arrive, so of two commands that start a
+/// few milliseconds apart, the second can read the mode of the first before
+/// its own shows. The grace time is for that. It is too short for a daemon
+/// that is in the middle of a bridge start or shutdown: the daemon's loop
+/// holds a request until that step ends, and a wait that reads the mode of
+/// the step for longer than the grace time fails although the daemon applies
+/// its mode afterwards. A wait ends at the first read after the grace time,
+/// and no pause between reads is longer than 500 ms.
 const MODE_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -205,9 +206,10 @@ enum ModePoll {
     Reached,
     Pending,
     WaitsForDocker,
-    /// The mode of another command shows, for less than [`MODE_GRACE`] so
-    /// far.
+    /// A mode of another command shows, and less than [`MODE_GRACE`] has
+    /// passed since one first did.
     Contested,
+    /// The mode that shows when the grace time is over.
     SetByAnother(NetbridgeMode),
     TurnedOff,
 }
@@ -217,8 +219,13 @@ enum ModePoll {
 /// The daemon reports the old mode until the bridge built for it is gone, so
 /// a mode that is neither the last one seen nor the wanted one comes from
 /// another command. `contested_for` is the time since the first read that
-/// showed such a mode, with the wanted mode in no read since. The other
-/// command won only when its mode still shows after [`MODE_GRACE`].
+/// showed such a mode, with the wanted mode in no read since. It does not
+/// start over when a third mode, or the old one, takes the place of that
+/// mode. Another command won when a read at or after [`MODE_GRACE`] still
+/// shows a mode that is not the wanted one, and the wait names the mode of
+/// that read. A wait that reads only the old mode cannot tell a command
+/// that set it back from a daemon that has not acted yet, so it goes on
+/// until the 60 s are used up.
 ///
 /// With `wait_for_up` the bridge was up before the request. A daemon that
 /// sends the phase sends `disabled` only for a bridge that nobody wants, so

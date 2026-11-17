@@ -216,7 +216,8 @@ pub struct DockerStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     /// Why the state is not `connected`, in a few plain words that the
-    /// daemon chooses and every surface prints as they are.
+    /// daemon chooses. A surface that prints them does not change them. The
+    /// status panel of the TUI leaves them out when its row is too narrow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// What the daemon knows beyond `reason`, such as the engine's error.
