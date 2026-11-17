@@ -238,7 +238,8 @@ impl Runtime {
         let rx = spawn_rx(udp.clone(), peer.clone(), vm_endpoint.clone(), dev_write);
         let tx = spawn_tx(udp.clone(), peer.clone(), vm_endpoint.clone(), dev_read);
         let timer = spawn_timer(udp.clone(), peer.clone(), vm_endpoint.clone());
-        let routes = spawn_route_reconciler(docker.clone(), options.mode, utun_name.clone());
+        let routes =
+            spawn_route_reconciler(docker.clone(), options.mode, utun_name.clone(), sbin_route);
 
         Ok(Self {
             utun_name,
@@ -504,12 +505,15 @@ where
     })
 }
 
-fn spawn_tx(
+fn spawn_tx<R>(
     udp: Arc<UdpSocket>,
     peer: Arc<Mutex<Peer>>,
     endpoint: Arc<Mutex<Option<SocketAddr>>>,
-    mut dev_read: tokio::io::ReadHalf<tun::AsyncDevice>,
-) -> JoinHandle<()> {
+    mut dev_read: R,
+) -> JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     tokio::spawn(async move {
         let mut pkt = vec![0u8; usize::from(u16::MAX)];
         let mut out = vec![0u8; usize::from(u16::MAX)];
@@ -582,7 +586,12 @@ fn spawn_timer(
     })
 }
 
-fn spawn_route_reconciler(docker: Docker, mode: NetbridgeMode, iface: String) -> JoinHandle<()> {
+fn spawn_route_reconciler(
+    docker: Docker,
+    mode: NetbridgeMode,
+    iface: String,
+    route: fn(&[&str]) -> std::io::Result<Output>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(ROUTE_RECONCILE_PERIOD);
         loop {
@@ -595,7 +604,7 @@ fn spawn_route_reconciler(docker: Docker, mode: NetbridgeMode, iface: String) ->
                 }
             };
             let cmds = startup_route_plan(&iface, &extra_route_cidrs);
-            let _ = tokio::task::spawn_blocking(move || reconcile_routes(&sbin_route, &cmds)).await;
+            let _ = tokio::task::spawn_blocking(move || reconcile_routes(&route, &cmds)).await;
         }
     })
 }
