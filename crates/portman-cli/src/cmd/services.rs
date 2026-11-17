@@ -387,8 +387,14 @@ impl InterruptedServices {
                 .filter(|row| names.contains(&row.name))
                 .all(start_ended)
         })
-        .await
-        .unwrap_or_default();
+        .await;
+        let Some(rows) = rows else {
+            report.fail(
+                known,
+                "the new daemon stopped answering after the start request",
+            );
+            return report;
+        };
         for service in known {
             match rows.iter().find(|row| row.name == service.name) {
                 Some(row) if row.state == ServiceState::Ready => report.started.push(service.name),
