@@ -27,7 +27,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
-use std::process::Command as StdCommand;
+use std::process::{Command as StdCommand, Output};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -338,7 +338,8 @@ impl Runtime {
     fn abort_tasks(&self) {
         // The kernel recycles utun names. Keep claiming this one after the
         // device is gone and route repair would treat a *recycled* utun —
-        // somebody else's VPN — as ours to repoint.
+        // somebody else's VPN — as ours to repoint. So the claim goes
+        // first, and the tasks that hold the device go after it.
         forget_own_utun(&self.utun_name);
         for t in &self.tasks {
             t.abort();
@@ -386,7 +387,7 @@ fn open_utun(extra_route_cidrs: &BTreeSet<String>) -> Result<(tun::AsyncDevice, 
             // The device drops with this error; stop claiming its name
             // (same reasoning as shutdown — names are recycled).
             forget_own_utun(&utun_name);
-            return Err(err);
+            return Err(err.into());
         }
         installed.record(cmd.cidr);
     }
@@ -599,14 +600,16 @@ fn spawn_route_reconciler(docker: Docker, mode: NetbridgeMode, iface: String) ->
 /// utun before the interface goes, and the routes go with the interface.
 fn reconcile_routes(route: &RunRoute, cmds: &[RouteCommand]) {
     for cmd in cmds {
-        let Err(err) = ensure_route_command(route, cmd) else {
-            continue;
-        };
-        if !is_own_utun(&cmd.iface) {
-            info!(iface = %cmd.iface, "netbridge route pass ended with its bridge");
-            return;
+        match ensure_route_command(route, cmd) {
+            Ok(()) => {}
+            Err(RouteError::LetGo) => {
+                info!(iface = %cmd.iface, "netbridge route pass ended with its bridge");
+                return;
+            }
+            Err(RouteError::Failed(err)) => {
+                warn!(cidr = %cmd.cidr, iface = %cmd.iface, %err, "netbridge route reconcile failed");
+            }
         }
-        warn!(cidr = %cmd.cidr, iface = %cmd.iface, %err, "netbridge route reconcile failed");
     }
 }
 
@@ -1538,6 +1541,15 @@ impl RouteCommand {
 /// other live utun belong to something else and are left alone.
 static OWN_UTUNS: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
 
+/// Held while a `route` command of a bridge runs.
+static ROUTE_IN_FLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn route_in_flight() -> std::sync::MutexGuard<'static, ()> {
+    ROUTE_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn remember_own_utun(name: &str) {
     OWN_UTUNS
         .lock()
@@ -1545,11 +1557,15 @@ fn remember_own_utun(name: &str) {
         .insert(name.to_string());
 }
 
+/// Ends the claim on `name` and waits for the `route` command that runs at
+/// this moment. No later command runs for the name, so the wait is for one
+/// command.
 fn forget_own_utun(name: &str) {
     OWN_UTUNS
         .lock()
         .expect("own-utun lock poisoned")
         .remove(name);
+    drop(route_in_flight());
 }
 
 fn is_own_utun(name: &str) -> bool {
@@ -1598,7 +1614,8 @@ impl Drop for InstalledRoutes {
             return;
         }
         for cidr in &self.cidrs {
-            if let Err(err) = run_route(&sbin_route, "delete", cidr, &self.iface) {
+            let args = ["-n", "delete", "-net", cidr, "-interface", &self.iface];
+            if let Err(err) = route_result("delete", sbin_route(&args)) {
                 warn!(%cidr, iface = %self.iface, %err, "rolling back netbridge route");
             }
         }
@@ -1639,25 +1656,37 @@ fn classify_existing_route(cidr: &str, existing_iface: &str, wanted_iface: &str)
     }
 }
 
-/// `route` takes an interface by its name, and the kernel gives the name of
-/// a utun that is gone to the next one, which can belong to a VPN.
-fn route_while_own(
-    route: &RunRoute,
-    iface: &str,
-    args: &[&str],
-) -> std::io::Result<std::process::Output> {
-    let own = OWN_UTUNS.lock().expect("own-utun lock poisoned");
-    if !own.contains(iface) {
-        let refused = format!("the bridge let go of {iface}");
-        return Err(std::io::Error::other(refused));
-    }
-    route(args)
+/// How a `route` command of a bridge ends without its work done.
+#[derive(Debug)]
+enum RouteError {
+    /// The bridge let go of the utun, so the command did not run.
+    LetGo,
+    Failed(anyhow::Error),
 }
 
-fn ensure_route_command(route: &RunRoute, cmd: &RouteCommand) -> Result<()> {
-    let route: &RunRoute = &|args| route_while_own(route, &cmd.iface, args);
+impl From<RouteError> for anyhow::Error {
+    fn from(err: RouteError) -> Self {
+        match err {
+            RouteError::LetGo => anyhow!("the bridge let go of its utun"),
+            RouteError::Failed(err) => err,
+        }
+    }
+}
+
+/// Runs `command` while the bridge holds `utun`. `route` takes an interface
+/// by its name, and the kernel gives the name of a utun that is gone to the
+/// next one, which can belong to a VPN.
+fn while_bridge_holds<T>(utun: &str, command: impl FnOnce() -> T) -> Result<T, RouteError> {
+    let _in_flight = route_in_flight();
+    if !is_own_utun(utun) {
+        return Err(RouteError::LetGo);
+    }
+    Ok(command())
+}
+
+fn ensure_route_command(route: &RunRoute, cmd: &RouteCommand) -> Result<(), RouteError> {
     if cmd.verb == "add" {
-        if let Some(existing) = specific_route_utun_interface(route, &cmd.cidr) {
+        if let Some(existing) = specific_route_utun_interface(route, &cmd.iface, &cmd.cidr)? {
             match classify_existing_route(&cmd.cidr, &existing, &cmd.iface) {
                 ExistingRoute::Correct => return Ok(()),
                 // The dedicated subnet belongs to this runtime even if its
@@ -1670,11 +1699,12 @@ fn ensure_route_command(route: &RunRoute, cmd: &RouteCommand) -> Result<()> {
                         alive = interface_is_alive(&existing),
                         "repointing stale netbridge route"
                     );
-                    if run_route(route, "change", &cmd.cidr, &cmd.iface).is_ok() {
-                        return Ok(());
+                    match run_route(route, "change", &cmd.cidr, &cmd.iface) {
+                        // `change` can fail if the route vanished under us;
+                        // fall through and let `add` handle it.
+                        Err(RouteError::Failed(_)) => {}
+                        ended => return ended,
                     }
-                    // `change` can fail if the route vanished under us; fall
-                    // through and let `add` handle it.
                 }
                 ExistingRoute::Foreign => {
                     debug!(
@@ -1690,30 +1720,37 @@ fn ensure_route_command(route: &RunRoute, cmd: &RouteCommand) -> Result<()> {
     }
 
     match run_route(route, cmd.verb, &cmd.cidr, &cmd.iface) {
-        Ok(()) => Ok(()),
-        Err(err) if cmd.verb == "add" => match specific_route_utun_interface(route, &cmd.cidr) {
-            Some(existing)
-                if classify_existing_route(&cmd.cidr, &existing, &cmd.iface)
-                    != ExistingRoute::Repair =>
-            {
-                debug!(cidr = %cmd.cidr, %existing, "route already present; leaving it in place");
-                Ok(())
+        Err(RouteError::Failed(err)) if cmd.verb == "add" => {
+            match specific_route_utun_interface(route, &cmd.iface, &cmd.cidr)? {
+                Some(existing)
+                    if classify_existing_route(&cmd.cidr, &existing, &cmd.iface)
+                        != ExistingRoute::Repair =>
+                {
+                    debug!(cidr = %cmd.cidr, %existing, "route already present; leaving it in place");
+                    Ok(())
+                }
+                _ => Err(RouteError::Failed(err)),
             }
-            _ => Err(err),
-        },
-        Err(err) => Err(err),
+        }
+        ended => ended,
     }
 }
 
-type RunRoute<'a> = dyn Fn(&[&str]) -> std::io::Result<std::process::Output> + 'a;
+type RunRoute<'a> = dyn Fn(&[&str]) -> std::io::Result<Output> + 'a;
 
-fn sbin_route(args: &[&str]) -> std::io::Result<std::process::Output> {
+fn sbin_route(args: &[&str]) -> std::io::Result<Output> {
     StdCommand::new("/sbin/route").args(args).output()
 }
 
-fn run_route(route: &RunRoute, verb: &str, cidr: &str, iface: &str) -> Result<()> {
-    let output = route(&["-n", verb, "-net", cidr, "-interface", iface])
-        .with_context(|| format!("spawning /sbin/route {verb}"))?;
+/// Runs one `route` command for `iface`, while the bridge holds it.
+fn run_route(route: &RunRoute, verb: &str, cidr: &str, iface: &str) -> Result<(), RouteError> {
+    let args = ["-n", verb, "-net", cidr, "-interface", iface];
+    let output = while_bridge_holds(iface, || route(&args))?;
+    route_result(verb, output).map_err(RouteError::Failed)
+}
+
+fn route_result(verb: &str, output: std::io::Result<Output>) -> Result<()> {
+    let output = output.with_context(|| format!("spawning /sbin/route {verb}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
@@ -1730,16 +1767,24 @@ fn run_route(route: &RunRoute, verb: &str, cidr: &str, iface: &str) -> Result<()
     Ok(())
 }
 
-fn specific_route_utun_interface(route: &RunRoute, cidr: &str) -> Option<String> {
-    let addr = cidr.split('/').next()?;
-    let Ok(output) = route(&["-n", "get", addr]) else {
-        return None;
+/// The utun of the specific route to `cidr`, asked for while the bridge
+/// holds `iface`.
+fn specific_route_utun_interface(
+    route: &RunRoute,
+    iface: &str,
+    cidr: &str,
+) -> Result<Option<String>, RouteError> {
+    let Some(addr) = cidr.split('/').next() else {
+        return Ok(None);
+    };
+    let Ok(output) = while_bridge_holds(iface, || route(&["-n", "get", addr]))? else {
+        return Ok(None);
     };
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    route_get_specific_utun_interface(&stdout, addr)
+    Ok(route_get_specific_utun_interface(&stdout, addr))
 }
 
 fn route_get_specific_utun_interface(stdout: &str, addr: &str) -> Option<String> {
