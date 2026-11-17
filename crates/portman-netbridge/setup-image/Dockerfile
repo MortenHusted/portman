@@ -30,9 +30,9 @@
 # legacy `PEER_PRIVKEY` so already-installed daemons keep working during
 # rolling upgrades; new runtimes do not pass that env var.
 #
-# The image stays tiny on purpose: no shell beyond what alpine ships,
-# no extra tools. If anything goes wrong, exit non-zero with a clear
-# message — the caller parses our stderr to surface it.
+# The image stays small on purpose: no shell beyond what alpine ships,
+# and only the packages below. If anything goes wrong, exit non-zero with
+# a clear message — the caller parses our stderr to surface it.
 #
 # The same image runs the split DNS forwarder: `entrypoint.sh dns <dnsmasq
 # arguments>` runs dnsmasq in the foreground. The daemon starts that

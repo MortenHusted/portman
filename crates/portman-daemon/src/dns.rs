@@ -13,8 +13,9 @@
 //!     rewritten to `proxy` (so a container resolves an HTTP-mode host to
 //!     the host's tunnel IP instead of its own loopback). Containers reach
 //!     TCP targets directly, not via a host loopback front. A name that the
-//!     registry does not hold gets `REFUSED` for every query type, because
-//!     the forwarder in the VM asks its next upstream only after `REFUSED`.
+//!     registry does not hold gets `REFUSED` for every query type. The
+//!     forwarder in the VM then asks its next upstream, which it does not
+//!     do after `NXDOMAIN`.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -510,7 +511,6 @@ mod tests {
         let for_the_host =
             |addr: SocketAddr| run(registry.clone(), addr.port(), LoopbackAllocator::new());
 
-        // (the listener, name) → response code
         assert_eq!(
             answer_of_a_listener_started_with(for_containers, "gone.demo.test").await,
             ResponseCode::Refused

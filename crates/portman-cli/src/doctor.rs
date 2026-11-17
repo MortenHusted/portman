@@ -1052,7 +1052,7 @@ const LOOKUP_RESOLVER_SECS: u64 = 2;
 /// create and start the container, the resolver in it waits for up to
 /// [`LOOKUP_RESOLVER_SECS`], and the engine then removes the container. The
 /// engine gets [`DOCKER_CLI_BOUND`] before the lookup and again after it, as
-/// it gets for any other call: 3 s, 2 s and 3 s.
+/// it gets for any other call.
 const LOOKUP_BOUND: Duration =
     Duration::from_secs(2 * DOCKER_CLI_BOUND.as_secs() + LOOKUP_RESOLVER_SECS);
 

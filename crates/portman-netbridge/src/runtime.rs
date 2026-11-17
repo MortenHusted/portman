@@ -16,8 +16,9 @@
 //!     handshake fires promptly after the VM peer starts.
 //!
 //! On request it also makes the engine run a DNS forwarder container on
-//! the VM host network ([`Runtime::ensure_dns_forwarder`]). A shutdown
-//! leaves that container running.
+//! the VM host network ([`Runtime::ensure_dns_forwarder`]).
+//! [`Runtime::shutdown`] leaves that container running, and
+//! [`Runtime::shutdown_and_remove_network`] removes it.
 //!
 //! It is **only** the v1 host-side bridge; it knows nothing about
 //! portman's proxy or registry, and of its DNS only the address that the

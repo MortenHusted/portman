@@ -7,10 +7,11 @@
 //! depend on the answer.
 //!
 //! Today: DNS/HTTP/TLS listeners on `192.168.99.1` that answer the
-//! same way the host-facing DNS/proxy surfaces do, with two exceptions
+//! same way the host-facing DNS/proxy surfaces do, with three exceptions
 //! in DNS. It rewrites any A-record answer of `127.0.0.1` to
-//! `192.168.99.1`, and it answers `REFUSED` for a name the registry does
-//! not hold (see `dns`).
+//! `192.168.99.1`, it answers a TCP route with the address of the route's
+//! target and not with a loopback front, and it answers `REFUSED` for a
+//! name the registry does not hold (see `dns`).
 //! That's what makes static rules like `crm.acme → 127.0.0.1:3070`
 //! work from inside a portman-network container: the container
 //! resolves to the host's tunnel IP, hits Portman's tunnel-side proxy,
