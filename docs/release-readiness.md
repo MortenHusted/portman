@@ -211,14 +211,37 @@ route `web.demo.test` and a TCP route `db.demo.test` to a container on the
    `dns forwarder: running at 192.168.99.129`.
 10. Build `portman-netbridge/setup:local` from the `setup-image` folder of
     the release before this feature, and enable the bridge. Confirm that the
-    bridge comes up and that doctor prints `dns forwarder: unavailable`. Run
-    `portman bridge prepare`. Confirm that `portman-netbridge-dns` runs within
-    a minute.
+    bridge comes up and that doctor prints `dns forwarder: unavailable` and
+    `setup image: older than this portman`. Run `portman bridge prepare`.
+    Confirm that `portman-netbridge-dns` runs within a minute and that doctor
+    prints `setup image: present`.
 11. From a container with `--dns 192.168.99.129`, look `late.demo.test` up
     before it is registered. Register it, and confirm that the next lookup
     resolves it.
 12. Stop the VM, run `portman bridge disable`, and start the VM. Confirm that
     `portman-netbridge-dns` and the `portman` network are gone.
+13. With the bridge up and one running container attached to the `portman`
+    network, run `portman uninstall`. Confirm that `portman-netbridge-dns`
+    and `portman-netbridge-setup` are gone, that the `portman` network stays,
+    and that the uninstall prints no `docker` command. Run `portman install`.
+    Confirm that the bridge comes up with no `portman bridge enable`, and
+    that `portman-netbridge-dns` runs again.
+14. From a container with `--dns 192.168.99.129`, run `dig` for a name under
+    a managed TLD that portman does not hold. `dig` sends a DNS cookie.
+    Confirm the answer of the VM's resolver, which is `NXDOMAIN` for a name
+    under `.test`, and not `REFUSED`. Repeat with `dig +noedns`, with `dig
+    +nocookie`, and with `dig +subnet=198.51.100.0/24`. Confirm that `dig
+    +tcp` gets `REFUSED`.
+15. From the same container, look up a TXT record set of more than 512 bytes
+    for a name outside the managed TLDs, with `dig +noedns +ignore` and with
+    `dig`. Confirm that each answer is the one that a container without the
+    option gets: the same flags, the `tc` flag of the first among them, and
+    the same records.
+16. Confirm that `docker exec portman-netbridge-dns dnsmasq --version` prints
+    2.91 or later. Confirm that `docker exec portman-netbridge-setup wg show
+    chip0` shows a handshake in the last three minutes, and that a request
+    from the Mac to the address of a container on the `portman` network gets
+    its answer.
 
 ## Current Evidence
 
@@ -297,7 +320,7 @@ or require a running local workload for useful comparison.
 | Docker bridge replacement | Mode persistence tests; Docker route-planning tests; health scope excludes unrelated networks; CLI doctor fixture tests for setup image, legacy bridge guidance, route parsing, and labelled-network rendering | `portman bridge mode docker`, `portman doctor`, stop docker-mac-net-connect, verify labelled containers on compose/default bridge networks resolve and connect | Partial: labelled TCP cutover verified on `dev_default`; broader disposable matrix still manual |
 | Container resources | Protocol defaults tests; daemon CPU/memory/network/block-IO calculation tests; per-second counter-rate test; Swift release build | `portman resources`, open Swift Resources pane, compare top rows with `docker stats --no-stream` and confirm network/block IO display as rates rather than lifetime totals | Manual comparison gate |
 | Container-facing DNS/proxy | DNS loopback rewrite test; response-code test of both DNS listeners for held and unheld names; host-facing service bind-plan test for `192.168.99.1:53/:80/:443`; host-facing retry test | Run disposable container on a routed network, query `@192.168.99.1`, then `curl http://<managed-host>` and `curl https://<managed-host>` where TLS is enabled | Manual gate |
-| Container DNS forwarder | Forwarder argument tests; entrypoint `dns` mode tests with a stand-in `dnsmasq`; replace-or-keep decision tests; removal tests against a fake engine; control-loop tests under paused time; doctor line tests | The twelve gates under "Container DNS Forwarder" | Manual gate |
+| Container DNS forwarder | Forwarder argument tests; entrypoint `dns` mode tests with a stand-in `dnsmasq`; replace-or-keep decision tests; removal tests against a fake engine; control-loop tests under paused time; doctor line tests | The sixteen gates under "Container DNS Forwarder" | Manual gate |
 | Setup image | Shell syntax check; runtime ownership tests | Docker build/run in a disposable context, inspect `wg show chip0` and `ip addr show chip0` | Manual gate |
 | Web dashboard | `portman dashboard`; dashboard Host/Origin tests; protected registry-entry test | Open `http://portman.localhost`, verify status, entries, static add/remove, TLD list, resource usage | Manual gate |
 
