@@ -1804,7 +1804,18 @@ fn sbin_route(args: &[&str]) -> std::io::Result<Output> {
 }
 
 /// Runs `command` to its end and returns what it printed. A command that
-/// runs longer than `limit` is killed.
+/// runs longer than `limit` is killed and gets [`KILL_GRACE`] to go away.
+/// One that is still there after the grace is left behind with a warning,
+/// because a wait without a bound would hold a bridge that ends. So a
+/// bridge that has let go of its utun promises this much: no `route`
+/// command runs for the utun, provided that a killed `route` goes away
+/// within the grace.
+///
+/// This is for a program like `route`, which starts no program of its own
+/// and prints less than a pipe holds. A program that leaves a child with
+/// its output open holds this call past the limit. A program that prints
+/// more than a pipe holds waits for a reader, which comes only after the
+/// program has ended, so it is killed at the limit.
 fn output_within(command: &mut StdCommand, limit: Duration) -> std::io::Result<Output> {
     let mut child = command
         .stdin(Stdio::null())
@@ -1815,7 +1826,12 @@ fn output_within(command: &mut StdCommand, limit: Duration) -> std::io::Result<O
         return child.wait_with_output();
     }
     child.kill()?;
-    exits_within(&mut child, KILL_GRACE)?;
+    if !exits_within(&mut child, KILL_GRACE)? {
+        warn!(
+            pid = child.id(),
+            "a command that was killed at its limit is still there; it is left behind"
+        );
+    }
     let timed_out = format!("the command did not end within {limit:?}");
     Err(std::io::Error::new(std::io::ErrorKind::TimedOut, timed_out))
 }
