@@ -126,7 +126,10 @@ const START_CLAIMS_WITHIN: Duration = Duration::from_secs(2);
 /// setup container: a claim can fail the other daemon's start, and the
 /// retry of that start comes [`RETRY_BASE`] later, which can be after the
 /// head start. The bound holds for a daemon that was built with the same
-/// limits.
+/// limits and that has ended the bridge of a lost session before its next
+/// start claims the port. A 0.1.7 daemon does not wait for that end, so its
+/// first start on a new session can fail on its own port and wait
+/// [`RETRY_BASE`] for the retry.
 const HEAD_START: Duration =
     Duration::from_secs(SESSION_OPENS_WITHIN.as_secs() + START_CLAIMS_WITHIN.as_secs());
 
@@ -3974,6 +3977,15 @@ mod tests {
         );
         assert_eq!(opened.elapsed(), HEAD_START);
         rig.no_sweep_follows().await;
+    }
+
+    #[test]
+    fn a_cleanup_that_waits_for_docker_says_how_long_after_the_connect_it_runs() {
+        let stated = format!("{} s after Docker connects", HEAD_START.as_secs());
+
+        let words = BridgeCleanup::WaitsForDocker.in_words();
+
+        assert!(words.contains(&stated), "{words}");
     }
 
     #[test]

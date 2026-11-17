@@ -194,8 +194,9 @@ pub enum BridgeCleanup {
     /// The daemon has not acted on a disable yet, or the removal runs now.
     /// A client that waits for a disable waits until this has passed.
     Pending,
-    /// No container engine is connected. The daemon removes them when one
-    /// connects, also when the daemon restarted in between.
+    /// No container engine is connected. The daemon removes them once one
+    /// has been connected for 10 s, unless the UDP port of the bridge is
+    /// then taken. That also holds when the daemon restarted in between.
     WaitsForDocker,
     /// A container engine connected less than `for_secs` ago. The daemon
     /// removes them once the engine has been connected for that long, so
@@ -238,7 +239,7 @@ impl BridgeCleanup {
                 format!("portman has not removed {leftovers} yet: the removal still runs")
             }
             BridgeCleanup::WaitsForDocker => format!(
-                "portman has not removed {leftovers}: Docker is not connected. It removes them when Docker connects"
+                "portman has not removed {leftovers}: Docker is not connected. It removes them 10 s after Docker connects, unless another program then holds the UDP port of the bridge"
             ),
             BridgeCleanup::WaitsForBridges { for_secs } => format!(
                 "portman has not removed {leftovers} yet: it waits until Docker has been connected for {for_secs} s, so that the bridge of another portman daemon can take the UDP port of the bridge first"
@@ -1664,7 +1665,8 @@ mod tests {
         assert_eq!(
             BridgeCleanup::WaitsForDocker.in_words(),
             "portman has not removed the dns forwarder and the `portman` network: Docker is \
-             not connected. It removes them when Docker connects"
+             not connected. It removes them 10 s after Docker connects, unless another program \
+             then holds the UDP port of the bridge"
         );
         assert_eq!(
             BridgeCleanup::WaitsForBridges { for_secs: 10 }.in_words(),
