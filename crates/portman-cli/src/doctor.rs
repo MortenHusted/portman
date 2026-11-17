@@ -162,18 +162,41 @@ pub(crate) enum DnsForwarderStatus {
         state: Option<String>,
     },
     Running(ForwarderQuery),
-    DockerUnavailable {
-        message: String,
-    },
+    DockerUnavailable(DockerCliError),
+}
+
+impl DnsForwarderStatus {
+    /// What the last `docker` call of the check learned.
+    pub(crate) fn cli_answer(&self) -> CliAnswer<'_> {
+        match self {
+            DnsForwarderStatus::DockerUnavailable(error)
+            | DnsForwarderStatus::Running(ForwarderQuery::NotRun { error, .. }) => Err(error),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// One lookup of a managed name from a container that has the forwarder as
 /// its only resolver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ForwarderQuery {
-    NotSent { why: String },
-    Answered { name: String, address: String },
-    Unanswered { name: String, detail: String },
+    NotSent {
+        why: String,
+    },
+    Answered {
+        name: String,
+        address: String,
+    },
+    /// The engine ran the lookup, or refused to, and no address came back.
+    Unanswered {
+        name: String,
+        detail: String,
+    },
+    /// The `docker` CLI gave nothing to read for the lookup.
+    NotRun {
+        name: String,
+        error: DockerCliError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -345,10 +368,9 @@ async fn dns_forwarder_status(phase: Option<BridgePhase>, routes: &[Entry]) -> D
     let image = ["image", "inspect", SETUP_IMAGE, "--format", &label_of_image];
     let state = "{{.State.Status}}";
     let container = ["container", "inspect", DNS_CONTAINER, "--format", state];
-    let printed = |answer: Result<String, DockerCliError>| answer.map_err(|err| err.to_string());
     classify_dns_forwarder(
-        printed(docker_stdout(&image).await),
-        async { printed(docker_stdout(&container).await) },
+        docker_stdout(&image).await,
+        docker_stdout(&container),
         async {
             match forwarder_query_name(phase, routes) {
                 Ok(name) => look_up_through_forwarder(&["docker"], name, LOOKUP_BOUND).await,
@@ -364,30 +386,31 @@ async fn dns_forwarder_status(phase: Option<BridgePhase>, routes: &[Entry]) -> D
 /// its error. The container is asked about only for an image that has the
 /// `dns` mode, and `look_up` runs only for a container that runs.
 async fn classify_dns_forwarder(
-    image_label: Result<String, String>,
-    container_state: impl Future<Output = Result<String, String>>,
+    image_label: Result<String, DockerCliError>,
+    container_state: impl Future<Output = Result<String, DockerCliError>>,
     look_up: impl Future<Output = ForwarderQuery>,
 ) -> DnsForwarderStatus {
-    let engine_has_no = |what: &str, message: &str| {
+    let engine_has_no = |what: &str, error: &DockerCliError| {
+        let message = error.to_string();
         message.contains(&format!("No such {what}")) || message.contains("No such object")
     };
     match image_label {
         Ok(value) if value.trim() == DNS_IMAGE_LABEL.1 => {}
         Ok(_) => return DnsForwarderStatus::ImageWithoutDnsMode,
-        Err(message) if engine_has_no("image", &message) => {
+        Err(error) if engine_has_no("image", &error) => {
             return DnsForwarderStatus::ImageWithoutDnsMode
         }
-        Err(message) => return DnsForwarderStatus::DockerUnavailable { message },
+        Err(error) => return DnsForwarderStatus::DockerUnavailable(error),
     }
     match container_state.await {
         Ok(state) if state.trim() == "running" => DnsForwarderStatus::Running(look_up.await),
         Ok(state) => DnsForwarderStatus::NotRunning {
             state: Some(state.trim().to_string()),
         },
-        Err(message) if engine_has_no("container", &message) => {
+        Err(error) if engine_has_no("container", &error) => {
             DnsForwarderStatus::NotRunning { state: None }
         }
-        Err(message) => DnsForwarderStatus::DockerUnavailable { message },
+        Err(error) => DnsForwarderStatus::DockerUnavailable(error),
     }
 }
 
@@ -476,18 +499,19 @@ async fn look_up_through_forwarder(
         &["--entrypoint", "getent", SETUP_IMAGE, "hosts", &name],
     ]
     .concat();
-    let detail = match bounded_output(program, &run, bound).await {
+    let error = match bounded_output(program, &run, bound).await {
         Ok(ran) => {
-            return forwarder_query(
-                name,
-                ran.status.success(),
-                &String::from_utf8_lossy(&ran.stdout),
-                &String::from_utf8_lossy(&ran.stderr),
-            )
+            let stderr = String::from_utf8_lossy(&ran.stderr);
+            if !ran.status.success() && reached_no_engine(&stderr) {
+                DockerCliError::NoAnswer(stderr.trim().to_string())
+            } else {
+                let stdout = String::from_utf8_lossy(&ran.stdout);
+                return forwarder_query(name, ran.status.success(), &stdout, &stderr);
+            }
         }
         Err(DockerCliError::NoAnswer(no_answer)) => {
             let remove = [first_args, &["rm", "--force", &container]].concat();
-            match run_docker(program, &remove, DOCKER_CLI_BOUND).await {
+            DockerCliError::NoAnswer(match run_docker(program, &remove, DOCKER_CLI_BOUND).await {
                 Ok(_) => no_answer,
                 Err(DockerCliError::Failed(gone)) if gone.contains("No such container") => {
                     no_answer
@@ -495,11 +519,11 @@ async fn look_up_through_forwarder(
                 Err(_) => format!(
                     "{no_answer}; the lookup container can still exist, `docker rm --force {container}` removes it"
                 ),
-            }
+            })
         }
-        Err(error) => error.to_string(),
+        Err(error) => error,
     };
-    ForwarderQuery::Unanswered { name, detail }
+    ForwarderQuery::NotRun { name, error }
 }
 
 /// What the lookup container's exit and output say. `getent` prints nothing
@@ -537,6 +561,10 @@ fn check_dns_forwarder(report: &DnsForwarderReport) -> CheckOutcome {
             CheckState::Warn,
             format!("{at}, {name} does not resolve through it ({detail})"),
         ),
+        DnsForwarderStatus::Running(ForwarderQuery::NotRun { name, error }) => (
+            CheckState::Warn,
+            format!("{at}, {name} does not resolve through it ({error})"),
+        ),
         DnsForwarderStatus::Running(ForwarderQuery::NotSent { why }) => {
             (CheckState::Ok, format!("{at}, not queried ({why})"))
         }
@@ -552,9 +580,9 @@ fn check_dns_forwarder(report: &DnsForwarderReport) -> CheckOutcome {
             CheckState::Warn,
             "dns forwarder: unavailable, the setup image has no dns mode (run `portman bridge prepare`; a bridge that is up then gets the forwarder within a minute)".to_string(),
         ),
-        DnsForwarderStatus::DockerUnavailable { message } => (
+        DnsForwarderStatus::DockerUnavailable(error) => (
             CheckState::Warn,
-            format!("dns forwarder: unavailable ({message})"),
+            format!("dns forwarder: unavailable ({error})"),
         ),
     };
     let mut lines = vec![line];
@@ -619,15 +647,20 @@ fn replacement_ready(outcomes: &[CheckOutcome]) -> bool {
 pub(crate) fn render_report(report: &DoctorReport) -> String {
     let legacy = check_legacy_bridge(&report.legacy_bridge);
     let legacy_running = legacy.state != CheckState::Ok;
-    let cli_answers = [
+    let mut cli_answers = vec![
         report.setup_image.cli_answer(),
         report.docker_routes.cli_answer(),
     ];
+    let mut cli_lines = "setup image and labelled docker networks lines";
+    if let Some(forwarder) = &report.dns_forwarder {
+        cli_answers.push(forwarder.status.cli_answer());
+        cli_lines = "setup image, dns forwarder and labelled docker networks lines";
+    }
     let mut outcomes = vec![check_daemon(&report.daemon)];
     outcomes.extend(check_docker(
         report.daemon.docker.as_ref(),
         &cli_answers,
-        "setup image and labelled docker networks lines",
+        cli_lines,
     ));
     outcomes.extend([
         check_setup_image(&report.setup_image),
@@ -696,8 +729,8 @@ fn bridge_guidance(phase: Option<BridgePhase>) -> &'static [&'static str] {
 }
 
 /// The daemon's own view of the engine. A daemon that reports none gets no
-/// line. The setup image check and the docker networks check ask the
-/// `docker` CLI.
+/// line. The setup image check, the DNS forwarder check and the docker
+/// networks check ask the `docker` CLI.
 fn check_docker(
     docker: Option<&DockerStatus>,
     cli_answers: &[CliAnswer<'_>],
@@ -1108,11 +1141,17 @@ async fn run_docker(
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     Err(if stderr.is_empty() {
         DockerCliError::Failed(format!("docker {args:?} exited with {}", output.status))
-    } else if NO_ENGINE.iter().any(|phrase| stderr.contains(phrase)) {
+    } else if reached_no_engine(&stderr) {
         DockerCliError::NoAnswer(stderr)
     } else {
         DockerCliError::Failed(stderr)
     })
+}
+
+/// Whether a call that failed printed what the CLI prints when it reaches
+/// no engine.
+fn reached_no_engine(stderr: &str) -> bool {
+    NO_ENGINE.iter().any(|phrase| stderr.contains(phrase))
 }
 
 fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
@@ -1356,9 +1395,9 @@ mod tests {
     }
 
     #[test]
-    fn doctor_reads_the_setup_image_check_as_one_of_the_two_that_ask_the_docker_cli() {
+    fn doctor_reads_the_setup_image_check_as_one_of_those_that_ask_the_docker_cli() {
         let no_answer = || DockerCliError::NoAnswer("no answer in 3 s".to_string());
-        let lines = "the setup image and labelled docker networks lines below";
+        let lines = "the setup image, dns forwarder and labelled docker networks lines below";
 
         let mut image_got_no_answer = with_docker(Some(connected_docker()));
         image_got_no_answer.setup_image = SetupImageStatus::Unavailable(no_answer());
@@ -1464,19 +1503,66 @@ mod tests {
 
     #[test]
     fn doctor_counts_a_forwarder_check_that_got_no_answer_toward_the_docker_cli_note() {
-        let mut report = with_docker(Some(connected_docker()));
-        report.dns_forwarder = Some(forwarder(DnsForwarderStatus::DockerUnavailable {
-            message: "no answer in 3 s".to_string(),
-        }));
-
-        let rendered = render_report(&report);
-
+        let no_answer = |waited: &str| DockerCliError::NoAnswer(format!("no answer in {waited}"));
+        let name = || "web.demo.test".to_string();
+        let lookup_killed = ForwarderQuery::NotRun {
+            name: name(),
+            error: no_answer("8 s"),
+        };
+        let no_address = ForwarderQuery::Unanswered {
+            name: name(),
+            detail: "getent found no address".to_string(),
+        };
+        let refused = DockerCliError::Failed("permission denied".to_string());
         let note = "\ndocker CLI: a check got no answer from an engine, and the daemon is \
                     connected to one; the setup image, dns forwarder and labelled docker \
                     networks lines below come from the `docker` CLI\n";
-        assert!(rendered.contains(note), "{rendered}");
+        // the forwarder check → (its line, the note shows)
+        let table = [
+            (
+                DnsForwarderStatus::DockerUnavailable(no_answer("3 s")),
+                "dns forwarder: unavailable (no answer in 3 s)",
+                true,
+            ),
+            (
+                running(lookup_killed),
+                "dns forwarder: running at 192.168.99.129, web.demo.test does not resolve through it (no answer in 8 s)",
+                true,
+            ),
+            (
+                DnsForwarderStatus::DockerUnavailable(refused),
+                "dns forwarder: unavailable (permission denied)",
+                false,
+            ),
+            (
+                running(no_address),
+                "dns forwarder: running at 192.168.99.129, web.demo.test does not resolve through it (getent found no address)",
+                false,
+            ),
+        ];
+        for (status, line, noted) in table {
+            let mut report = with_docker(Some(connected_docker()));
+            report.dns_forwarder = Some(forwarder(status.clone()));
+
+            let rendered = render_report(&report);
+
+            assert_eq!(rendered.contains(note), noted, "{status:?}\n{rendered}");
+            assert_eq!(rendered.contains("docker CLI:"), noted, "{rendered}");
+            assert!(rendered.contains(&format!("\n{line}\n")), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn the_docker_cli_note_names_the_forwarder_line_only_where_doctor_prints_one() {
+        let mut report = with_docker(Some(connected_docker()));
+        report.dns_forwarder = None;
+        report.setup_image =
+            SetupImageStatus::Unavailable(DockerCliError::NoAnswer("no answer in 3 s".into()));
+
+        let rendered = render_report(&report);
+
         assert!(
-            rendered.contains("\ndns forwarder: unavailable (no answer in 3 s)\n"),
+            rendered.contains("the setup image and labelled docker networks lines below"),
             "{rendered}"
         );
     }
@@ -1580,9 +1666,9 @@ mod tests {
         let restarting = DnsForwarderStatus::NotRunning {
             state: Some("restarting".to_string()),
         };
-        let no_engine = DnsForwarderStatus::DockerUnavailable {
-            message: "Cannot connect to the Docker daemon".to_string(),
-        };
+        let no_engine = DnsForwarderStatus::DockerUnavailable(DockerCliError::NoAnswer(
+            "Cannot connect to the Docker daemon".to_string(),
+        ));
         // status → the line
         let table = [
             (
@@ -1692,15 +1778,17 @@ mod tests {
     #[tokio::test]
     async fn the_forwarder_is_looked_at_in_order_and_asked_only_when_it_runs() {
         let ok = |printed: &str| Ok(printed.to_string());
-        let err = |message: &str| Err(message.to_string());
-        let no_image = "Error response from daemon: No such image: portman-netbridge/setup:local";
-        let no_container = "Error response from daemon: No such container: portman-netbridge-dns";
-        let no_object = "Error: No such object: portman-netbridge-dns";
-        let no_engine = "Cannot connect to the Docker daemon";
-        let no_cli = "`docker` not found";
-        let unavailable = |message: &str| DnsForwarderStatus::DockerUnavailable {
-            message: message.to_string(),
-        };
+        let failed = |message: &str| DockerCliError::Failed(message.to_string());
+        let no_image =
+            failed("Error response from daemon: No such image: portman-netbridge/setup:local");
+        let no_container =
+            failed("Error response from daemon: No such container: portman-netbridge-dns");
+        let no_object = failed("Error: No such object: portman-netbridge-dns");
+        let no_engine = DockerCliError::NoAnswer("Cannot connect to the Docker daemon".into());
+        let no_cli = DockerCliError::NotStarted("`docker` not found".into());
+        let err = |error: &DockerCliError| Err(error.clone());
+        let unavailable =
+            |error: &DockerCliError| DnsForwarderStatus::DockerUnavailable(error.clone());
         let not_running = |state: Option<&str>| DnsForwarderStatus::NotRunning {
             state: state.map(String::from),
         };
@@ -1714,17 +1802,17 @@ mod tests {
                 Some(ok("restarting\n")),
                 not_running(Some("restarting")),
             ),
-            (ok("1\n"), Some(err(no_container)), not_running(None)),
-            (ok("1\n"), Some(err(no_object)), not_running(None)),
-            (ok("1\n"), Some(err(no_image)), unavailable(no_image)),
-            (ok("1\n"), Some(err(no_engine)), unavailable(no_engine)),
+            (ok("1\n"), Some(err(&no_container)), not_running(None)),
+            (ok("1\n"), Some(err(&no_object)), not_running(None)),
+            (ok("1\n"), Some(err(&no_image)), unavailable(&no_image)),
+            (ok("1\n"), Some(err(&no_engine)), unavailable(&no_engine)),
             (ok("\n"), None, ImageWithoutDnsMode),
             (ok("2\n"), None, ImageWithoutDnsMode),
-            (err(no_image), None, ImageWithoutDnsMode),
-            (err(no_object), None, ImageWithoutDnsMode),
-            (err(no_container), None, unavailable(no_container)),
-            (err(no_engine), None, unavailable(no_engine)),
-            (err(no_cli), None, unavailable(no_cli)),
+            (err(&no_image), None, ImageWithoutDnsMode),
+            (err(&no_object), None, ImageWithoutDnsMode),
+            (err(&no_container), None, unavailable(&no_container)),
+            (err(&no_engine), None, unavailable(&no_engine)),
+            (err(&no_cli), None, unavailable(&no_cli)),
         ];
         for (image_label, container_state, want) in table {
             let case = format!("{image_label:?} {container_state:?}");
@@ -1806,16 +1894,31 @@ mod tests {
         for (rm, detail) in table {
             let (query, calls) = look_up_with(&hangs_then(rm), Duration::from_millis(100)).await;
 
-            let unanswered = ForwarderQuery::Unanswered {
+            let not_run = ForwarderQuery::NotRun {
                 name: "web.demo.test".to_string(),
-                detail: detail.to_string(),
+                error: DockerCliError::NoAnswer(detail.to_string()),
             };
-            assert_eq!(query, unanswered, "{rm}");
+            assert_eq!(query, not_run, "{rm}");
             assert_eq!(calls.len(), 2, "{calls:?}");
             let named = format!("run --rm --pull never --name {container} --dns 192.168.99.129 ");
             assert!(calls[0].starts_with(&named), "{calls:?}");
             assert_eq!(calls[1], format!("rm --force {container}"), "{rm}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_lookup_whose_docker_call_reaches_no_engine_reads_as_a_call_with_no_answer() {
+        let no_engine = "Cannot connect to the Docker daemon at unix:///run/demo/docker.sock";
+        let run = format!("echo '{no_engine}' >&2; exit 1");
+
+        let (query, calls) = look_up_with(&run, Duration::from_secs(60)).await;
+
+        let not_run = ForwarderQuery::NotRun {
+            name: "web.demo.test".to_string(),
+            error: DockerCliError::NoAnswer(no_engine.to_string()),
+        };
+        assert_eq!(query, not_run);
+        assert_eq!(calls.len(), 1, "{calls:?}");
     }
 
     #[tokio::test]
