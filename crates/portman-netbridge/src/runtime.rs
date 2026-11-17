@@ -235,8 +235,20 @@ impl Runtime {
         let vm_endpoint: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
         let (dev_read, dev_write) = tokio::io::split(device);
 
-        let rx = spawn_rx(udp.clone(), peer.clone(), vm_endpoint.clone(), dev_write);
-        let tx = spawn_tx(udp.clone(), peer.clone(), vm_endpoint.clone(), dev_read);
+        let rx = spawn_rx(
+            udp.clone(),
+            peer.clone(),
+            vm_endpoint.clone(),
+            &utun_name,
+            dev_write,
+        );
+        let tx = spawn_tx(
+            udp.clone(),
+            peer.clone(),
+            vm_endpoint.clone(),
+            &utun_name,
+            dev_read,
+        );
         let timer = spawn_timer(udp.clone(), peer.clone(), vm_endpoint.clone());
         let routes =
             spawn_route_reconciler(docker.clone(), options.mode, utun_name.clone(), sbin_route);
@@ -414,15 +426,38 @@ fn prevent_child_inheritance(fd: RawFd) -> Result<()> {
 
 // ── Task spawners ──────────────────────────────────────────────────
 
+/// A pump's half of the bridge's utun device. A pump that ends drops its
+/// half, whatever ended it, and the device closes when both halves have
+/// dropped. The kernel can then give the name of the utun to the next one,
+/// so the bridge lets go of the name before the half drops. Rust runs the
+/// `drop` of a value before it drops the value's fields, and it moves no
+/// field out of a type that has a `drop`. So no change to a pump can put the
+/// half ahead of the let-go.
+struct OwnHalf<D> {
+    utun: String,
+    half: D,
+}
+
+impl<D> Drop for OwnHalf<D> {
+    fn drop(&mut self) {
+        forget_own_utun(&self.utun);
+    }
+}
+
 fn spawn_rx<W>(
     udp: Arc<UdpSocket>,
     peer: Arc<Mutex<Peer>>,
     endpoint: Arc<Mutex<Option<SocketAddr>>>,
-    mut dev_write: W,
+    utun: &str,
+    dev_write: W,
 ) -> JoinHandle<()>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let mut dev_write = OwnHalf {
+        utun: utun.to_string(),
+        half: dev_write,
+    };
     tokio::spawn(async move {
         // Sized so no UDP datagram or 1500-MTU container packet can arrive
         // truncated — a clipped frame would feed decapsulate garbage that
@@ -479,7 +514,7 @@ where
                             authenticated = true;
                         }
                         let pkt_len = pkt.len();
-                        if let Err(err) = dev_write.write_all(&out[..4 + pkt_len]).await {
+                        if let Err(err) = dev_write.half.write_all(&out[..4 + pkt_len]).await {
                             if !send_warned {
                                 warn!(%err, "netbridge rx pump failed to write utun; further failures muted");
                                 send_warned = true;
@@ -509,17 +544,22 @@ fn spawn_tx<R>(
     udp: Arc<UdpSocket>,
     peer: Arc<Mutex<Peer>>,
     endpoint: Arc<Mutex<Option<SocketAddr>>>,
-    mut dev_read: R,
+    utun: &str,
+    dev_read: R,
 ) -> JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    let mut dev_read = OwnHalf {
+        utun: utun.to_string(),
+        half: dev_read,
+    };
     tokio::spawn(async move {
         let mut pkt = vec![0u8; usize::from(u16::MAX)];
         let mut out = vec![0u8; usize::from(u16::MAX)];
         let mut send_warned = false;
         loop {
-            let n = match dev_read.read(&mut pkt).await {
+            let n = match dev_read.half.read(&mut pkt).await {
                 Ok(n) => n,
                 Err(err) => {
                     warn!(%err, "netbridge tx pump died; bridge will stop passing traffic");
@@ -604,7 +644,11 @@ fn spawn_route_reconciler(
                 }
             };
             let cmds = startup_route_plan(&iface, &extra_route_cidrs);
-            let _ = tokio::task::spawn_blocking(move || reconcile_routes(&route, &cmds)).await;
+            let pass = tokio::task::spawn_blocking(move || reconcile_routes(&route, &cmds));
+            let bridge_holds_utun = pass.await.unwrap_or(true);
+            if !bridge_holds_utun {
+                return;
+            }
         }
     })
 }
@@ -612,19 +656,22 @@ fn spawn_route_reconciler(
 /// One pass of the route reconciler. It runs on a blocking thread, and the
 /// abort of the reconciler task does not end it. A bridge lets go of its
 /// utun before the interface goes, and the routes go with the interface.
-fn reconcile_routes(route: &RunRoute, cmds: &[RouteCommand]) {
+/// Returns whether the bridge still holds its utun. A bridge never takes a
+/// utun back, so a pass that returns `false` is the last one.
+fn reconcile_routes(route: &RunRoute, cmds: &[RouteCommand]) -> bool {
     for cmd in cmds {
         match ensure_route_command(route, cmd) {
             Ok(()) => {}
             Err(RouteError::LetGo) => {
                 info!(iface = %cmd.iface, "netbridge route pass ended with its bridge");
-                return;
+                return false;
             }
             Err(RouteError::Failed(err)) => {
                 warn!(cidr = %cmd.cidr, iface = %cmd.iface, %err, "netbridge route reconcile failed");
             }
         }
     }
+    true
 }
 
 // ── Docker helpers ─────────────────────────────────────────────────
@@ -2144,6 +2191,7 @@ destination: 172.18.0.0
             rx_sock.clone(),
             rx_peer.clone(),
             endpoint.clone(),
+            "no-utun",
             tokio::io::sink(),
         );
 
@@ -2600,6 +2648,7 @@ destination: 172.18.0.0
                     udp.clone(),
                     peer.clone(),
                     endpoint.clone(),
+                    &bridge.utun_name,
                     tokio::io::sink(),
                 ),
                 spawn_timer(udp.clone(), peer, endpoint),
@@ -3056,7 +3105,7 @@ destination: 172.18.0.0
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let (host, vm) = (Keypair::generate(), Keypair::generate());
         let peer = Arc::new(Mutex::new(Peer::new(&host, vm.public(), None)));
-        spawn_tx(udp, peer, Arc::default(), half)
+        spawn_tx(udp, peer, Arc::default(), half.seen.utun, half)
     }
 
     /// An ICMP echo from the VM's end of the tunnel to the host's.
@@ -3072,7 +3121,7 @@ destination: 172.18.0.0
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let to_host = udp.local_addr().unwrap();
         let peer = Arc::new(Mutex::new(Peer::new(&host, vm.public(), None)));
-        let pump = spawn_rx(udp, peer, Arc::default(), half);
+        let pump = spawn_rx(udp, peer, Arc::default(), half.seen.utun, half);
 
         let mut vm = Peer::new(&vm, host.public(), None);
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
