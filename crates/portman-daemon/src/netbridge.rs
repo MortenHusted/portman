@@ -50,10 +50,12 @@
 //!     bridge on the forwarder and the network, and a debt that waited for
 //!     the port would be paid the first time the port is free for a
 //!     moment. The debt is saved in `netbridge.json` with the flag, so a
-//!     daemon that restarts still owes it. An `Enable` ends it. But for
-//!     the stop of a running bridge, which holds the port itself, no
-//!     cleanup runs on a session that has been open for less than the
-//!     [`HEAD_START`].
+//!     daemon that restarts still owes it. An `Enable` ends it. A cleanup
+//!     that the loop plans while no bridge runs waits until the session
+//!     has been open for the [`HEAD_START`]. The stop of a running bridge
+//!     does not wait, and neither does a start, which removes the setup
+//!     container of an earlier bridge: the bridge holds the port through
+//!     both.
 //!   - a failed start is retried with a growing delay. The wait does not
 //!     hold up control messages, and a new session starts the delay over.
 //!   - a bridge that is up gets the DNS forwarder in the VM: the loop makes
