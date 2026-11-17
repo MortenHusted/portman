@@ -2684,6 +2684,40 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_start_that_uses_up_every_wait_inside_it_fails_for_its_own_reason() {
+        let (engine, fake) = engine_with_leftovers(FREE_PORT);
+        fake.hold_what_it_creates(SETUP_CONTAINER, OWN_SETUP_CONTAINER);
+        fake.hold("/containers/portman-netbridge-setup/logs", "");
+        fake.be_slow(crate::engine::tests::Slow {
+            stop: Duration::from_millis(4_900),
+            removal: Duration::from_millis(9_900),
+        });
+        let (logged, _capture) = Logged::capture();
+
+        let asked = Instant::now();
+        let started = try_start(&engine, Session(1), OptIn, &mut Attempts::new()).await;
+
+        assert!(
+            started.is_none(),
+            "a bridge started with no key from the VM"
+        );
+        let warnings = logged.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let cause = "err=netbridge setup container did not report VM_PUBKEY";
+        assert!(warnings[0].contains(cause), "{}", warnings[0]);
+        let waited = asked.elapsed();
+        assert!(waited > Duration::from_secs(39), "{waited:?}");
+        assert!(
+            fake.calls().ends_with(&[
+                "DELETE /containers/portman-netbridge-setup".to_string(),
+                format!("GET {SETUP_CONTAINER}"),
+            ]),
+            "the start did not see its setup container gone: {:?}",
+            fake.calls()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn with_the_listen_port_free_the_forwarder_and_the_network_go_only_when_asked_for() {
         let container = "/containers/portman-netbridge-setup";
         let cases = [
