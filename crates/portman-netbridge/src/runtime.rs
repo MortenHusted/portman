@@ -1419,14 +1419,18 @@ pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Left
     match try_remove_leftovers(docker, listen_port, leftovers).await {
         Ok(end) => end.into(),
         Err(err) => {
-            info!(
-                listen_port,
-                %err,
-                "netbridge leftovers stay in the engine: the listen port is taken, and its holder may run a bridge on them"
-            );
+            say_why_leftovers_stay(listen_port, &err);
             Cleanup::Owed
         }
     }
+}
+
+fn say_why_leftovers_stay(listen_port: u16, err: &std::io::Error) {
+    info!(
+        listen_port,
+        %err,
+        "netbridge leftovers stay in the engine: the listen port is taken, and its holder may run a bridge on them"
+    );
 }
 
 /// As [`remove_leftovers`], for a caller that acts on why a cleanup did not
@@ -3798,6 +3802,26 @@ destination: 172.18.0.0
 
         let cleanup = remove_leftovers(&engine.docker, 0, everything).await;
         assert_eq!(cleanup, Cleanup::Complete);
+    }
+
+    #[test]
+    fn a_cleanup_that_did_not_get_the_port_blames_a_holder_only_for_an_address_in_use() {
+        let (logged, _capture) = Logged::capture();
+
+        let taken = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        say_why_leftovers_stay(HOST_WG_LISTEN_PORT, &taken);
+
+        let lines = logged.take_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("the listen port is taken"), "{lines:?}");
+
+        let out_of_descriptors = std::io::Error::from_raw_os_error(libc::EMFILE);
+        say_why_leftovers_stay(HOST_WG_LISTEN_PORT, &out_of_descriptors);
+
+        let warnings = logged.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("Too many open files"), "{warnings:?}");
+        assert!(!warnings[0].contains("is taken"), "{warnings:?}");
     }
 
     /// How long the daemon's client waits for the head of an answer.
