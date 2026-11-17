@@ -92,14 +92,20 @@ pub(crate) async fn settled_daemon<F>(mut read: impl FnMut() -> F) -> DaemonSnap
 where
     F: Future<Output = Option<Response>>,
 {
-    let first_read = tokio::time::Instant::now();
-    loop {
-        let daemon = DaemonSnapshot::from_status(read().await);
-        if !daemon.verdict_can_be_from_before_the_bridge() || first_read.elapsed() >= HEALTH_BOUND {
-            return daemon;
-        }
+    let give_up_at = tokio::time::Instant::now() + HEALTH_BOUND;
+    let mut daemon = DaemonSnapshot::from_status(read().await);
+    while daemon.verdict_can_be_from_before_the_bridge() && tokio::time::Instant::now() < give_up_at
+    {
         tokio::time::sleep(HEALTH_PAUSE).await;
+        // A daemon that accepts the connection and never answers would hold
+        // a read with no end, so a read that is not answered at the bound
+        // leaves the last reading in place.
+        match tokio::time::timeout_at(give_up_at, read()).await {
+            Ok(status) => daemon = DaemonSnapshot::from_status(status),
+            Err(_) => break,
+        }
     }
+    daemon
 }
 
 /// Why a `docker` CLI call gave no output to read.
@@ -1411,6 +1417,38 @@ mod tests {
         );
         assert_eq!(reads.get(), 2);
         assert!(asked_at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn doctor_ends_at_the_bound_when_the_daemon_answers_once_and_then_never() {
+        let (mut answers, _) = daemon_that_reports("up", "docker", &[Some("routes_missing")]);
+        let mut reads = 0;
+        let read = move || -> std::pin::Pin<Box<dyn Future<Output = Option<Response>>>> {
+            reads += 1;
+            if reads == 1 {
+                Box::pin(answers())
+            } else {
+                Box::pin(std::future::pending())
+            }
+        };
+        let period = BridgeAssessment::PERIOD;
+        let asked_at = tokio::time::Instant::now();
+
+        let daemon = tokio::time::timeout(Duration::from_secs(60), settled_daemon(read))
+            .await
+            .expect("doctor waits for a daemon that does not answer");
+
+        let waited = asked_at.elapsed();
+        assert!(
+            waited > period && waited <= period + period / 4,
+            "waited {waited:?}"
+        );
+        let rendered = rendered_with(daemon);
+        let daemon_line = "daemon: ok v0.1.7 bridge: routes_missing netbridge: up mode: docker";
+        assert!(
+            rendered.contains(&format!("replacement: needs attention\n{daemon_line}\n")),
+            "{rendered}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

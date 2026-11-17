@@ -64,11 +64,14 @@ fn bridge_status_lines(
 }
 
 pub(crate) async fn cmd_doctor() -> Result<()> {
-    let daemon = doctor::settled_daemon(|| async { request(Request::Status).await.ok() }).await;
+    // The entries are read before the status, so that no request without a
+    // bound follows the wait for the health. A daemon that stops answering
+    // during that wait would hold such a request with no end.
     let routes = match request(Request::ListEntries).await {
         Ok(Response::Entries { entries }) => entries,
         _ => Vec::new(),
     };
+    let daemon = doctor::settled_daemon(|| async { request(Request::Status).await.ok() }).await;
     let (setup_image, docker_routes, dns_forwarder) = tokio::join!(
         doctor::inspect_setup_image(),
         doctor::collect_docker_routes(),
