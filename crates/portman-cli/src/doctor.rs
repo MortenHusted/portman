@@ -18,7 +18,7 @@ const CONTAINER_FACING_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 99, 1);
 const DNS_CONTAINER: &str = "portman-netbridge-dns";
 /// The gateway address of the `portman` docker network, where the DNS
 /// forwarder listens.
-const DNS_FORWARDER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 99, 129);
+pub(crate) const DNS_FORWARDER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 99, 129);
 /// The subnet of the `portman` docker network. The netbridge crate names it
 /// `DOCKER_BRIDGE_CIDR` and builds on macOS only, so doctor has its own
 /// copy, and a test holds the two together.

@@ -435,7 +435,7 @@ The forwarder keeps running when the daemon stops or the bridge is down. Its res
 | `host.docker.internal` | Resolves as before, with no added delay. |
 | A name under a managed TLD | Takes 5 to 9 s. The forwarder waits for portman before it asks the VM's resolver, which holds no portman hostname. |
 
-`portman bridge disable` removes the forwarder together with the `portman` network. A container that still has `192.168.99.129` as its only resolver then resolves no name at all. Remove the `dns` line from that container, or enable the bridge again. A compose project that names `portman` as an `external` network fails to start while the network is gone.
+`portman bridge disable` removes the forwarder together with the `portman` network, and prints a line that says so. A container that still has `192.168.99.129` as its only resolver then resolves no name at all. Remove the `dns` line from that container, or enable the bridge again. A compose project that names `portman` as an `external` network fails to start while the network is gone.
 
 When Docker is not running at the time of the disable, portman removes the forwarder and the network once Docker runs again. A daemon restart in between ends that, and `docker rm -f portman-netbridge-dns` then removes the forwarder.
 

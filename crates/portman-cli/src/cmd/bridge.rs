@@ -1,6 +1,6 @@
 //! Netbridge commands: status, enable/disable, mode, prepare, doctor.
 
-use crate::client::{bridge_status, wait_for_bridge_mode, wait_for_bridge_state};
+use crate::client::{bridge_status, wait_for_bridge_mode, wait_for_bridge_state, Settled};
 use crate::cmd::run_setup_image_build;
 use crate::doctor;
 use anyhow::{bail, Result};
@@ -87,11 +87,27 @@ pub(crate) async fn cmd_bridge(req: Request, desired_enabled: bool, verb: &str) 
     match request(req).await? {
         Response::Ok => {
             let settled = wait_for_bridge_state(desired_enabled).await?;
-            println!("{}", settled.line(&format!("netbridge {verb}")));
+            for line in bridge_command_lines(settled, desired_enabled, verb) {
+                println!("{line}");
+            }
             Ok(())
         }
         other => other.unexpected(),
     }
+}
+
+/// What `portman bridge enable` and `portman bridge disable` print when the
+/// bridge has settled. Only a bridge on macOS has a DNS forwarder for a
+/// disable to remove.
+fn bridge_command_lines(settled: Settled, desired_enabled: bool, verb: &str) -> Vec<String> {
+    let mut lines = vec![settled.line(&format!("netbridge {verb}"))];
+    if !desired_enabled && cfg!(target_os = "macos") {
+        lines.push(format!(
+            "portman removes the dns forwarder at {}; a container that lists it as its only resolver resolves no name until the bridge is enabled again",
+            doctor::DNS_FORWARDER_IP
+        ));
+    }
+    lines
 }
 
 pub(crate) async fn cmd_bridge_mode(mode: Option<String>) -> Result<()> {
@@ -190,6 +206,28 @@ mod tests {
                 "mode:      opt-in",
                 networks,
             ]
+        );
+    }
+
+    #[test]
+    fn a_disable_says_that_the_dns_forwarder_goes_and_what_a_container_loses() {
+        let note = "portman removes the dns forwarder at 192.168.99.129; a container that \
+                    lists it as its only resolver resolves no name until the bridge is \
+                    enabled again";
+        let disabled = bridge_command_lines(Settled::Reached, false, "disabled");
+        if cfg!(target_os = "macos") {
+            assert_eq!(disabled, ["netbridge disabled", note]);
+        } else {
+            assert_eq!(disabled, ["netbridge disabled"]);
+        }
+
+        assert_eq!(
+            bridge_command_lines(Settled::Reached, true, "enabled"),
+            ["netbridge enabled"]
+        );
+        assert_eq!(
+            bridge_command_lines(Settled::WaitsForDocker, true, "enabled"),
+            ["netbridge enabled; the bridge starts when Docker connects"]
         );
     }
 
