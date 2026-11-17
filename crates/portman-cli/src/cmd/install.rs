@@ -258,10 +258,16 @@ async fn daemon_engine_socket(
 fn bridge_leftover_lines(leftovers: &BridgeLeftovers) -> Vec<String> {
     let by_hand = portman_daemon::manual_removal_commands().map(|command| format!("    {command}"));
     match leftovers {
-        BridgeLeftovers::NoneLeft { socket } => vec![format!(
-            "bridge: Docker at {} holds nothing of the bridge now; a `portman` network that a running container uses stays",
-            socket.display()
-        )],
+        BridgeLeftovers::NoneLeft { socket } => vec![
+            format!(
+                "bridge: Docker at {} holds nothing of the bridge now; a `portman` network that a running container uses stays",
+                socket.display()
+            ),
+            format!(
+                "bridge: a container that lists the dns forwarder at {} as its only resolver resolves no name until portman is installed again",
+                crate::doctor::DNS_FORWARDER_IP
+            ),
+        ],
         BridgeLeftovers::Owed { socket } => [
             vec![
                 format!(
@@ -714,7 +720,9 @@ mod tests {
             }),
             [
                 "bridge: Docker at /run/demo/docker.sock holds nothing of the bridge now; \
-              a `portman` network that a running container uses stays"
+                 a `portman` network that a running container uses stays",
+                "bridge: a container that lists the dns forwarder at 192.168.99.129 as its \
+                 only resolver resolves no name until portman is installed again",
             ]
         );
         assert_eq!(

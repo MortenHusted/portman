@@ -441,7 +441,7 @@ The forwarder keeps running when the daemon stops or the bridge is down. Its res
 
 When Docker is not running at the time of the disable, portman removes the forwarder and the network once Docker runs again. A daemon restart in between ends that. `docker rm -f portman-netbridge-dns` then removes the forwarder, and `docker network rm portman` the network.
 
-`portman uninstall` stops the daemon and then removes what `portman bridge disable` removes: the forwarder, the bridge's setup container, and the `portman` network unless a running container is attached to it. It removes only what carries portman's labels, and it does not change whether the bridge is on for the next install. When Docker is not running at that time, the uninstall still completes and prints the commands that remove the forwarder and the network, `docker rm -f portman-netbridge-dns` and `docker network rm portman`.
+`portman uninstall` stops the daemon and then removes what `portman bridge disable` removes: the forwarder, the bridge's setup container, and the `portman` network unless a running container is attached to it. It removes only what carries portman's labels, and it does not change whether the bridge is on for the next install. As after a disable, a container that still has `192.168.99.129` as its only resolver then resolves no name, until portman is installed again. When Docker is not running at that time, the uninstall still completes and prints the commands that remove the forwarder and the network, `docker rm -f portman-netbridge-dns` and `docker network rm portman`.
 
 ### Check the forwarder
 
