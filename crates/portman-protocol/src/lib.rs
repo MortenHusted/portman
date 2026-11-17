@@ -154,6 +154,19 @@ impl BridgePhase {
         }
     }
 
+    /// The words that `portman status` and `portman bridge status` print
+    /// for the phase. A bridge whose last start failed also says when the
+    /// daemon starts it again. `retry_in_secs` is the status field
+    /// `bridge_retry_in_secs`.
+    pub fn status_words(self, retry_in_secs: Option<u64>) -> String {
+        match (self, retry_in_secs) {
+            (BridgePhase::Starting, Some(secs)) => {
+                format!("starting, the last start failed, tries again in {secs}s")
+            }
+            _ => self.display_word().to_string(),
+        }
+    }
+
     /// The phase a client acts on. A daemon that sends no phase this client
     /// knows still sends `bridge_enabled`, which is true only while a bridge
     /// runs.
@@ -605,6 +618,12 @@ pub enum Response {
         /// What the in-process netbridge is doing.
         #[serde(default)]
         bridge_phase: BridgePhase,
+        /// The seconds until the daemon starts the bridge again, rounded
+        /// up and so never 0, while a start that failed waits for its
+        /// retry. `None` otherwise, and from a daemon that predates the
+        /// field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bridge_retry_in_secs: Option<u64>,
         /// Route ownership mode for the native netbridge: the mode of the
         /// running bridge, or the mode the next one is built for.
         #[serde(default = "default_netbridge_mode")]
@@ -1363,6 +1382,7 @@ mod tests {
                 bridge_assessment,
                 bridge_enabled,
                 bridge_phase,
+                bridge_retry_in_secs,
                 bridge_mode,
                 dashboard_port,
                 managed_broker,
@@ -1372,6 +1392,7 @@ mod tests {
             } => {
                 assert_eq!(docker, None);
                 assert_eq!(bridge_phase, BridgePhase::Unknown);
+                assert_eq!(bridge_retry_in_secs, None);
                 assert!(!managed_broker);
                 assert_eq!(egress_grants_version, 0);
                 assert_eq!(inference_provisioning_version, 0);
@@ -1427,6 +1448,69 @@ mod tests {
         for (phase, word) in words {
             assert_eq!(phase.display_word(), word);
         }
+    }
+
+    #[test]
+    fn only_a_start_that_waits_for_its_retry_says_when_it_runs_again() {
+        let failed = "starting, the last start failed, tries again in 12s";
+        // (phase, bridge_retry_in_secs) → the words
+        let table = [
+            (BridgePhase::Starting, Some(12), failed),
+            (BridgePhase::Starting, None, "starting"),
+            (BridgePhase::Up, Some(12), "up"),
+            (
+                BridgePhase::WaitingForDocker,
+                Some(12),
+                "waiting for docker",
+            ),
+            (BridgePhase::Disabled, None, "disabled"),
+        ];
+        for (phase, retry_in_secs, words) in table {
+            assert_eq!(
+                phase.status_words(retry_in_secs),
+                words,
+                "{phase:?} {retry_in_secs:?}"
+            );
+        }
+    }
+
+    fn status_retry(json: &str) -> Option<u64> {
+        match serde_json::from_str(json).unwrap() {
+            Response::Status {
+                bridge_retry_in_secs,
+                ..
+            } => bridge_retry_in_secs,
+            other => panic!("expected status response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_retry_time_is_on_the_wire_only_while_a_start_waits_for_it() {
+        let waits = r#"{"kind":"status","bridge_phase":"starting","bridge_retry_in_secs":12}"#;
+        assert_eq!(status_retry(waits), Some(12));
+        let from_an_older_daemon = r#"{"kind":"status","bridge_phase":"starting"}"#;
+        assert_eq!(status_retry(from_an_older_daemon), None);
+
+        let mut status: Response = serde_json::from_str(from_an_older_daemon).unwrap();
+        let sent = serde_json::to_value(&status).unwrap();
+        assert_eq!(sent.get("bridge_retry_in_secs"), None, "{sent}");
+
+        if let Response::Status {
+            bridge_retry_in_secs,
+            ..
+        } = &mut status
+        {
+            *bridge_retry_in_secs = Some(12);
+        }
+        let sent = serde_json::to_value(&status).unwrap();
+        assert_eq!(sent["bridge_retry_in_secs"], 12, "{sent}");
+    }
+
+    #[test]
+    fn a_status_field_that_this_client_does_not_know_is_passed_over() {
+        let from_a_newer_daemon =
+            r#"{"kind":"status","bridge_phase":"starting","bridge_retry_reason":"port taken"}"#;
+        assert_eq!(status_phase(from_a_newer_daemon), BridgePhase::Starting);
     }
 
     #[test]

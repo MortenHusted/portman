@@ -484,6 +484,10 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
         bridge_assessment,
         bridge_enabled: published_phase.reads_as_enabled(),
         bridge_phase: BridgePhase::from(published_phase),
+        bridge_retry_in_secs: state
+            .netbridge
+            .retry_in_secs()
+            .map(std::num::NonZeroU64::get),
         bridge_mode,
         dashboard_port: state.dashboard_port,
         docker: Some(docker_status(
@@ -2034,6 +2038,28 @@ pub(crate) mod tests {
                 other => panic!("expected status response, got {other:?}"),
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(start_paused = true)]
+    async fn status_says_when_a_failed_bridge_start_runs_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(&dir);
+        let (handle, _rx, _phase_tx) = crate::netbridge::handle_pair();
+        state.netbridge = handle;
+        let retry_in_secs = |response| match response {
+            Response::Status {
+                bridge_retry_in_secs,
+                ..
+            } => bridge_retry_in_secs,
+            other => panic!("expected status response, got {other:?}"),
+        };
+
+        assert_eq!(retry_in_secs(handle_status(&state).await), None);
+
+        let due = tokio::time::Instant::now() + std::time::Duration::from_secs(12);
+        *state.netbridge.retry_at.write().unwrap() = Some(due);
+        assert_eq!(retry_in_secs(handle_status(&state).await), Some(12));
     }
 
     #[tokio::test]

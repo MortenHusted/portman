@@ -18,11 +18,13 @@
 //!     the channel. A message that arrives later waits for the step to end:
 //!     the loop does not cancel a step in flight.
 //!   - a bridge is built on one engine session. When no session exists the
-//!     loop drops the bridge and asks the engine nothing. When another
+//!     loop ends the bridge and asks the engine nothing. When another
 //!     session opens, the loop keeps the bridge if that engine says within
 //!     [`SETUP_CHECK_BUDGET`] that it still runs the setup container that
 //!     the bridge started, because the tunnel then still has both ends.
-//!     Otherwise it drops the bridge and builds a new one.
+//!     Otherwise it ends the bridge and builds a new one. It waits for the
+//!     tasks of a bridge that it ends, because they hold the UDP port that
+//!     the next bridge binds.
 //!   - while the bridge is off and none runs, the loop removes the setup
 //!     container that an earlier bridge can have left in the engine, once
 //!     for each session and again when the user turns the bridge off. Only
@@ -30,12 +32,14 @@
 //!     stopped container of the user can still refer to it. That removal
 //!     stays owed until a cleanup has done it: with no session it waits for
 //!     one, and a cleanup that was skipped or that failed is tried again on
-//!     the next session. A network that the engine refuses to remove
-//!     because it is in use is not owed. It stays until the next `Disable`,
-//!     so that no later session removes it under containers that have
-//!     stopped. The debt is not saved, so a daemon restart ends it. Each
-//!     removal needs the UDP port that a bridge listens on, so that it
-//!     cannot take what another daemon's bridge runs on.
+//!     the next session. The stop of a bridge that the user turned off is
+//!     such a cleanup, so no second one follows it on its session. A
+//!     network that the engine refuses to remove because it is in use is
+//!     not owed. It stays until the next `Disable`, so that no later
+//!     session removes it under containers that have stopped. The debt is
+//!     not saved, so a daemon restart ends it. Each removal needs the UDP
+//!     port that a bridge listens on, so that it cannot take what another
+//!     daemon's bridge runs on.
 //!   - a failed start is retried with a growing delay. The wait does not
 //!     hold up control messages, and a new session starts the delay over.
 //!   - a bridge that is up gets the DNS forwarder in the VM: the loop makes
@@ -49,9 +53,11 @@
 //!     a network that is in use. A forwarder that could not be removed
 //!     beside such a network stays until the next `Disable`.
 //!   - [`publish`] tells the rest of the daemon what the bridge is doing:
-//!     the [`phase`], the mode, and the interface index of the utun.
+//!     the [`phase`], the mode, the interface index of the utun, and when a
+//!     start that failed runs again.
 
 use std::collections::{BTreeSet, HashSet};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -170,6 +176,17 @@ pub(crate) struct Handle {
     /// Wakes the netbridge task after a change of the managed TLD set, which
     /// the DNS forwarder is built from.
     pub tlds_changed: Arc<Notify>,
+    /// When the next start is due, while a start that failed waits for its
+    /// retry.
+    pub retry_at: Arc<std::sync::RwLock<Option<Instant>>>,
+}
+
+impl Handle {
+    pub(crate) fn retry_in_secs(&self) -> Option<NonZeroU64> {
+        let at = (*self.retry_at.read().expect("retry lock poisoned"))?;
+        let left = at.saturating_duration_since(Instant::now());
+        NonZeroU64::new(left.as_secs() + u64::from(left.subsec_nanos() > 0))
+    }
 }
 
 /// Build the handle the daemon shares, and the two ends only the netbridge
@@ -185,6 +202,7 @@ pub(crate) fn handle_pair() -> (Handle, mpsc::Receiver<Control>, watch::Sender<B
             phase,
             ifindex: crate::upstream::new_bridge_ifindex(),
             tlds_changed: Arc::new(Notify::new()),
+            retry_at: Arc::default(),
         },
         rx,
         phase_tx,
@@ -244,7 +262,7 @@ fn forwarder_due(forwarded: Option<&Forwarded>, tlds: &BTreeSet<String>, now: In
 enum Step {
     Keep,
     Start(Session),
-    /// Drop the bridge without a Docker call. Its session is gone, and no
+    /// End the bridge without a Docker call. Its session is gone, and no
     /// later session's engine said in time that it runs the bridge's setup
     /// container.
     Abandon,
@@ -319,7 +337,7 @@ fn reported_mode(intent: &NetbridgeState, running: Option<Built>) -> NetbridgeMo
 struct Attempts {
     host_kp: Keypair,
     failures: u32,
-    retry_after: Option<Duration>,
+    retry_at: Option<Instant>,
 }
 
 impl Attempts {
@@ -327,7 +345,7 @@ impl Attempts {
         Self {
             host_kp: Keypair::generate(),
             failures: 0,
-            retry_after: None,
+            retry_at: None,
         }
     }
 
@@ -344,12 +362,12 @@ impl Attempts {
                 self.failures += 1;
                 let retry_after = backoff(self.failures);
                 warn!(
-                    %err,
+                    err = %format_args!("{err:#}"),
                     attempt = self.failures,
                     retry_in_secs = retry_after.as_secs(),
                     "netbridge start failed"
                 );
-                self.retry_after = Some(retry_after);
+                self.retry_at = Some(Instant::now() + retry_after);
                 None
             }
         }
@@ -503,9 +521,10 @@ async fn converge<E: BridgeEngine>(
             phase(&intent, session, built),
             reported_mode(&intent, built),
             running.as_ref(),
+            attempts.retry_at,
         )
         .await;
-        let may_start = attempts.retry_after.is_none();
+        let may_start = attempts.retry_at.is_none();
         let tlds = managed_tlds(&known_tlds);
         let now = Instant::now();
         let forwarded = running.as_ref().map(|r| r.forwarded.as_ref());
@@ -515,17 +534,17 @@ async fn converge<E: BridgeEngine>(
             Step::Keep => {
                 // A start waits only while no bridge runs, and a forwarder
                 // only while one does, so one timer serves both.
-                let forwarder_retry = forwarded
-                    .flatten()
-                    .and_then(|last| last.retry_at)
+                let forwarder_retry = forwarded.flatten().and_then(|last| last.retry_at);
+                let retry_after = attempts
+                    .retry_at
+                    .or(forwarder_retry)
                     .map(|at| at.saturating_duration_since(now));
-                let retry_after = attempts.retry_after.or(forwarder_retry);
                 let tlds_changed = &handle.tlds_changed;
                 match next_wake(&mut rx, &mut engine, tlds_changed, retry_after).await {
                     Wake::Control(msg) => {
                         take(msg, &mut wanted, &mut attempts, &mut debt, &state_path);
                     }
-                    Wake::RetryDue => attempts.retry_after = None,
+                    Wake::RetryDue => attempts.retry_at = None,
                     Wake::SessionChanged | Wake::TldsChanged => {}
                     Wake::Closed => return Ok(()),
                 }
@@ -551,7 +570,11 @@ async fn converge<E: BridgeEngine>(
                     });
                 }
             }
-            Step::Abandon => running = None,
+            Step::Abandon => {
+                if let Some(old) = running.take() {
+                    old.bridge.abandon().await;
+                }
+            }
             Step::Shutdown => {
                 if let Some(old) = running.take() {
                     old.bridge.shutdown().await;
@@ -559,7 +582,9 @@ async fn converge<E: BridgeEngine>(
             }
             Step::Teardown => {
                 if let Some(old) = running.take() {
-                    old.bridge.shutdown_and_remove_network().await;
+                    let cleanup = old.bridge.shutdown_and_remove_network().await;
+                    let asked_for = Leftovers::SetupContainerAndNetwork;
+                    debt.settle(old.built.session, asked_for, cleanup);
                 }
             }
             Step::Sweep(session, leftovers) => {
@@ -685,9 +710,11 @@ async fn publish(
     phase: BridgePhase,
     mode: NetbridgeMode,
     running: Option<&Running<impl Bridge>>,
+    retry_at: Option<Instant>,
 ) {
     let up = running.filter(|_| phase.epoch().is_some());
     publish_ifindex(&handle.ifindex, up.map(|r| &r.bridge));
+    *handle.retry_at.write().expect("retry lock poisoned") = retry_at;
     phase_tx.send_replace(phase);
     *handle.mode.write().await = mode;
 }
@@ -738,9 +765,8 @@ pub(crate) trait BridgeEngine {
     /// Removes `leftovers` that carry portman's label from the engine of
     /// `session`, and says whether any is still owed. Does nothing when another
     /// session exists at the call, or when the UDP port that a bridge
-    /// listens on is taken. Another daemon's bridge holds that port. So do
-    /// the tasks of a bridge that this daemon dropped, until their abort
-    /// ends, and so can a process that is not portman.
+    /// listens on is taken. Another daemon's bridge holds that port, and so
+    /// can a process that is not portman.
     async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) -> Cleanup;
 }
 
@@ -753,11 +779,15 @@ pub(crate) trait Bridge {
     /// Makes the bridge's engine run the DNS forwarder for `tlds`. It
     /// changes the engine only while the forwarder differs from that.
     async fn ensure_dns_forwarder(&self, tlds: &BTreeSet<String>) -> Result<DnsForwarder>;
+    /// Ends the bridge and asks its engine nothing. The listen port is free
+    /// when this returns, so that the next start can take it.
+    async fn abandon(self);
     /// Stops the bridge and keeps the docker network and the DNS forwarder.
     async fn shutdown(self);
     /// Stops the bridge and removes the DNS forwarder and the docker
-    /// network.
-    async fn shutdown_and_remove_network(self);
+    /// network. Says whether any of them is still owed, as
+    /// [`BridgeEngine::remove_leftovers`] does.
+    async fn shutdown_and_remove_network(self) -> Cleanup;
 }
 
 /// The engine behind the daemon's link. Its bridges listen on UDP port
@@ -852,12 +882,16 @@ impl Bridge for Runtime {
         Runtime::ensure_dns_forwarder(self, tlds).await
     }
 
+    async fn abandon(self) {
+        Runtime::abandon(self).await;
+    }
+
     async fn shutdown(self) {
         Runtime::shutdown(self).await;
     }
 
-    async fn shutdown_and_remove_network(self) {
-        Runtime::shutdown_and_remove_network(self).await;
+    async fn shutdown_and_remove_network(self) -> Cleanup {
+        Runtime::shutdown_and_remove_network(self).await
     }
 }
 
@@ -1179,21 +1213,22 @@ mod tests {
         assert_eq!(backoff(u32::MAX), Duration::from_secs(60));
     }
 
-    #[test]
-    fn a_start_that_succeeds_ends_its_sequence() {
+    #[tokio::test(start_paused = true)]
+    async fn a_start_that_succeeds_ends_its_sequence() {
         let failed = || Err::<(), _>(anyhow::anyhow!("no container engine"));
+        let now = Instant::now();
         let mut attempts = Attempts::new();
         let first_key = attempts.host_kp.public_base64();
         attempts.settle(failed());
         attempts.settle(failed());
-        assert_eq!(attempts.retry_after, Some(Duration::from_secs(10)));
+        assert_eq!(attempts.retry_at, Some(now + Duration::from_secs(10)));
         assert_eq!(attempts.host_kp.public_base64(), first_key);
 
         assert_eq!(attempts.settle(Ok(())), Some(()));
 
         assert_ne!(attempts.host_kp.public_base64(), first_key);
         attempts.settle(failed());
-        assert_eq!(attempts.retry_after, Some(RETRY_BASE));
+        assert_eq!(attempts.retry_at, Some(now + RETRY_BASE));
     }
 
     struct Attempt {
@@ -1232,6 +1267,8 @@ mod tests {
         forwards: mpsc::UnboundedSender<Forwarding>,
         /// How the next ensure ends.
         ensure: Arc<Mutex<Ensure>>,
+        port_held: Arc<AtomicBool>,
+        cleanups_end: Arc<Mutex<Cleanup>>,
     }
 
     struct Forwarding {
@@ -1297,12 +1334,16 @@ mod tests {
             });
             match &self.probe {
                 Some(probe) => {
+                    if probe.port_held.swap(true, Ordering::SeqCst) {
+                        anyhow::bail!("an earlier bridge holds the listen port");
+                    }
                     probe.held.fetch_add(1, Ordering::SeqCst);
                     let setup_container = format!("the setup container for {session:?}");
                     *probe.setup_container.lock().unwrap() = Some(setup_container.clone());
                     Ok(TestBridge {
                         probe: probe.clone(),
                         setup_container,
+                        holds_port: true,
                     })
                 }
                 None => anyhow::bail!("the start failed"),
@@ -1330,11 +1371,27 @@ mod tests {
     struct TestBridge {
         probe: Probe,
         setup_container: String,
+        holds_port: bool,
     }
 
+    impl TestBridge {
+        fn free_port(&mut self) {
+            self.holds_port = false;
+            self.probe.port_held.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// As a `Runtime` that is dropped: its tasks hold the listen port until
+    /// the executor has run their abort, which is after the drop returns.
     impl Drop for TestBridge {
         fn drop(&mut self) {
             self.probe.held.fetch_sub(1, Ordering::SeqCst);
+            if self.holds_port {
+                let port_held = self.probe.port_held.clone();
+                if let Ok(executor) = tokio::runtime::Handle::try_current() {
+                    executor.spawn(async move { port_held.store(false, Ordering::SeqCst) });
+                }
+            }
         }
     }
 
@@ -1369,12 +1426,19 @@ mod tests {
             }
         }
 
-        async fn shutdown(self) {
-            self.probe.clone().stop(Stop::KeepsNetwork).await;
+        async fn abandon(mut self) {
+            self.free_port();
         }
 
-        async fn shutdown_and_remove_network(self) {
+        async fn shutdown(mut self) {
+            self.probe.clone().stop(Stop::KeepsNetwork).await;
+            self.free_port();
+        }
+
+        async fn shutdown_and_remove_network(mut self) -> Cleanup {
             self.probe.clone().stop(Stop::RemovesNetwork).await;
+            self.free_port();
+            *self.probe.cleanups_end.lock().unwrap()
         }
     }
 
@@ -1456,6 +1520,8 @@ mod tests {
                     stops_may_end: may_end,
                     forwards: forward_seen,
                     ensure: ensure.clone(),
+                    port_held: Arc::default(),
+                    cleanups_end: cleanups_end.clone(),
                 }),
             };
             tokio::spawn(converge(
@@ -1682,6 +1748,67 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_wake_for_another_reason_does_not_put_off_the_retry_of_a_failed_start() {
+        let mut rig = Rig::start();
+        rig.send(Control::Enable).await;
+        let first = rig.next_attempt().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        rig.manage(&["acme"]);
+        let retry = rig.next_attempt().await;
+
+        assert_eq!(retry.at - first.at, RETRY_BASE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_time_of_the_retry_is_published_while_a_failed_start_waits_for_it() {
+        let mut rig = Rig::start();
+        assert_eq!(rig.handle.retry_in_secs(), None);
+
+        rig.send(Control::Enable).await;
+        rig.next_attempt().await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(rig.handle.retry_in_secs(), NonZeroU64::new(4));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(rig.handle.retry_in_secs(), NonZeroU64::new(2));
+
+        rig.next_attempt().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(rig.handle.retry_in_secs(), NonZeroU64::new(9));
+
+        rig.send(Control::Disable).await;
+        rig.reaches(BridgePhase::Disabled).await;
+        assert_eq!(rig.handle.retry_in_secs(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_that_has_fallen_due_has_no_time_left_to_report() {
+        let (handle, _rx, _phase_tx) = handle_pair();
+        let due = Instant::now() + RETRY_BASE;
+        *handle.retry_at.write().unwrap() = Some(due);
+
+        tokio::time::advance(RETRY_BASE - Duration::from_nanos(1)).await;
+        assert_eq!(handle.retry_in_secs(), NonZeroU64::new(1));
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        assert_eq!(handle.retry_in_secs(), None, "at the due instant");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(handle.retry_in_secs(), None, "after the due instant");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_retry_time_is_published_for_a_bridge_that_is_up_or_waits_for_docker() {
+        let rig = Rig::up().await;
+        assert_eq!(rig.handle.retry_in_secs(), None);
+
+        let mut failing = Rig::start();
+        failing.send(Control::Enable).await;
+        failing.next_attempt().await;
+        failing.engine_session(None);
+        failing.reaches(BridgePhase::WaitingForDocker).await;
+        assert_eq!(failing.handle.retry_in_secs(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn the_utun_index_is_published_before_the_phase_says_up() {
         let rig = Rig::up().await;
 
@@ -1746,17 +1873,30 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_stop_of_a_bridge_that_was_turned_off_does_not_pay_the_network_debt() {
+    async fn a_disable_of_a_running_bridge_asks_the_engine_for_the_network_once() {
         let mut rig = Rig::up().await;
 
         rig.send(Control::Disable).await;
 
         assert_eq!(rig.next_stop().await, Stop::RemovesNetwork);
+        rig.no_sweep_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_that_left_the_network_owed_is_followed_up_at_the_next_session() {
+        let mut rig = Rig::up().await;
+        rig.cleanups_end(Cleanup::Owed);
+
+        rig.send(Control::Disable).await;
+
+        assert_eq!(rig.next_stop().await, Stop::RemovesNetwork);
+        rig.no_sweep_follows().await;
+
+        rig.engine_session(S2);
         assert_eq!(
             rig.next_sweep().await,
-            (Session(1), SetupContainerAndNetwork)
+            (Session(2), SetupContainerAndNetwork)
         );
-        rig.no_sweep_follows().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -1910,6 +2050,32 @@ mod tests {
             assert!(rig.no_stop_began(), "a stop of a bridge that is gone");
             assert!(rig.ifindex().is_some());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_runtime_restart_costs_no_failed_start() {
+        let mut rig = Rig::up().await;
+
+        rig.engine_session(None);
+        rig.reaches(BridgePhase::WaitingForDocker).await;
+        rig.engine_runs(None);
+        rig.engine_session(S2);
+        rig.reaches(BridgePhase::Up { epoch: 2 }).await;
+        // The link stays on a session that ended until the next one opens,
+        // so the loop sees session 3 follow session 2.
+        rig.engine_runs(None);
+        let reopened = Instant::now();
+        rig.engine_session(Some(Session(3)));
+        rig.reaches(BridgePhase::Up { epoch: 3 }).await;
+
+        assert_eq!(
+            reopened.elapsed(),
+            Duration::ZERO,
+            "the start on session 3 failed and waited for its retry"
+        );
+        let rebuilt = [rig.next_attempt().await, rig.next_attempt().await];
+        assert_eq!(rebuilt.map(|a| a.session), [Session(2), Session(3)]);
+        rig.no_attempt_follows().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -2437,6 +2603,26 @@ mod tests {
             [],
             "listed containers before it held the port"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_start_logs_the_error_of_the_operating_system() {
+        let another_daemons_bridge = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let taken = another_daemons_bridge.local_addr().unwrap().port();
+        let (engine, _fake) = engine_with_leftovers(taken);
+        let (logged, _capture) = Logged::capture();
+
+        let started = try_start(&engine, Session(1), OptIn, &mut Attempts::new()).await;
+
+        assert!(
+            started.is_none(),
+            "a bridge started on a port that is taken"
+        );
+        let lines = logged.lines();
+        let warnings: Vec<&String> = lines.iter().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{lines:?}");
+        let cause = format!("err=binding 0.0.0.0:{taken}: Address already in use");
+        assert!(warnings[0].contains(&cause), "{}", warnings[0]);
     }
 
     #[tokio::test(start_paused = true)]

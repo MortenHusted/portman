@@ -27,7 +27,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
-use std::process::Command as StdCommand;
+use std::process::{Command as StdCommand, Output, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,6 +94,11 @@ const SETUP_STOP_TIMEOUT_SECS: i32 = 5;
 const SETUP_REMOVE_TIMEOUT: Duration = Duration::from_secs(10);
 const LABEL_HOST: &str = "dev.portman.host";
 const ROUTE_RECONCILE_PERIOD: Duration = Duration::from_secs(5);
+/// A `route` command takes milliseconds. A bridge that ends waits for the
+/// command that runs at that moment, so one that takes longer is ended.
+const ROUTE_LIMIT: Duration = Duration::from_secs(3);
+/// How long a command that was killed gets to go away.
+const KILL_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeOptions {
@@ -230,10 +235,23 @@ impl Runtime {
         let vm_endpoint: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
         let (dev_read, dev_write) = tokio::io::split(device);
 
-        let rx = spawn_rx(udp.clone(), peer.clone(), vm_endpoint.clone(), dev_write);
-        let tx = spawn_tx(udp.clone(), peer.clone(), vm_endpoint.clone(), dev_read);
+        let rx = spawn_rx(
+            udp.clone(),
+            peer.clone(),
+            vm_endpoint.clone(),
+            &utun_name,
+            dev_write,
+        );
+        let tx = spawn_tx(
+            udp.clone(),
+            peer.clone(),
+            vm_endpoint.clone(),
+            &utun_name,
+            dev_read,
+        );
         let timer = spawn_timer(udp.clone(), peer.clone(), vm_endpoint.clone());
-        let routes = spawn_route_reconciler(docker.clone(), options.mode, utun_name.clone());
+        let routes =
+            spawn_route_reconciler(docker.clone(), options.mode, utun_name.clone(), sbin_route);
 
         Ok(Self {
             utun_name,
@@ -299,7 +317,8 @@ impl Runtime {
     /// `portman bridge disable` (user intent) still wants the network
     /// gone; call [`Runtime::shutdown_and_remove_network`] for that.
     pub async fn shutdown(mut self) {
-        self.stop().await;
+        self.end_tasks().await;
+        best_effort_remove_setup_container(&self.docker, &self.listen_port).await;
         info!(utun = %self.utun_name, "netbridge shut down (network retained)");
     }
 
@@ -309,35 +328,46 @@ impl Runtime {
     /// not on daemon restart. Docker refuses the removal of the network
     /// only while a running container is attached, and that is logged. A
     /// stopped container that refers to the network fails to start
-    /// afterwards.
-    pub async fn shutdown_and_remove_network(mut self) {
-        self.stop().await;
-        best_effort_remove_dns_forwarder(&self.docker, &self.listen_port).await;
-        remove_portman_network_if_owned(&self.docker, &self.listen_port).await;
+    /// afterwards. The return value says whether a later cleanup has
+    /// anything left to try, as [`remove_leftovers`] does.
+    pub async fn shutdown_and_remove_network(mut self) -> Cleanup {
+        self.end_tasks().await;
+        let everything = Leftovers::SetupContainerAndNetwork;
+        let cleanup = remove_with_port_held(&self.docker, &self.listen_port, everything).await;
         info!(utun = %self.utun_name, "netbridge shut down");
+        cleanup
     }
 
-    async fn stop(&mut self) {
-        for t in &self.tasks {
-            t.abort();
-        }
+    /// Ends the bridge and asks the engine nothing, for a bridge whose
+    /// engine is gone. The pump tasks hold the listen port and the utun, and
+    /// they have ended when this returns. So a start that follows at once
+    /// finds the port free, which it does not after a drop.
+    pub async fn abandon(mut self) {
+        self.end_tasks().await;
+    }
+
+    async fn end_tasks(&mut self) {
+        self.abort_tasks();
         for t in self.tasks.drain(..) {
             let _ = t.await;
         }
+    }
+
+    fn abort_tasks(&self) {
         // The kernel recycles utun names. Keep claiming this one after the
         // device is gone and route repair would treat a *recycled* utun —
-        // somebody else's VPN — as ours to repoint.
+        // somebody else's VPN — as ours to repoint. So the claim goes
+        // first, and the tasks that hold the device go after it.
         forget_own_utun(&self.utun_name);
-        best_effort_remove_setup_container(&self.docker, &self.listen_port).await;
+        for t in &self.tasks {
+            t.abort();
+        }
     }
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        for t in &self.tasks {
-            t.abort();
-        }
-        forget_own_utun(&self.utun_name);
+        self.abort_tasks();
     }
 }
 
@@ -371,11 +401,11 @@ fn open_utun(extra_route_cidrs: &BTreeSet<String>) -> Result<(tun::AsyncDevice, 
 
     let mut installed = InstalledRoutes::new(utun_name.clone());
     for cmd in startup_route_plan(&utun_name, extra_route_cidrs) {
-        if let Err(err) = ensure_route_command(&cmd) {
+        if let Err(err) = ensure_route_command(&sbin_route, &cmd) {
             // The device drops with this error; stop claiming its name
             // (same reasoning as shutdown — names are recycled).
             forget_own_utun(&utun_name);
-            return Err(err);
+            return Err(err.into());
         }
         installed.record(cmd.cidr);
     }
@@ -396,15 +426,37 @@ fn prevent_child_inheritance(fd: RawFd) -> Result<()> {
 
 // ── Task spawners ──────────────────────────────────────────────────
 
+/// A pump that ends drops its half of the utun device, whatever ended it,
+/// and the device closes when both halves have dropped. The kernel can then
+/// give the utun's name to the next utun, so the bridge lets go of the name
+/// before the half drops. No change to a pump can turn that order around,
+/// because Rust runs the `drop` of a value before it drops the value's
+/// fields, and it moves no field out of a type that has a `drop`.
+struct OwnHalf<D> {
+    utun: String,
+    half: D,
+}
+
+impl<D> Drop for OwnHalf<D> {
+    fn drop(&mut self) {
+        forget_own_utun(&self.utun);
+    }
+}
+
 fn spawn_rx<W>(
     udp: Arc<UdpSocket>,
     peer: Arc<Mutex<Peer>>,
     endpoint: Arc<Mutex<Option<SocketAddr>>>,
-    mut dev_write: W,
+    utun: &str,
+    dev_write: W,
 ) -> JoinHandle<()>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let mut dev_write = OwnHalf {
+        utun: utun.to_string(),
+        half: dev_write,
+    };
     tokio::spawn(async move {
         // Sized so no UDP datagram or 1500-MTU container packet can arrive
         // truncated — a clipped frame would feed decapsulate garbage that
@@ -461,7 +513,7 @@ where
                             authenticated = true;
                         }
                         let pkt_len = pkt.len();
-                        if let Err(err) = dev_write.write_all(&out[..4 + pkt_len]).await {
+                        if let Err(err) = dev_write.half.write_all(&out[..4 + pkt_len]).await {
                             if !send_warned {
                                 warn!(%err, "netbridge rx pump failed to write utun; further failures muted");
                                 send_warned = true;
@@ -487,18 +539,26 @@ where
     })
 }
 
-fn spawn_tx(
+fn spawn_tx<R>(
     udp: Arc<UdpSocket>,
     peer: Arc<Mutex<Peer>>,
     endpoint: Arc<Mutex<Option<SocketAddr>>>,
-    mut dev_read: tokio::io::ReadHalf<tun::AsyncDevice>,
-) -> JoinHandle<()> {
+    utun: &str,
+    dev_read: R,
+) -> JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let mut dev_read = OwnHalf {
+        utun: utun.to_string(),
+        half: dev_read,
+    };
     tokio::spawn(async move {
         let mut pkt = vec![0u8; usize::from(u16::MAX)];
         let mut out = vec![0u8; usize::from(u16::MAX)];
         let mut send_warned = false;
         loop {
-            let n = match dev_read.read(&mut pkt).await {
+            let n = match dev_read.half.read(&mut pkt).await {
                 Ok(n) => n,
                 Err(err) => {
                     warn!(%err, "netbridge tx pump died; bridge will stop passing traffic");
@@ -565,7 +625,12 @@ fn spawn_timer(
     })
 }
 
-fn spawn_route_reconciler(docker: Docker, mode: NetbridgeMode, iface: String) -> JoinHandle<()> {
+fn spawn_route_reconciler(
+    docker: Docker,
+    mode: NetbridgeMode,
+    iface: String,
+    route: fn(&[&str]) -> std::io::Result<Output>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(ROUTE_RECONCILE_PERIOD);
         loop {
@@ -578,16 +643,34 @@ fn spawn_route_reconciler(docker: Docker, mode: NetbridgeMode, iface: String) ->
                 }
             };
             let cmds = startup_route_plan(&iface, &extra_route_cidrs);
-            let _ = tokio::task::spawn_blocking(move || {
-                for cmd in cmds {
-                    if let Err(err) = ensure_route_command(&cmd) {
-                        warn!(cidr = %cmd.cidr, iface = %cmd.iface, %err, "netbridge route reconcile failed");
-                    }
-                }
-            })
-            .await;
+            let pass = tokio::task::spawn_blocking(move || reconcile_routes(&route, &cmds));
+            let bridge_holds_utun = pass.await.unwrap_or(true);
+            if !bridge_holds_utun {
+                return;
+            }
         }
     })
+}
+
+/// One pass of the route reconciler. It runs on a blocking thread, and the
+/// abort of the reconciler task does not end it. A bridge lets go of its
+/// utun before the interface goes, and the routes go with the interface.
+/// Returns whether the bridge still holds its utun. A bridge never takes a
+/// utun back, so a pass that returns `false` is the last one.
+fn reconcile_routes(route: &RunRoute, cmds: &[RouteCommand]) -> bool {
+    for cmd in cmds {
+        match ensure_route_command(route, cmd) {
+            Ok(()) => {}
+            Err(RouteError::LetGo) => {
+                info!(iface = %cmd.iface, "netbridge route pass ended with its bridge");
+                return false;
+            }
+            Err(RouteError::Failed(err)) => {
+                warn!(cidr = %cmd.cidr, iface = %cmd.iface, %err, "netbridge route reconcile failed");
+            }
+        }
+    }
+    true
 }
 
 // ── Docker helpers ─────────────────────────────────────────────────
@@ -1254,12 +1337,20 @@ pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Left
             return Cleanup::Owed;
         }
     };
-    let container_gone = best_effort_remove_setup_container(docker, &held).await;
+    remove_with_port_held(docker, &held, leftovers).await
+}
+
+async fn remove_with_port_held(
+    docker: &Docker,
+    held: &ListenPort,
+    leftovers: Leftovers,
+) -> Cleanup {
+    let container_gone = best_effort_remove_setup_container(docker, held).await;
     let (forwarder_gone, network) = match leftovers {
         Leftovers::SetupContainer => (true, None),
         Leftovers::SetupContainerAndNetwork => {
-            let forwarder_gone = best_effort_remove_dns_forwarder(docker, &held).await;
-            let network = remove_portman_network_if_owned(docker, &held).await;
+            let forwarder_gone = best_effort_remove_dns_forwarder(docker, held).await;
+            let network = remove_portman_network_if_owned(docker, held).await;
             (forwarder_gone, Some(network))
         }
     };
@@ -1510,25 +1601,43 @@ impl RouteCommand {
 /// other live utun belong to something else and are left alone.
 static OWN_UTUNS: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
 
-fn remember_own_utun(name: &str) {
-    OWN_UTUNS
+/// Held while a `route` command of a bridge runs.
+static ROUTE_IN_FLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn route_in_flight() -> std::sync::MutexGuard<'static, ()> {
+    ROUTE_IN_FLIGHT
         .lock()
-        .expect("own-utun lock poisoned")
-        .insert(name.to_string());
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn forget_own_utun(name: &str) {
+/// The let-go of a utun runs in the `drop` of [`OwnHalf`], also while a pump
+/// unwinds from a panic, and a second panic there would abort the daemon. So
+/// a poisoned lock is read as it is.
+fn own_utuns() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
     OWN_UTUNS
         .lock()
-        .expect("own-utun lock poisoned")
-        .remove(name);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn remember_own_utun(name: &str) {
+    own_utuns().insert(name.to_string());
+}
+
+/// Ends the claim on `name` and waits for the `route` command that runs at
+/// this moment. No later command runs for the name. With one bridge in the
+/// process the wait is for that one command: at most [`ROUTE_LIMIT`], and
+/// [`KILL_GRACE`] after it for a command that was killed. The daemon has one
+/// bridge, because it ends a bridge before it starts the next, and two
+/// bridges cannot hold the one listen port. The lock is one for the process
+/// and it is not fair. So among several bridges the commands of the others
+/// can go ahead of the let-go, and the wait is then for more than one.
+fn forget_own_utun(name: &str) {
+    own_utuns().remove(name);
+    drop(route_in_flight());
 }
 
 fn is_own_utun(name: &str) -> bool {
-    OWN_UTUNS
-        .lock()
-        .expect("own-utun lock poisoned")
-        .contains(name)
+    own_utuns().contains(name)
 }
 
 /// Does `iface` still exist on the host?
@@ -1570,7 +1679,8 @@ impl Drop for InstalledRoutes {
             return;
         }
         for cidr in &self.cidrs {
-            if let Err(err) = run_route("delete", cidr, &self.iface) {
+            let args = ["-n", "delete", "-net", cidr, "-interface", &self.iface];
+            if let Err(err) = route_result("delete", sbin_route(&args)) {
                 warn!(%cidr, iface = %self.iface, %err, "rolling back netbridge route");
             }
         }
@@ -1611,9 +1721,37 @@ fn classify_existing_route(cidr: &str, existing_iface: &str, wanted_iface: &str)
     }
 }
 
-fn ensure_route_command(cmd: &RouteCommand) -> Result<()> {
+/// How a `route` command of a bridge ends without its work done.
+#[derive(Debug)]
+enum RouteError {
+    /// The bridge let go of the utun, so the command did not run.
+    LetGo,
+    Failed(anyhow::Error),
+}
+
+impl From<RouteError> for anyhow::Error {
+    fn from(err: RouteError) -> Self {
+        match err {
+            RouteError::LetGo => anyhow!("the bridge let go of its utun"),
+            RouteError::Failed(err) => err,
+        }
+    }
+}
+
+/// Runs `command` while the bridge holds `utun`. `route` takes an interface
+/// by its name, and the kernel gives the name of a utun that is gone to the
+/// next one, which can belong to a VPN.
+fn while_bridge_holds<T>(utun: &str, command: impl FnOnce() -> T) -> Result<T, RouteError> {
+    let _in_flight = route_in_flight();
+    if !is_own_utun(utun) {
+        return Err(RouteError::LetGo);
+    }
+    Ok(command())
+}
+
+fn ensure_route_command(route: &RunRoute, cmd: &RouteCommand) -> Result<(), RouteError> {
     if cmd.verb == "add" {
-        if let Some(existing) = specific_route_utun_interface(&cmd.cidr) {
+        if let Some(existing) = specific_route_utun_interface(route, &cmd.iface, &cmd.cidr)? {
             match classify_existing_route(&cmd.cidr, &existing, &cmd.iface) {
                 ExistingRoute::Correct => return Ok(()),
                 // The dedicated subnet belongs to this runtime even if its
@@ -1626,11 +1764,12 @@ fn ensure_route_command(cmd: &RouteCommand) -> Result<()> {
                         alive = interface_is_alive(&existing),
                         "repointing stale netbridge route"
                     );
-                    if run_route("change", &cmd.cidr, &cmd.iface).is_ok() {
-                        return Ok(());
+                    match run_route(route, "change", &cmd.cidr, &cmd.iface) {
+                        // `change` can fail if the route vanished under us;
+                        // fall through and let `add` handle it.
+                        Err(RouteError::Failed(_)) => {}
+                        ended => return ended,
                     }
-                    // `change` can fail if the route vanished under us; fall
-                    // through and let `add` handle it.
                 }
                 ExistingRoute::Foreign => {
                     debug!(
@@ -1645,27 +1784,84 @@ fn ensure_route_command(cmd: &RouteCommand) -> Result<()> {
         }
     }
 
-    match run_route(cmd.verb, &cmd.cidr, &cmd.iface) {
-        Ok(()) => Ok(()),
-        Err(err) if cmd.verb == "add" => match specific_route_utun_interface(&cmd.cidr) {
-            Some(existing)
-                if classify_existing_route(&cmd.cidr, &existing, &cmd.iface)
-                    != ExistingRoute::Repair =>
-            {
-                debug!(cidr = %cmd.cidr, %existing, "route already present; leaving it in place");
-                Ok(())
+    match run_route(route, cmd.verb, &cmd.cidr, &cmd.iface) {
+        Err(RouteError::Failed(err)) if cmd.verb == "add" => {
+            match specific_route_utun_interface(route, &cmd.iface, &cmd.cidr)? {
+                Some(existing)
+                    if classify_existing_route(&cmd.cidr, &existing, &cmd.iface)
+                        != ExistingRoute::Repair =>
+                {
+                    debug!(cidr = %cmd.cidr, %existing, "route already present; leaving it in place");
+                    Ok(())
+                }
+                _ => Err(RouteError::Failed(err)),
             }
-            _ => Err(err),
-        },
-        Err(err) => Err(err),
+        }
+        ended => ended,
     }
 }
 
-fn run_route(verb: &str, cidr: &str, iface: &str) -> Result<()> {
-    let output = StdCommand::new("/sbin/route")
-        .args(["-n", verb, "-net", cidr, "-interface", iface])
-        .output()
-        .with_context(|| format!("spawning /sbin/route {verb}"))?;
+type RunRoute<'a> = dyn Fn(&[&str]) -> std::io::Result<Output> + 'a;
+
+fn sbin_route(args: &[&str]) -> std::io::Result<Output> {
+    output_within(StdCommand::new("/sbin/route").args(args), ROUTE_LIMIT)
+}
+
+/// Runs `command` to its end and returns what it printed. A command that
+/// runs longer than `limit` is killed and gets [`KILL_GRACE`] to go away.
+/// One that is still there after the grace is left behind with a warning,
+/// because a wait without a bound would hold a bridge that ends. So a
+/// bridge that has let go of its utun promises this much: no `route`
+/// command runs for the utun, provided that a killed `route` goes away
+/// within the grace.
+///
+/// This is for a program like `route`, which starts no program of its own
+/// and prints less than a pipe holds. A program that leaves a child with
+/// its output open holds this call past the limit. A program that prints
+/// more than a pipe holds waits for a reader, which comes only after the
+/// program has ended, so it is killed at the limit.
+fn output_within(command: &mut StdCommand, limit: Duration) -> std::io::Result<Output> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if exits_within(&mut child, limit)? {
+        return child.wait_with_output();
+    }
+    child.kill()?;
+    if !exits_within(&mut child, KILL_GRACE)? {
+        warn!(
+            pid = child.id(),
+            "a command that was killed at its limit is still there; it is left behind"
+        );
+    }
+    let timed_out = format!("the command did not end within {limit:?}");
+    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, timed_out))
+}
+
+fn exits_within(child: &mut std::process::Child, limit: Duration) -> std::io::Result<bool> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Runs one `route` command for `iface`, while the bridge holds it.
+fn run_route(route: &RunRoute, verb: &str, cidr: &str, iface: &str) -> Result<(), RouteError> {
+    let args = ["-n", verb, "-net", cidr, "-interface", iface];
+    let output = while_bridge_holds(iface, || route(&args))?;
+    route_result(verb, output).map_err(RouteError::Failed)
+}
+
+fn route_result(verb: &str, output: std::io::Result<Output>) -> Result<()> {
+    let output = output.with_context(|| format!("spawning /sbin/route {verb}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
@@ -1682,19 +1878,24 @@ fn run_route(verb: &str, cidr: &str, iface: &str) -> Result<()> {
     Ok(())
 }
 
-fn specific_route_utun_interface(cidr: &str) -> Option<String> {
-    let addr = cidr.split('/').next()?;
-    let Ok(output) = StdCommand::new("/sbin/route")
-        .args(["-n", "get", addr])
-        .output()
-    else {
-        return None;
+/// The utun of the specific route to `cidr`, asked for while the bridge
+/// holds `iface`.
+fn specific_route_utun_interface(
+    route: &RunRoute,
+    iface: &str,
+    cidr: &str,
+) -> Result<Option<String>, RouteError> {
+    let Some(addr) = cidr.split('/').next() else {
+        return Ok(None);
+    };
+    let Ok(output) = while_bridge_holds(iface, || route(&["-n", "get", addr]))? else {
+        return Ok(None);
     };
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    route_get_specific_utun_interface(&stdout, addr)
+    Ok(route_get_specific_utun_interface(&stdout, addr))
 }
 
 fn route_get_specific_utun_interface(stdout: &str, addr: &str) -> Option<String> {
@@ -1731,6 +1932,8 @@ fn strip_utun_prefix(pkt: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
     use super::*;
 
     #[test]
@@ -2008,6 +2211,7 @@ destination: 172.18.0.0
             rx_sock.clone(),
             rx_peer.clone(),
             endpoint.clone(),
+            "no-utun",
             tokio::io::sink(),
         );
 
@@ -2153,12 +2357,10 @@ destination: 172.18.0.0
         use std::os::unix::fs::PermissionsExt;
         use std::process::Stdio;
 
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        static RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir =
-            std::env::temp_dir().join(format!("portman-dns-mode-{}-{nanos}", std::process::id()));
+            std::env::temp_dir().join(format!("portman-dns-mode-{}-{run}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let program = dir.join("dnsmasq");
         std::fs::write(&program, dnsmasq).unwrap();
@@ -2371,7 +2573,18 @@ destination: 172.18.0.0
         /// The method and path of each request that is not an inspect, and
         /// its body.
         requests: Shared<Vec<(String, String)>>,
+        refusals: Shared<HashMap<String, Refusal>>,
     }
+
+    type Refusal = (&'static str, &'static str);
+
+    /// How the engine answers the removal of a network that a running
+    /// container is attached to.
+    const IN_USE: Refusal = (
+        "403 Forbidden",
+        "error while removing network: network portman has active endpoints",
+    );
+    const ENGINE_FAILED: Refusal = ("500 Internal Server Error", "the engine is shutting down");
 
     const IMAGE_INSPECT: &str = "/images/portman-netbridge/setup:local/json";
     const IMAGE_WITH_DNS_MODE: &str = r#"{
@@ -2395,10 +2608,12 @@ destination: 172.18.0.0
             let address = listener.local_addr().unwrap().to_string();
             let holds = Shared::<HashMap<String, String>>::default();
             let requests = Shared::<Vec<(String, String)>>::default();
-            let (held, asked) = (holds.clone(), requests.clone());
+            let refusals = Shared::<HashMap<String, Refusal>>::default();
+            let (held, asked, refused) = (holds.clone(), requests.clone(), refusals.clone());
             tokio::spawn(async move {
                 while let Ok((stream, _)) = listener.accept().await {
-                    tokio::spawn(Self::answer(stream, held.clone(), asked.clone()));
+                    let (held, asked, refused) = (held.clone(), asked.clone(), refused.clone());
+                    tokio::spawn(Self::answer(stream, held, asked, refused));
                 }
             });
             let engine = Self {
@@ -2406,6 +2621,7 @@ destination: 172.18.0.0
                     .unwrap(),
                 holds,
                 requests,
+                refusals,
             };
             engine.hold(IMAGE_INSPECT, IMAGE_WITH_DNS_MODE);
             engine.hold(NETWORK_INSPECT, OWN_NETWORK);
@@ -2414,6 +2630,10 @@ destination: 172.18.0.0
 
         fn hold(&self, path: &str, json: &str) {
             self.holds.lock().unwrap().insert(path.into(), json.into());
+        }
+
+        fn refuse_delete(&self, path: &str, refusal: Refusal) {
+            self.refusals.lock().unwrap().insert(path.into(), refusal);
         }
 
         fn requests(&self) -> Vec<(String, String)> {
@@ -2437,10 +2657,30 @@ destination: 172.18.0.0
             }
         }
 
+        async fn bridge_with_pumps(&self) -> Runtime {
+            let mut bridge = self.bridge().await;
+            let udp = &bridge.listen_port.0;
+            let (host, vm) = (Keypair::generate(), Keypair::generate());
+            let peer = Arc::new(Mutex::new(Peer::new(&host, vm.public(), None)));
+            let endpoint = Arc::new(Mutex::new(None));
+            bridge.tasks = vec![
+                spawn_rx(
+                    udp.clone(),
+                    peer.clone(),
+                    endpoint.clone(),
+                    &bridge.utun_name,
+                    tokio::io::sink(),
+                ),
+                spawn_timer(udp.clone(), peer, endpoint),
+            ];
+            bridge
+        }
+
         async fn answer(
             mut stream: tokio::net::TcpStream,
             holds: Shared<HashMap<String, String>>,
             requests: Shared<Vec<(String, String)>>,
+            refusals: Shared<HashMap<String, Refusal>>,
         ) {
             let mut head = Vec::new();
             while !head.ends_with(b"\r\n\r\n") {
@@ -2472,14 +2712,18 @@ destination: 172.18.0.0
                     let asked = format!("{} {path}", method.to_ascii_uppercase());
                     let body = String::from_utf8(body).unwrap();
                     requests.lock().unwrap().push((asked, body));
-                    match (method, path) {
-                        ("delete", _) => {
+                    let refusal = refusals.lock().unwrap().get(path).copied();
+                    match (method, path, refusal) {
+                        ("delete", _, Some((status, message))) => {
+                            (status, format!(r#"{{"message":"{message}"}}"#))
+                        }
+                        ("delete", _, None) => {
                             let mut holds = holds.lock().unwrap();
                             holds.remove(&format!("{path}/json"));
                             holds.remove(path);
                             ("204 No Content", String::new())
                         }
-                        ("post", "/containers/create") => {
+                        ("post", "/containers/create", _) => {
                             ("201 Created", r#"{"Id":"eeee3333","Warnings":[]}"#.into())
                         }
                         _ => ("204 No Content", String::new()),
@@ -2645,6 +2889,727 @@ destination: 172.18.0.0
             }
 
             assert_eq!(engine.asked_for(), requests, "disable={disable}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bridge_that_is_dropped_still_holds_the_listen_port_when_the_drop_returns() {
+        let engine = FakeEngine::start().await;
+        let bridge = engine.bridge_with_pumps().await;
+        let port = bridge.listen_port.0.local_addr().unwrap().port();
+
+        drop(bridge);
+        let next_start = ListenPort::claim(port).await;
+
+        assert_eq!(
+            next_start.err().map(|err| err.kind()),
+            Some(std::io::ErrorKind::AddrInUse)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_bridge_has_freed_the_listen_port_and_asked_the_engine_nothing() {
+        let engine = FakeEngine::start().await;
+        engine.hold(SETUP_INSPECT, OWN_SETUP_CONTAINER);
+        let bridge = engine.bridge_with_pumps().await;
+        let socket = Arc::downgrade(&bridge.listen_port.0);
+
+        bridge.abandon().await;
+
+        assert_eq!(socket.strong_count(), 0, "the listen port has a holder");
+        assert_eq!(engine.asked_for(), [] as [&str; 0]);
+    }
+
+    struct Device {
+        utun: &'static str,
+        claimed_at_close: Shared<Option<bool>>,
+    }
+
+    impl Drop for Device {
+        fn drop(&mut self) {
+            *self.claimed_at_close.lock().unwrap() = Some(is_own_utun(self.utun));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bridge_that_ends_lets_go_of_its_utun_before_it_closes_the_device() {
+        let utun = "utun-of-a-bridge-that-ends";
+        let claimed_at_close = Shared::<Option<bool>>::default();
+        let device = Device {
+            utun,
+            claimed_at_close: claimed_at_close.clone(),
+        };
+        let engine = FakeEngine::start().await;
+        let mut bridge = engine.bridge().await;
+        bridge.utun_name = utun.to_string();
+        remember_own_utun(utun);
+        bridge.tasks = vec![tokio::spawn(async move {
+            let _device = device;
+            std::future::pending::<()>().await
+        })];
+
+        bridge.abandon().await;
+
+        assert_eq!(
+            *claimed_at_close.lock().unwrap(),
+            Some(false),
+            "the bridge claimed the utun when its device closed"
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum Ends {
+        Never,
+        ByAnError,
+        ByAPanic,
+    }
+
+    #[derive(Clone)]
+    struct Seen {
+        utun: &'static str,
+        claimed_at_drop: Shared<Vec<bool>>,
+        a_half_dropped: Arc<AtomicBool>,
+    }
+
+    impl Seen {
+        fn claim(utun: &'static str) -> Self {
+            remember_own_utun(utun);
+            Self {
+                utun,
+                claimed_at_drop: Shared::default(),
+                a_half_dropped: Arc::default(),
+            }
+        }
+
+        fn half(&self, ends: Ends) -> Half {
+            Half {
+                ends,
+                seen: self.clone(),
+            }
+        }
+
+        fn claimed_at_drop(&self) -> Vec<bool> {
+            self.claimed_at_drop.lock().unwrap().clone()
+        }
+    }
+
+    struct Half {
+        ends: Ends,
+        seen: Seen,
+    }
+
+    impl Half {
+        fn used(&self) -> std::task::Poll<std::io::Result<()>> {
+            match self.ends {
+                Ends::Never => std::task::Poll::Pending,
+                Ends::ByAnError => {
+                    std::task::Poll::Ready(Err(std::io::Error::other("the device is gone")))
+                }
+                Ends::ByAPanic => panic!("the pump panics"),
+            }
+        }
+    }
+
+    impl Drop for Half {
+        fn drop(&mut self) {
+            let claimed = is_own_utun(self.seen.utun);
+            self.seen.claimed_at_drop.lock().unwrap().push(claimed);
+            self.seen.a_half_dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl tokio::io::AsyncRead for Half {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.used()
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Half {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.used().map_ok(|()| bytes.len())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    struct Passes {
+        stop: Arc<AtomicBool>,
+        ended: Arc<AtomicU64>,
+        after_a_drop: Arc<AtomicU64>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl Passes {
+        fn start(seen: &Seen) -> Self {
+            let stop = Arc::<AtomicBool>::default();
+            let ended = Arc::<AtomicU64>::default();
+            let after_a_drop = Arc::<AtomicU64>::default();
+            let ran = Arc::<AtomicU64>::default();
+            let thread = {
+                let (seen, stop, ended) = (seen.clone(), stop.clone(), ended.clone());
+                let (after_a_drop, ran) = (after_a_drop.clone(), ran.clone());
+                std::thread::spawn(move || {
+                    let dropped = || seen.a_half_dropped.load(Ordering::SeqCst);
+                    let route = |_: &[&str]| {
+                        let started_late = dropped();
+                        ran.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_micros(200));
+                        if started_late || dropped() {
+                            after_a_drop.fetch_add(1, Ordering::SeqCst);
+                        }
+                        route_ended(0, "")
+                    };
+                    let cmds = [RouteCommand::add("192.0.2.0/24", seen.utun)];
+                    while !stop.load(Ordering::SeqCst) {
+                        reconcile_routes(&route, &cmds);
+                        ended.fetch_add(1, Ordering::SeqCst);
+                        std::thread::yield_now();
+                    }
+                })
+            };
+            while ran.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Self {
+                stop,
+                ended,
+                after_a_drop,
+                thread,
+            }
+        }
+
+        fn end(self) -> u64 {
+            let ended = self.ended.load(Ordering::SeqCst);
+            while self.ended.load(Ordering::SeqCst) < ended + 2 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.stop.store(true, Ordering::SeqCst);
+            self.thread.join().unwrap();
+            self.after_a_drop.load(Ordering::SeqCst)
+        }
+    }
+
+    async fn tx_pump(half: Half) -> JoinHandle<()> {
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (host, vm) = (Keypair::generate(), Keypair::generate());
+        let peer = Arc::new(Mutex::new(Peer::new(&host, vm.public(), None)));
+        spawn_tx(udp, peer, Arc::default(), half.seen.utun, half)
+    }
+
+    const ECHO_FROM_THE_VM: &[u8] = &[
+        0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 192, 168, 99, 2,
+        192, 168, 99, 1, b'e', b'c', b'h', b'o', b'!', b'!', b'!', b'!',
+    ];
+
+    async fn rx_pump_that_gets_a_packet(half: Half) -> JoinHandle<()> {
+        let (host, vm) = (Keypair::generate(), Keypair::generate());
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let to_host = udp.local_addr().unwrap();
+        let peer = Arc::new(Mutex::new(Peer::new(&host, vm.public(), None)));
+        let pump = spawn_rx(udp, peer, Arc::default(), half.seen.utun, half);
+
+        let mut vm = Peer::new(&vm, host.public(), None);
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (mut frame, mut answer) = ([0u8; 2048], [0u8; 2048]);
+        let TunnResult::WriteToNetwork(initiation) = vm.encapsulate(ECHO_FROM_THE_VM, &mut frame)
+        else {
+            panic!("no handshake initiation");
+        };
+        socket.send_to(initiation, to_host).await.unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(60), socket.recv_from(&mut answer));
+        let (n, _) = answered
+            .await
+            .expect("the pump answers the handshake")
+            .unwrap();
+        if let TunnResult::WriteToNetwork(keepalive) = vm.decapsulate(&answer[..n], &mut frame) {
+            socket.send_to(keepalive, to_host).await.unwrap();
+        }
+        let TunnResult::WriteToNetwork(data) = vm.encapsulate(ECHO_FROM_THE_VM, &mut frame) else {
+            panic!("no data frame");
+        };
+        socket.send_to(data, to_host).await.unwrap();
+        pump
+    }
+
+    async fn ended(pump: JoinHandle<()>) -> Result<(), tokio::task::JoinError> {
+        tokio::time::timeout(Duration::from_secs(60), pump)
+            .await
+            .expect("the pump ends by itself")
+    }
+
+    #[tokio::test]
+    async fn a_pump_that_fails_lets_go_of_the_utun_before_its_half_of_the_device_drops() {
+        let seen = Seen::claim("utun-of-a-pump-that-fails");
+        let passes = Passes::start(&seen);
+
+        let pump = tx_pump(seen.half(Ends::ByAnError)).await;
+        assert!(ended(pump).await.is_ok());
+
+        assert_eq!(passes.end(), 0, "route commands after the half dropped");
+        assert_eq!(seen.claimed_at_drop(), [false]);
+    }
+
+    #[tokio::test]
+    async fn a_pump_that_panics_lets_go_of_the_utun_before_its_half_of_the_device_drops() {
+        let tx = Seen::claim("utun-of-a-tx-pump-that-panics");
+        let passes = Passes::start(&tx);
+        let pump = tx_pump(tx.half(Ends::ByAPanic)).await;
+        assert!(ended(pump).await.unwrap_err().is_panic());
+        assert_eq!(passes.end(), 0, "route commands after the tx half dropped");
+        assert_eq!(tx.claimed_at_drop(), [false]);
+
+        let rx = Seen::claim("utun-of-an-rx-pump-that-panics");
+        let passes = Passes::start(&rx);
+        let pump = rx_pump_that_gets_a_packet(rx.half(Ends::ByAPanic)).await;
+        assert!(ended(pump).await.unwrap_err().is_panic());
+        assert_eq!(passes.end(), 0, "route commands after the rx half dropped");
+        assert_eq!(rx.claimed_at_drop(), [false]);
+    }
+
+    #[tokio::test]
+    async fn when_both_pumps_end_the_bridge_has_let_go_of_the_utun_before_the_device_closes() {
+        let seen = Seen::claim("utun-of-two-pumps-that-end");
+        let passes = Passes::start(&seen);
+
+        let tx = tx_pump(seen.half(Ends::ByAnError)).await;
+        let rx = rx_pump_that_gets_a_packet(seen.half(Ends::ByAPanic)).await;
+        assert!(ended(tx).await.is_ok());
+        assert!(ended(rx).await.unwrap_err().is_panic());
+
+        assert_eq!(passes.end(), 0, "route commands after a half dropped");
+        assert_eq!(seen.claimed_at_drop(), [false, false]);
+    }
+
+    /// At its end the daemon drops its tokio runtime, and the runtime drops
+    /// the task that holds the bridge and the pump tasks in an order of its
+    /// own. The order follows the ids of the tasks, which count up across
+    /// the process and fall into four lists. So the test puts 0 to 7 tasks
+    /// between the pump and the holder of the bridge.
+    #[test]
+    fn a_tokio_runtime_that_shuts_down_drops_no_half_of_a_device_under_the_claim_on_its_utun() {
+        for tasks_between in 0..8 {
+            let utun = format!("utun-at-a-shutdown-{tasks_between}");
+            let utun: &'static str = Box::leak(utun.into_boxed_str());
+            let seen = Seen::claim(utun);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let engine = FakeEngine::start().await;
+                let mut bridge = engine.bridge().await;
+                bridge.utun_name = utun.to_string();
+                bridge.tasks = vec![tx_pump(seen.half(Ends::Never)).await];
+                for _ in 0..tasks_between {
+                    tokio::spawn(std::future::pending::<()>());
+                }
+                let (holds, held) = tokio::sync::oneshot::channel();
+                tokio::spawn(async move {
+                    let _bridge = bridge;
+                    let _ = holds.send(());
+                    std::future::pending::<()>().await
+                });
+                held.await.unwrap();
+                assert!(
+                    is_own_utun(utun),
+                    "the bridge let go of the utun under a pump that runs"
+                );
+            });
+
+            drop(runtime);
+
+            assert_eq!(
+                seen.claimed_at_drop(),
+                [false],
+                "tasks_between={tasks_between}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pump_that_ends_lets_go_of_the_utun_through_a_poisoned_lock() {
+        let utun = "utun-under-a-poisoned-lock";
+        let poisons = std::thread::spawn(|| {
+            let _held = OWN_UTUNS.lock();
+            panic!("a panic under the lock of the utun names");
+        });
+        assert!(poisons.join().is_err());
+        assert!(OWN_UTUNS.is_poisoned());
+
+        remember_own_utun(utun);
+        assert!(is_own_utun(utun));
+        drop(OwnHalf {
+            utun: utun.to_string(),
+            half: (),
+        });
+        assert!(!is_own_utun(utun));
+
+        OWN_UTUNS.clear_poison();
+    }
+
+    #[tokio::test]
+    async fn the_route_reconciler_ends_with_the_pass_that_finds_the_utun_let_go() {
+        static RAN: AtomicU64 = AtomicU64::new(0);
+        let route = |_: &[&str]| {
+            RAN.fetch_add(1, Ordering::SeqCst);
+            route_ended(0, "")
+        };
+        let engine = FakeEngine::start().await;
+        let reconciler = |utun: &str| {
+            let docker = engine.docker.clone();
+            spawn_route_reconciler(docker, NetbridgeMode::OptIn, utun.to_string(), route)
+        };
+
+        let let_go = reconciler("utun-let-go-before-the-reconciler");
+        tokio::time::timeout(Duration::from_secs(30), let_go)
+            .await
+            .expect("the reconciler ends")
+            .unwrap();
+        assert_eq!(RAN.load(Ordering::SeqCst), 0);
+
+        let utun = "utun-held-under-the-reconciler";
+        remember_own_utun(utun);
+        let held = reconciler(utun);
+        while RAN.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!held.is_finished(), "the reconciler ended under its bridge");
+        forget_own_utun(utun);
+        held.abort();
+    }
+
+    #[tokio::test]
+    async fn a_route_pass_that_panics_does_not_end_the_reconciler_of_a_bridge_that_holds_its_utun()
+    {
+        static COMMANDS: AtomicU64 = AtomicU64::new(0);
+        let route = |_: &[&str]| {
+            if COMMANDS.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("the first route pass panics");
+            }
+            route_ended(0, "")
+        };
+        let utun = "utun-of-a-route-pass-that-panics";
+        remember_own_utun(utun);
+        let docker = FakeEngine::start().await.docker.clone();
+        let reconciler =
+            spawn_route_reconciler(docker, NetbridgeMode::OptIn, utun.to_string(), route);
+
+        let began = std::time::Instant::now();
+        while COMMANDS.load(Ordering::SeqCst) < 2 {
+            assert!(
+                !reconciler.is_finished(),
+                "the reconciler ended with the pass that panicked"
+            );
+            assert!(
+                began.elapsed() < ROUTE_RECONCILE_PERIOD + Duration::from_secs(60),
+                "no pass followed the one that panicked"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        forget_own_utun(utun);
+        reconciler.abort();
+    }
+
+    #[derive(Clone, Default)]
+    struct Logged(Shared<Vec<u8>>);
+
+    /// While one subscriber exists, tracing takes a callsite's interest
+    /// from the thread that reaches it first, and that can be a test that
+    /// has no subscriber. With a second subscriber it asks each of them.
+    struct Capture {
+        _on_this_thread: tracing::subscriber::DefaultGuard,
+        _second_subscriber: tracing::Dispatch,
+    }
+
+    impl std::io::Write for Logged {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Logged {
+        fn capture() -> (Self, Capture) {
+            let logged = Self::default();
+            let writer = logged.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let capture = Capture {
+                _on_this_thread: tracing::subscriber::set_default(subscriber),
+                _second_subscriber: tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new()),
+            };
+            (logged, capture)
+        }
+
+        fn take_lines(&self) -> Vec<String> {
+            let bytes = std::mem::take(&mut *self.0.lock().unwrap());
+            let text = String::from_utf8(bytes).unwrap();
+            text.lines().map(String::from).collect()
+        }
+
+        fn take_warnings(&self) -> Vec<String> {
+            let mut lines = self.take_lines();
+            lines.retain(|line| line.contains(" WARN "));
+            lines
+        }
+    }
+
+    fn route_ended(code: i32, stderr: &str) -> std::io::Result<std::process::Output> {
+        use std::os::unix::process::ExitStatusExt;
+
+        Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.into(),
+        })
+    }
+
+    fn no_such_interface(_: &[&str]) -> std::io::Result<std::process::Output> {
+        route_ended(1, "route: bad address: utun-of-no-bridge")
+    }
+
+    #[test]
+    fn a_route_that_fails_is_a_warning_only_while_the_bridge_holds_its_utun() {
+        let utun = "utun-of-no-bridge";
+        let pass = [RouteCommand::add("192.0.2.0/24", utun)];
+        let (logged, _capture) = Logged::capture();
+
+        remember_own_utun(utun);
+        reconcile_routes(&no_such_interface, &pass);
+        let warnings = logged.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("route reconcile failed"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("bad address"), "{warnings:?}");
+
+        forget_own_utun(utun);
+        reconcile_routes(&no_such_interface, &pass);
+        assert_eq!(logged.take_warnings(), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn a_route_pass_runs_no_command_for_a_utun_that_its_bridge_let_go_of() {
+        let utun = "utun-let-go-before-the-pass";
+        let pass = [
+            RouteCommand::add("192.0.2.0/24", utun),
+            RouteCommand::add("198.51.100.0/24", utun),
+        ];
+        let ran = std::cell::RefCell::new(Vec::new());
+        let route = |args: &[&str]| {
+            ran.borrow_mut().push(args.join(" "));
+            route_ended(0, "")
+        };
+        let (logged, _capture) = Logged::capture();
+
+        remember_own_utun(utun);
+        reconcile_routes(&route, &pass);
+        assert_eq!(logged.take_lines(), [] as [&str; 0]);
+        assert_eq!(
+            ran.take(),
+            [
+                "-n get 192.0.2.0",
+                "-n add -net 192.0.2.0/24 -interface utun-let-go-before-the-pass",
+                "-n get 198.51.100.0",
+                "-n add -net 198.51.100.0/24 -interface utun-let-go-before-the-pass",
+            ]
+        );
+
+        forget_own_utun(utun);
+        reconcile_routes(&route, &pass);
+        assert_eq!(ran.take(), [] as [&str; 0]);
+        let said = logged.take_lines();
+        assert_eq!(said.len(), 1, "{said:?}");
+        let ended = "netbridge route pass ended with its bridge iface=utun-let-go-before-the-pass";
+        assert!(
+            said[0].contains(" INFO ") && said[0].ends_with(ended),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_bridge_lets_go_of_its_utun_only_after_the_route_command_that_runs_for_it() {
+        use std::sync::mpsc;
+
+        let utun = "utun-let-go-during-a-command";
+        remember_own_utun(utun);
+        let (started, command_runs) = mpsc::channel();
+        let (may_end, ends) = mpsc::channel::<()>();
+        let pass = std::thread::spawn(move || {
+            let route = |_: &[&str]| {
+                let _ = started.send(());
+                let _ = ends.recv();
+                route_ended(0, "")
+            };
+            reconcile_routes(&route, &[RouteCommand::add("192.0.2.0/24", utun)]);
+        });
+        command_runs.recv().unwrap();
+
+        let (let_go, lets_go) = mpsc::channel();
+        let bridge = std::thread::spawn(move || {
+            forget_own_utun(utun);
+            let_go.send(()).unwrap();
+        });
+
+        let claim_ended = (0..3000).any(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            !is_own_utun(utun)
+        });
+        assert!(
+            claim_ended,
+            "the claim stands while the command runs, so the pass could go on after it"
+        );
+        assert!(
+            lets_go.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the bridge let go of its utun while a route command for it ran"
+        );
+        drop(may_end);
+        lets_go
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the bridge lets go once the command has ended");
+        pass.join().unwrap();
+        bridge.join().unwrap();
+    }
+
+    #[test]
+    fn a_command_that_outlives_its_limit_is_ended_and_one_that_does_not_gives_its_output() {
+        let prints = "echo out; echo err >&2; exit 3";
+        let within = Duration::from_secs(60);
+        let ended = output_within(StdCommand::new("sh").args(["-c", prints]), within).unwrap();
+        assert_eq!(ended.status.code(), Some(3));
+        assert_eq!(
+            (ended.stdout, ended.stderr),
+            (b"out\n".into(), b"err\n".into())
+        );
+
+        let pid_file = std::env::temp_dir().join(format!("portman-hangs-{}", std::process::id()));
+        let hangs = format!("echo $$ > '{}'; exec sleep 60", pid_file.display());
+        let mut limit = Duration::from_millis(100);
+        let pid = loop {
+            let _ = std::fs::remove_file(&pid_file);
+            let began = std::time::Instant::now();
+            let hung = output_within(StdCommand::new("sh").args(["-c", &hangs]), limit);
+            assert_eq!(hung.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+            let took = began.elapsed();
+            assert!(took < limit + Duration::from_secs(10), "it took {took:?}");
+            match std::fs::read_to_string(&pid_file) {
+                Ok(pid) if pid.ends_with('\n') => break pid.trim().to_string(),
+                _killed_before_it_wrote_its_id => limit *= 2,
+            }
+        };
+        std::fs::remove_file(&pid_file).unwrap();
+        assert!(
+            !exists(&pid),
+            "the program that hangs (pid {pid}) is there after its limit"
+        );
+    }
+
+    /// A process that has ended exists until its parent has waited for it.
+    fn exists(pid: &str) -> bool {
+        let signal_none = StdCommand::new("kill").args(["-0", pid]).output().unwrap();
+        signal_none.status.success()
+    }
+
+    #[test]
+    fn a_route_program_that_hangs_holds_a_bridge_that_ends_no_longer_than_its_limit() {
+        let utun = "utun-of-a-route-that-hangs";
+        remember_own_utun(utun);
+        let (started, command_runs) = std::sync::mpsc::channel();
+        let pass = std::thread::spawn(move || {
+            let hangs = |_: &[&str]| {
+                let _ = started.send(());
+                output_within(
+                    StdCommand::new("sleep").arg("60"),
+                    Duration::from_millis(200),
+                )
+            };
+            let cmds: Vec<RouteCommand> = (0..40)
+                .map(|n| RouteCommand::add(format!("10.{n}.0.0/16"), utun))
+                .collect();
+            reconcile_routes(&hangs, &cmds);
+        });
+        command_runs.recv().unwrap();
+
+        let began = std::time::Instant::now();
+        forget_own_utun(utun);
+        let waited = began.elapsed();
+        pass.join().unwrap();
+
+        assert!(
+            waited < Duration::from_secs(5),
+            "the bridge waited {waited:?} for a route program that hangs"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_for_a_disable_asks_for_a_network_in_use_once_and_warns_once() {
+        let engine = FakeEngine::start().await;
+        engine.hold(SETUP_INSPECT, OWN_SETUP_CONTAINER);
+        engine.refuse_delete(NETWORK_INSPECT, IN_USE);
+        let bridge = engine.bridge().await;
+        let (logged, _capture) = Logged::capture();
+
+        let cleanup = bridge.shutdown_and_remove_network().await;
+
+        assert_eq!(cleanup, Cleanup::Complete);
+        let mut asked = engine.asked_for();
+        asked.retain(|asked| asked.ends_with(NETWORK_INSPECT));
+        assert_eq!(asked, ["DELETE /networks/portman"]);
+        let warnings = logged.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("has active endpoints"), "{warnings:?}");
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_for_a_disable_says_whether_a_later_cleanup_has_anything_left_to_try() {
+        let forwarder = dns_forwarder_args(&tlds(&["test"]));
+        // the removal that fails, and how → how the shutdown ends
+        let cases = [
+            (None, Cleanup::Complete),
+            (Some((NETWORK_INSPECT, IN_USE)), Cleanup::Complete),
+            (Some((NETWORK_INSPECT, ENGINE_FAILED)), Cleanup::Owed),
+            (Some(("/containers/dddd2222", ENGINE_FAILED)), Cleanup::Owed),
+        ];
+        for (fails, want) in cases {
+            let engine = FakeEngine::start().await;
+            engine.hold(SETUP_INSPECT, OWN_SETUP_CONTAINER);
+            engine.hold(FORWARDER_INSPECT, &held_forwarder(&forwarder, RUNNING));
+            if let Some((path, refusal)) = fails {
+                engine.refuse_delete(path, refusal);
+            }
+
+            let cleanup = engine.bridge().await.shutdown_and_remove_network().await;
+
+            assert_eq!(cleanup, want, "{fails:?}");
         }
     }
 

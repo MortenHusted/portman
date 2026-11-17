@@ -52,6 +52,12 @@ pub(crate) struct Handle {
     pub tlds_changed: Arc<Notify>,
 }
 
+impl Handle {
+    pub(crate) fn retry_in_secs(&self) -> Option<std::num::NonZeroU64> {
+        None
+    }
+}
+
 pub(crate) fn handle_pair() -> (Handle, mpsc::Receiver<Control>, watch::Sender<BridgePhase>) {
     let (tx, rx) = mpsc::channel(8);
     let mode = Arc::new(RwLock::new(NetbridgeMode::OptIn));
