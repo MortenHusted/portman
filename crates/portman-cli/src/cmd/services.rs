@@ -259,6 +259,7 @@ const RECORD_LIMIT: Duration = Duration::from_secs(3);
 const NEW_DAEMON_LIMIT: Duration = Duration::from_secs(30);
 const READY_LIMIT: Duration = Duration::from_secs(120);
 const POLL_PAUSE: Duration = Duration::from_millis(300);
+const FAILED_ATTEMPTS_THAT_END_THE_WAIT: u32 = 2;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct InterruptedServices(Vec<UpService>);
@@ -527,7 +528,8 @@ fn is_up(status: &ServiceStatusInfo) -> bool {
 
 fn start_ended(row: &ServiceStatusInfo) -> bool {
     match row.state {
-        ServiceState::Ready | ServiceState::Failed | ServiceState::Backoff => true,
+        ServiceState::Ready | ServiceState::Failed => true,
+        ServiceState::Backoff => row.restarts >= FAILED_ATTEMPTS_THAT_END_THE_WAIT,
         ServiceState::Stopped => !row.desired_up,
         _ => false,
     }
