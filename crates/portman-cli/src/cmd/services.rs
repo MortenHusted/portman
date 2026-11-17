@@ -272,6 +272,7 @@ struct UpService {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct RestartReport {
     started: Vec<String>,
+    dependencies: Vec<String>,
     in_backoff: Vec<NotStarted>,
     not_started: Vec<NotStarted>,
 }
@@ -375,13 +376,25 @@ impl InterruptedServices {
                 ))
             })
             .and_then(|response| match response {
-                Response::ServiceStatuses { .. } => Ok(()),
+                Response::ServiceStatuses { services } => Ok(services),
                 other => other.unexpected(),
             });
-        if let Err(err) = asked {
-            report.fail(known, &format!("{err:#}"));
-            return report;
-        }
+        let wanted_up = match asked {
+            Ok(rows) => rows.into_iter().filter(|row| row.desired_up),
+            Err(err) => {
+                report.fail(known, &format!("{err:#}"));
+                return report;
+            }
+        };
+        let was_down = |name: &String| {
+            listed
+                .iter()
+                .any(|row| row.name == *name && !row.desired_up)
+        };
+        let dependencies: Vec<String> = wanted_up
+            .map(|row| row.name)
+            .filter(|name| !names.contains(name) && was_down(name))
+            .collect();
 
         let rows = poll_services(&mut send, READY_LIMIT, |rows| {
             rows.iter()
@@ -410,6 +423,11 @@ impl InterruptedServices {
                 None => report.fail(vec![service], "the new daemon no longer lists it"),
             }
         }
+        let ready = |name: &String| {
+            rows.iter()
+                .any(|row| row.name == *name && row.state == ServiceState::Ready)
+        };
+        report.dependencies = dependencies.into_iter().filter(ready).collect();
         report
     }
 
@@ -431,6 +449,12 @@ impl RestartReport {
         let mut lines = Vec::new();
         if !self.started.is_empty() {
             lines.push(format!("started again: {}", self.started.join(", ")));
+        }
+        if !self.dependencies.is_empty() {
+            lines.push(format!(
+                "started as a dependency: {}",
+                self.dependencies.join(", ")
+            ));
         }
         for NotStarted { service, why } in &self.in_backoff {
             lines.push(format!(

@@ -69,7 +69,7 @@ git clone https://github.com/MortenHusted/portman && cd portman && cargo build -
 
 Optional extras: a Docker runtime if you want container routing, and [`mkcert`](https://github.com/FiloSottile/mkcert) if you want local TLS.
 
-To upgrade, run `portman install` again. It restarts the daemon, and the daemon stops every supervised service when it stops. The install names the services that are up before the restart and starts the same ones on the new daemon. A service that was down stays down. The install waits up to 120 seconds for the services to get ready, then prints the ones that are ready again. For each service that is not ready, it prints the reason and the command that starts it:
+To upgrade, run `portman install` again. It restarts the daemon, and the daemon stops every supervised service when it stops. The install names the services that are up before the restart and starts the same ones on the new daemon. A service that was down stays down, unless a service that the install starts depends on it. The daemon then starts that dependency too, and the install names it. The install waits up to 120 seconds for the services to get ready, then prints the ones that are ready again. For each service that is not ready, it prints the reason and the command that starts it:
 
 ```text
 the restart of the daemon stops these services: jobs, web
