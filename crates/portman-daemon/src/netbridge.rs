@@ -50,8 +50,9 @@
 //!     bridge on the forwarder and the network, and a debt that waited for
 //!     the port would be paid the first time the port is free for a
 //!     moment. The debt is saved in `netbridge.json` with the flag, so a
-//!     daemon that restarts still owes it. An `Enable` ends it. No cleanup
-//!     runs on a session that has been open for less than the
+//!     daemon that restarts still owes it. An `Enable` ends it. But for
+//!     the stop of a running bridge, which holds the port itself, no
+//!     cleanup runs on a session that has been open for less than the
 //!     [`HEAD_START`].
 //!   - a failed start is retried with a growing delay. The wait does not
 //!     hold up control messages, and a new session starts the delay over.
@@ -115,21 +116,22 @@ const SETUP_CHECK_BUDGET: Duration = Duration::from_secs(3);
 /// claim on the listen port that its start begins with.
 const START_CLAIMS_WITHIN: Duration = Duration::from_secs(2);
 
-/// How long a session is open before the loop cleans up on it. The bridge
-/// of another portman daemon on the same engine runs on the DNS forwarder
-/// and the docker network, and it holds the listen port only once its start
-/// has begun. That daemon has a session within [`SESSION_OPENS_WITHIN`] of
-/// the moment the engine answers, and its start claims the port before it
-/// asks the engine anything. After the head start such a bridge holds the
-/// port, and the cleanup ends as a taken port does. Until then the loop
-/// asks the engine nothing and does not claim the port, also not for the
-/// setup container: a claim can fail the other daemon's start, and the
-/// retry of that start comes [`RETRY_BASE`] later, which can be after the
-/// head start. The bound holds for a daemon that was built with the same
-/// limits and that has ended the bridge of a lost session before its next
-/// start claims the port. A 0.1.7 daemon does not wait for that end, so its
-/// first start on a new session can fail on its own port and wait
-/// [`RETRY_BASE`] for the retry.
+/// How long a session is open before the loop cleans up on it with no
+/// bridge of its own running. The bridge of another portman daemon on the
+/// same engine runs on the DNS forwarder and the docker network, and it
+/// holds the listen port only once its start has begun. That daemon has a
+/// session within [`SESSION_OPENS_WITHIN`] of the moment the engine
+/// answers, and its start claims the port before it asks the engine
+/// anything. After the head start such a bridge holds the port, and the
+/// cleanup ends as a taken port does. Until then the loop asks the engine
+/// nothing and does not claim the port, also not for the setup container: a
+/// claim can fail the other daemon's start, and the retry of that start
+/// comes [`RETRY_BASE`] later, which can be after the head start. The
+/// bound holds for a daemon that was built with the same limits and that
+/// has ended the bridge of a lost session before its next start claims the
+/// port. A 0.1.7 daemon does not wait for that end, so its first start on a
+/// new session can fail on its own port and wait [`RETRY_BASE`] for the
+/// retry.
 const HEAD_START: Duration =
     Duration::from_secs(SESSION_OPENS_WITHIN.as_secs() + START_CLAIMS_WITHIN.as_secs());
 
