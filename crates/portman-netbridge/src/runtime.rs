@@ -2892,6 +2892,7 @@ destination: 172.18.0.0
     /// writes to it.
     #[derive(Clone, Copy)]
     enum Ends {
+        Never,
         ByAnError,
         ByAPanic,
     }
@@ -2936,6 +2937,7 @@ destination: 172.18.0.0
     impl Half {
         fn used(&self) -> std::task::Poll<std::io::Result<()>> {
             match self.ends {
+                Ends::Never => std::task::Poll::Pending,
                 Ends::ByAnError => {
                     std::task::Poll::Ready(Err(std::io::Error::other("the device is gone")))
                 }
@@ -3141,6 +3143,55 @@ destination: 172.18.0.0
 
         assert_eq!(passes.end(), 0, "route commands after a half dropped");
         assert_eq!(seen.claimed_at_drop(), [false, false]);
+    }
+
+    /// At its end the daemon drops its tokio runtime, and the runtime drops
+    /// the task that holds the bridge and the pump tasks in an order of its
+    /// own.
+    #[test]
+    fn a_tokio_runtime_that_shuts_down_drops_no_half_of_a_device_under_the_claim_on_its_utun() {
+        let orders = [
+            (true, "utun-of-a-bridge-that-is-older-than-its-pump"),
+            (false, "utun-of-a-pump-that-is-older-than-its-bridge"),
+        ];
+        for (bridge_first, utun) in orders {
+            let seen = Seen::claim(utun);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let engine = FakeEngine::start().await;
+                let mut bridge = engine.bridge().await;
+                bridge.utun_name = utun.to_string();
+                let (give, given) = tokio::sync::oneshot::channel::<Runtime>();
+                let (holds, held) = tokio::sync::oneshot::channel();
+                let hold = async move {
+                    let _bridge = given.await;
+                    let _ = holds.send(());
+                    std::future::pending::<()>().await
+                };
+                let pump = if bridge_first {
+                    tokio::spawn(hold);
+                    tx_pump(seen.half(Ends::Never)).await
+                } else {
+                    let pump = tx_pump(seen.half(Ends::Never)).await;
+                    tokio::spawn(hold);
+                    pump
+                };
+                bridge.tasks = vec![pump];
+                assert!(give.send(bridge).is_ok());
+                held.await.unwrap();
+            });
+
+            drop(runtime);
+
+            assert_eq!(
+                seen.claimed_at_drop(),
+                [false],
+                "bridge_first={bridge_first}"
+            );
+        }
     }
 
     #[tokio::test]
