@@ -400,6 +400,7 @@ mod tests {
         let registry = Registry::new();
         registry.upsert(entry("web.demo.test", "10.0.0.8:3000", Mode::Http));
         registry.upsert(entry("db.demo.test", "10.0.0.9:5432", Mode::Tcp));
+        registry.upsert(entry("*.acme.test", "10.0.0.7:3000", Mode::Http));
         let tunnel = Ipv4Addr::new(192, 168, 99, 1);
         let host = DnsHandler::host_facing(registry.clone(), LoopbackAllocator::new());
         let containers = DnsHandler::container_facing(registry, tunnel);
@@ -427,6 +428,16 @@ mod tests {
             (&containers, "gone.demo.test", AAAA, Refused, vec![]),
             (&containers, "gone.demo.test", MX, Refused, vec![]),
             (&containers, "host.docker.internal", TypeA, Refused, vec![]),
+            (&containers, "api.acme.test", TypeA, NoError, vec![tunnel]),
+            (&containers, "api.acme.test", AAAA, NoError, vec![]),
+            (&containers, "v2.api.acme.test", TypeA, Refused, vec![]),
+            (
+                &host,
+                "api.acme.test",
+                TypeA,
+                NoError,
+                vec![Ipv4Addr::LOCALHOST],
+            ),
         ];
         for (listener, name, qtype, code, addresses) in table {
             assert_eq!(
@@ -436,5 +447,81 @@ mod tests {
                 listener.unheld
             );
         }
+    }
+
+    /// The response code that the listener on `server` sends for an A query
+    /// over UDP, or `None` when no response came.
+    async fn ask_over_udp(server: SocketAddr, name: &str) -> Option<ResponseCode> {
+        use hickory_proto::op::{Message, Query};
+
+        let mut query = Message::query();
+        query.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket
+            .send_to(&query.to_vec().unwrap(), server)
+            .await
+            .ok()?;
+        let mut response = [0; 512];
+        let received = socket.recv_from(&mut response);
+        let (length, _) = tokio::time::timeout(Duration::from_millis(200), received)
+            .await
+            .ok()?
+            .ok()?;
+        let response = Message::from_vec(&response[..length]).unwrap();
+        Some(response.metadata.response_code)
+    }
+
+    /// Starts a listener with `start` on a loopback port and asks it for
+    /// `name`. The port is one that the system just gave out and took back,
+    /// so another socket can get it first. The listener then ends at once,
+    /// and the next port is tried.
+    async fn answer_of_a_listener_started_with<F>(
+        start: impl Fn(SocketAddr) -> F,
+        name: &str,
+    ) -> ResponseCode
+    where
+        F: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        for _ in 0..10 {
+            let free = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = free.local_addr().unwrap();
+            drop(free);
+            let listener = tokio::spawn(start(addr));
+            for _ in 0..25 {
+                if listener.is_finished() {
+                    break;
+                }
+                if let Some(code) = ask_over_udp(addr, name).await {
+                    listener.abort();
+                    return code;
+                }
+            }
+            listener.abort();
+        }
+        panic!("no listener answered on ten loopback ports");
+    }
+
+    #[tokio::test]
+    async fn each_listener_is_started_with_its_own_answer_for_a_name_that_is_not_held() {
+        let registry = Registry::new();
+        registry.upsert(entry("web.demo.test", "10.0.0.8:3000", Mode::Http));
+        let tunnel = Ipv4Addr::new(192, 168, 99, 1);
+        let for_containers = |addr| run_for_containers(registry.clone(), addr, tunnel);
+        let for_the_host =
+            |addr: SocketAddr| run(registry.clone(), addr.port(), LoopbackAllocator::new());
+
+        // (the listener, name) → response code
+        assert_eq!(
+            answer_of_a_listener_started_with(for_containers, "gone.demo.test").await,
+            ResponseCode::Refused
+        );
+        assert_eq!(
+            answer_of_a_listener_started_with(for_containers, "web.demo.test").await,
+            ResponseCode::NoError
+        );
+        assert_eq!(
+            answer_of_a_listener_started_with(for_the_host, "gone.demo.test").await,
+            ResponseCode::NXDomain
+        );
     }
 }
