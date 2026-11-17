@@ -66,8 +66,9 @@ const ENABLE_ENV: &str = "PORTMAN_NETBRIDGE";
 
 /// How long the engine of a new session has to say whether it runs a
 /// bridge's setup container. bollard bounds only the wait for a response
-/// head, so a VM that froze with its socket open would hold the loop, and
-/// with it every control message, without this.
+/// head, so a VM that froze with its socket open would never end this
+/// check. The budget bounds this check alone. A later step that asks the
+/// same engine can still hold the loop, and with it every control message.
 const SETUP_CHECK_BUDGET: Duration = Duration::from_secs(3);
 
 const RETRY_BASE: Duration = Duration::from_secs(5);
@@ -201,7 +202,8 @@ enum Step {
     Sweep(Session, Leftovers),
 }
 
-/// `owed` is what the loop has yet to remove from the session's engine.
+/// `owed` is what a cleanup on this session is to remove. It is `None` once
+/// the session had its cleanup, also when that one left the network owed.
 fn plan(
     intent: &NetbridgeState,
     session: Option<Session>,
