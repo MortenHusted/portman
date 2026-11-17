@@ -70,13 +70,42 @@ impl DaemonSnapshot {
     }
 }
 
+impl DaemonSnapshot {
+    /// A bridge that is up beside a health that is not `healthy` can be a
+    /// health from before that bridge. A daemon up to 0.1.7 assesses on its
+    /// period only, and a later one needs the time of one assessment after
+    /// the bridge comes up.
+    fn health_can_be_behind_the_bridge(&self) -> bool {
+        self.bridge_phase == Some(BridgePhase::Up)
+            && self.bridge_assessment != Some(BridgeAssessment::Healthy)
+    }
+}
+
+/// How long doctor reads the status again while
+/// [`DaemonSnapshot::health_can_be_behind_the_bridge`]. One period brings an
+/// assessment from after the first read, and the margin is for the time
+/// that the assessment takes.
+const HEALTH_BOUND: Duration = BridgeAssessment::PERIOD.saturating_add(Duration::from_secs(1));
+const HEALTH_PAUSE: Duration = Duration::from_millis(100);
+
 /// The status that doctor gives its verdict on. `read` asks the daemon for
-/// its status, and gives `None` for a daemon that did not answer.
+/// its status, and gives `None` for a daemon that did not answer. Doctor
+/// reads again while the health can be behind the bridge, for at most
+/// [`HEALTH_BOUND`], and takes the last reading. So a bridge whose health
+/// stays as it is costs that wait, and doctor's verdict is not from before
+/// the bridge.
 pub(crate) async fn settled_daemon<F>(mut read: impl FnMut() -> F) -> DaemonSnapshot
 where
     F: Future<Output = Option<Response>>,
 {
-    DaemonSnapshot::from_status(read().await)
+    let first_read = tokio::time::Instant::now();
+    loop {
+        let daemon = DaemonSnapshot::from_status(read().await);
+        if !daemon.health_can_be_behind_the_bridge() || first_read.elapsed() >= HEALTH_BOUND {
+            return daemon;
+        }
+        tokio::time::sleep(HEALTH_PAUSE).await;
+    }
 }
 
 /// Why a `docker` CLI call gave no output to read.
