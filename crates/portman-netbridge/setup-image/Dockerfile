@@ -40,9 +40,22 @@
 # tells the daemon that the image has the mode, so that it never starts the
 # forwarder from an image without it.
 
-FROM alpine:3.21
+# Alpine 3.22 is the first release with dnsmasq 2.91. dnsmasq 2.90 does not
+# ask the next server when the first one refuses a query that carries EDNS
+# options, such as a DNS cookie. Such a query then got portman's REFUSED
+# for a name that portman does not hold, and not the VM resolver's answer.
+FROM alpine:3.22
 
 LABEL dev.portman.dns-forwarder="1"
+
+# Raise the revision with each change to this image that a user needs.
+# `portman doctor` names `portman bridge prepare` for an image with a lower
+# revision than its own, or with none, as portman 0.1.7 and older built it.
+# The revision is a label of its own: the daemon of 0.1.7 starts the
+# forwarder only for `dev.portman.dns-forwarder=1`, so a higher value there
+# would take the forwarder from a user who built this image and still runs
+# that daemon.
+LABEL dev.portman.setup-image-revision="2"
 
 RUN apk add --no-cache \
     wireguard-tools \

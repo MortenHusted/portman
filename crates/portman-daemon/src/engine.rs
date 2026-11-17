@@ -223,15 +223,15 @@ pub(crate) async fn run(
 }
 
 /// An engine that answered a connect attempt.
-struct Found {
-    docker: Docker,
-    socket: PathBuf,
+pub(crate) struct Found {
+    pub(crate) docker: Docker,
+    pub(crate) socket: PathBuf,
     version: Option<String>,
 }
 
 /// The first candidate that answers. When none does, the reason names the
 /// first socket that exists.
-async fn connect(
+pub(crate) async fn connect(
     sockets: &Sockets,
     open: &impl Fn(&Path) -> Option<Docker>,
 ) -> Result<Found, Absent> {

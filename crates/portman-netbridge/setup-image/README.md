@@ -74,7 +74,7 @@ docker run -d --name portman-netbridge-dns \
   portman-netbridge/setup:local \
   dns --keep-in-foreground --no-hosts \
   --listen-address=192.168.99.129 --bind-interfaces --strict-order \
-  --no-negcache --log-facility=- \
+  --cache-size=0 --log-facility=- \
   --server=/test/192.168.99.1 --server=/test/@vm-resolver@ \
   --server=/host.docker.internal/#
 ```
@@ -88,8 +88,29 @@ The daemon starts this container. The command above shows what it runs.
   network that file is the VM's own.
 - The entrypoint exits with status 2 and a message when `/etc/resolv.conf`
   names no nameserver or when no argument follows `dns`.
+- `--strict-order` makes dnsmasq ask the servers of a managed TLD in the
+  order given, portman first. It has a cost for every other name
+  ([issue 50](https://github.com/MortenHusted/portman/issues/50)). In strict
+  order dnsmasq 2.91 tries the next server after a `SERVFAIL` or a
+  `REFUSED`, and for a name outside the managed TLDs the VM's resolver is
+  the last server. dnsmasq then sends the client no reply over UDP, and the
+  client waits for its own timeout. dnsmasq 2.90 does the same for a query
+  without an EDNS option. Over TCP the error comes through.
+- `--cache-size=0` makes dnsmasq keep no answer. A name that portman
+  registers then resolves to portman's address at the next lookup, also
+  when the VM's resolver answered or denied that name before.
+- The image needs dnsmasq 2.91 or later, which Alpine 3.22 is the first
+  release to ship. dnsmasq 2.90 passes a refused query on to the VM's
+  resolver only when the query carries no EDNS option. A query with a DNS
+  cookie, as `dig` sends it, then got `REFUSED` for a name under a managed
+  TLD that portman does not hold.
 - The image label `dev.portman.dns-forwarder=1` marks an image that has this
   mode. The daemon starts the forwarder only from an image with the label.
+- The image label `dev.portman.setup-image-revision` carries a number that
+  goes up with each change to the image that a user needs. `portman doctor`
+  reports an image with a lower number than its own, or with no such label,
+  as older than this portman and names `portman bridge prepare`. The daemon
+  does not read the label, and keeps using an older image.
 
 ## Why `--network host`?
 

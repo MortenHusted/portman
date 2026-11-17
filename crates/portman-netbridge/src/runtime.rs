@@ -1065,9 +1065,10 @@ fn docker_removal_already_underway(err: &DockerError) -> bool {
 /// strict order it asks portman first and the VM's resolver second for a
 /// name under a managed TLD, so a name that portman refuses still resolves.
 /// Every other name goes to the resolvers in the VM's `/etc/resolv.conf`,
-/// which dnsmasq reads itself. It keeps no negative answer: portman can
-/// register a moment later the name that the VM's resolver just denied, and
-/// a cached denial would hide it for as long as that resolver's SOA says.
+/// which dnsmasq reads itself. It keeps no answer: portman can register a
+/// moment later the name that the VM's resolver just answered or denied,
+/// and a cached answer would hide the registration for as long as that
+/// resolver's TTL says.
 /// It logs to stderr, where `docker logs` finds what it wrote.
 pub fn dns_forwarder_args(managed_tlds: &BTreeSet<String>) -> Vec<String> {
     let mut args = vec![
@@ -1077,7 +1078,7 @@ pub fn dns_forwarder_args(managed_tlds: &BTreeSet<String>) -> Vec<String> {
         format!("--listen-address={DOCKER_BRIDGE_GATEWAY}"),
         "--bind-interfaces".to_string(),
         "--strict-order".to_string(),
-        "--no-negcache".to_string(),
+        "--cache-size=0".to_string(),
         "--log-facility=-".to_string(),
     ];
     let forwarded = managed_tlds
@@ -1294,8 +1295,8 @@ pub enum Leftovers {
     /// Also the DNS forwarder, which listens on the network's gateway
     /// address and goes before the network does. The engine removes a
     /// network that a stopped container refers to, and that container then
-    /// fails to start. Only a user's request to turn the bridge off calls
-    /// for this.
+    /// fails to start. Only a user's request calls for this: to turn the
+    /// bridge off, or to uninstall portman.
     SetupContainerAndNetwork,
 }
 
@@ -2299,7 +2300,7 @@ destination: 172.18.0.0
         "--listen-address=192.168.99.129",
         "--bind-interfaces",
         "--strict-order",
-        "--no-negcache",
+        "--cache-size=0",
         "--log-facility=-",
     ];
     const TO_THE_VM: &str = "--server=/host.docker.internal/#";
@@ -2846,6 +2847,44 @@ destination: 172.18.0.0
             assert_eq!(ensured.ok(), want, "{forwarder}");
             assert_eq!(engine.asked_for(), requests, "{forwarder}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_forwarder_from_0_1_7_is_replaced_by_one_that_keeps_no_answer() {
+        let from_0_1_7 = [
+            "dns",
+            "--keep-in-foreground",
+            "--no-hosts",
+            "--listen-address=192.168.99.129",
+            "--bind-interfaces",
+            "--strict-order",
+            "--no-negcache",
+            "--log-facility=-",
+            "--server=/test/192.168.99.1",
+            "--server=/test/@vm-resolver@",
+            "--server=/host.docker.internal/#",
+        ]
+        .map(String::from);
+        let engine = FakeEngine::start().await;
+        engine.hold(FORWARDER_INSPECT, &held_forwarder(&from_0_1_7, RUNNING));
+
+        let ensured = engine
+            .bridge()
+            .await
+            .ensure_dns_forwarder(&tlds(&["test"]))
+            .await;
+
+        assert_eq!(ensured.unwrap(), DnsForwarder::Started);
+        assert_eq!(
+            engine.asked_for(),
+            [
+                "DELETE /containers/dddd2222",
+                "POST /containers/create",
+                "POST /containers/portman-netbridge-dns/start",
+            ]
+        );
+        let created = &engine.requests()[1].1;
+        assert!(created.contains(r#""--cache-size=0""#), "{created}");
     }
 
     #[tokio::test]
@@ -3619,6 +3658,23 @@ destination: 172.18.0.0
         let label = format!("LABEL {DNS_IMAGE_LABEL}=\"{DNS_IMAGE_LABEL_VALUE}\"");
 
         assert!(dockerfile.lines().any(|line| line == label), "{label}");
+    }
+
+    #[test]
+    fn the_setup_image_ships_a_dnsmasq_that_falls_through_for_a_query_with_edns_options() {
+        let dockerfile = include_str!("../setup-image/Dockerfile");
+        let base = dockerfile
+            .lines()
+            .find_map(|line| line.strip_prefix("FROM alpine:"))
+            .expect("the setup image is built on alpine");
+        let mut numbers = base.split('.').map(|number| number.parse::<u32>().unwrap());
+        let release = (numbers.next().unwrap(), numbers.next().unwrap());
+
+        assert!(
+            release >= (3, 22),
+            "alpine {base} ships dnsmasq 2.90 or older, which answers REFUSED to a query \
+             with EDNS options and does not ask the VM's resolver"
+        );
     }
 
     #[test]

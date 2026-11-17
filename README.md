@@ -77,7 +77,7 @@ portman tld add test
 portman dashboard        # opens http://portman.localhost
 ```
 
-`portman uninstall` removes the launchd service and binaries. portman's data dir (`~/Library/Application Support/portman`) holds `static.json`, `tls.json`, `certs/`, and, for the service runner, `services.json` (definitions + desired state), `logs.db` (captured service output), and `credentials.json` (secrets-provider machine credentials, 0600). Delete it yourself if you want a clean slate.
+`portman uninstall` removes the launchd service and binaries, and what the bridge left in Docker. portman's data dir (`~/Library/Application Support/portman`) holds `static.json`, `tls.json`, `certs/`, and, for the service runner, `services.json` (definitions + desired state), `logs.db` (captured service output), and `credentials.json` (secrets-provider machine credentials, 0600). Delete it yourself if you want a clean slate.
 
 ### Linux (experimental)
 
@@ -403,7 +403,11 @@ services:
 
 With `docker run`, pass `--dns 192.168.99.129`.
 
-The forwarder sends only names under your managed TLDs to portman. Every other name goes to the resolver that the VM already uses, so the other lookups of the container keep their answers. A name under a managed TLD that portman does not hold also goes on to the VM's resolver, and `host.docker.internal` never goes to portman. portman changes nothing in `/etc/resolver` or in the Mac's own name resolution for this.
+The forwarder sends only names under your managed TLDs to portman. Every other name goes to the resolver that the VM already uses, and the container gets that resolver's answer, with the two differences that the next paragraph names. A name under a managed TLD that portman does not hold also goes on to the VM's resolver, and `host.docker.internal` never goes to portman. A lookup over TCP is the exception. The forwarder then asks portman only, and a name under a managed TLD that portman does not hold gets `REFUSED`. A resolver turns to TCP when the answer does not fit in a UDP packet, so this affects a name with a large record set under a managed TLD that is a real domain. portman changes nothing in `/etc/resolver` or in the Mac's own name resolution for this.
+
+An answer does not come through when the VM's resolver fails a lookup with `SERVFAIL` or `REFUSED` ([issue 50](https://github.com/MortenHusted/portman/issues/50)). The forwarder then sends the container no answer over UDP, and the lookup ends in the client's own timeout. A client that returns such an error at once notices the wait. Measured on colima with Docker Engine 29, `getent` in a Debian container returns at once without the forwarder. Through the forwarder it returns after 8 s on a compose network, where Docker's own resolver sits between the container and the forwarder. It returns after 10 s with `docker run --dns 192.168.99.129` on the default bridge network, where the forwarder is the container's resolver itself. `dig` gives up after 15 s. A client that waits out a failed lookup by itself notices nothing. `getent` in an Alpine container takes 5 s either way. A lookup that the VM's resolver answers, with an address or with `NXDOMAIN`, is not affected, and over TCP the error comes through. The second difference is a flag. The forwarder does not pass on the `ad` flag that a validating resolver sets on a DNSSEC answer. The records of that answer are the same.
+
+The forwarder keeps no answer, as Docker's own resolver keeps none. A hostname that you register resolves to portman at the next lookup, whatever the VM's resolver answered for that name before.
 
 HTTP routes need no extra network. Their names resolve to portman's proxy at `192.168.99.1`, which a container on a compose network reaches without joining another network.
 
@@ -423,7 +427,7 @@ networks:
 
 Joining the `portman` network does not make a TCP route to any other target reachable. For a TCP service on the host, keep using `host.docker.internal:<port>`.
 
-`portman tld add` and `portman tld remove` make portman replace the forwarder with one for the new set of TLDs. Lookups through the forwarder fail for the moment that this takes.
+`portman tld add` and `portman tld remove` make portman replace the forwarder with one for the new set of TLDs. Lookups through the forwarder fail for the moment that this takes. An upgrade from portman 0.1.7 replaces the forwarder once in the same way, when the bridge next comes up.
 
 ### When portman is down
 
@@ -439,13 +443,19 @@ The forwarder keeps running when the daemon stops or the bridge is down. Its res
 
 When Docker is not running at the time of the disable, portman removes the forwarder and the network once Docker runs again. A daemon restart in between ends that. `docker rm -f portman-netbridge-dns` then removes the forwarder, and `docker network rm portman` the network.
 
-`portman uninstall` stops the daemon and leaves the forwarder running. To remove the forwarder too, run `portman bridge disable` before you uninstall, or run `docker rm -f portman-netbridge-dns` afterwards.
+`portman uninstall` stops the daemon and then removes what `portman bridge disable` removes: the forwarder, the bridge's setup container, and the `portman` network unless a running container is attached to it. It removes only what carries portman's labels, and it does not change whether the bridge is on for the next install. As after a disable, a container that still has `192.168.99.129` as its only resolver then resolves no name, until portman is installed again. The uninstall completes also when it cannot remove them. It gives Docker 35 s for the removal. In three cases the uninstall prints the commands that remove the forwarder and the network, `docker rm -f portman-netbridge-dns` and `docker network rm portman`. Docker gives no answer in that time. Another process holds the bridge's UDP port, or Docker refuses a removal. Or Docker is not running and the bridge is enabled. When Docker is not running and the bridge is not enabled, it prints nothing about the forwarder.
+
+The two `docker` commands go by name. portman itself removes a forwarder or a network only when it carries portman's labels and no other process holds the bridge's UDP port. The commands check neither. Do not run them while another portman daemon runs a bridge on the same engine, because they would remove that bridge's forwarder and network.
 
 ### Check the forwarder
 
 `portman doctor` prints one `dns forwarder` line. For a forwarder that runs while the bridge is up, it starts a short-lived container that looks one registered hostname up through `192.168.99.129`, and prints the answer. It looks no name up when every registered hostname is a wildcard or is under `.localhost`.
 
-The forwarder needs a setup image that has `dnsmasq`. An install from before this feature has an older image. The bridge then works as before, and `portman doctor` reports the forwarder as unavailable. Run `portman bridge prepare` to build the current image. A bridge that is up gets the forwarder within a minute.
+The forwarder needs a setup image that has `dnsmasq`. An install from before this feature has an image without it. The bridge then works as before, and `portman doctor` reports the forwarder as unavailable. Run `portman bridge prepare` to build the current image. A bridge that is up then gets the forwarder within a minute.
+
+The image that portman 0.1.7 built has `dnsmasq` 2.90. Through it, a query that carries a DNS cookie, as `dig` sends it, gets `REFUSED` for a name under a managed TLD that portman does not hold. `portman doctor` reports such an image as `setup image: older than this portman`. `portman install` builds the current image and restarts the daemon, and the daemon replaces the forwarder when the bridge comes up. `portman bridge prepare` builds the current image too, and leaves a forwarder that runs from the older image in place. The daemon replaces that forwarder at the next bridge start, or at the next `portman tld add` or `portman tld remove`.
+
+`portman doctor` and `portman bridge prepare` use the engine that the `docker` command talks to. When the daemon is connected to another engine, `portman status` prints that engine's socket path on its `docker` line. Run `portman bridge prepare` again with `DOCKER_HOST` set to `unix://` and that path.
 
 ## Status
 

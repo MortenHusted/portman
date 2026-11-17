@@ -26,6 +26,11 @@ mod upstream;
 mod watch;
 
 #[cfg(target_os = "macos")]
+mod bridge_leftovers;
+#[cfg(target_os = "macos")]
+pub use bridge_leftovers::{manual_removal_commands, remove_bridge_leftovers, BridgeLeftovers};
+
+#[cfg(target_os = "macos")]
 mod bridge_health;
 #[cfg(not(target_os = "macos"))]
 #[path = "bridge_health_stub.rs"]
