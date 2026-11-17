@@ -218,7 +218,8 @@ pub enum BridgeCleanup {
 
 impl BridgeCleanup {
     /// The words that `portman bridge disable` and the TUI put after
-    /// "netbridge disabled".
+    /// "netbridge disabled", and that `portman status` and `portman bridge
+    /// status` print on their cleanup line.
     pub fn disable_words(self) -> String {
         let leftovers = "the dns forwarder and the `portman` network";
         let again =

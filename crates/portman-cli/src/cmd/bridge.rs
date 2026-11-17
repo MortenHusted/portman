@@ -4,7 +4,7 @@ use crate::client::{bridge_status, wait_for_bridge_mode, wait_for_bridge_state, 
 use crate::cmd::run_setup_image_build;
 use crate::doctor;
 use anyhow::{bail, Result};
-use portman_protocol::{BridgeAssessment, BridgePhase, DockerStatus, NetbridgeMode};
+use portman_protocol::{BridgeAssessment, BridgeCleanup, BridgePhase, DockerStatus, NetbridgeMode};
 
 use crate::client::request;
 use portman_protocol::{Request, Response};
@@ -16,6 +16,7 @@ pub(crate) async fn cmd_bridge_status() -> Result<()> {
             bridge_enabled,
             bridge_phase,
             bridge_retry_in_secs,
+            bridge_cleanup,
             bridge_mode,
             docker,
             ..
@@ -25,6 +26,7 @@ pub(crate) async fn cmd_bridge_status() -> Result<()> {
                 bridge_assessment,
                 bridge_phase.or_from_enabled(bridge_enabled),
                 bridge_retry_in_secs,
+                bridge_cleanup,
                 bridge_mode,
                 docker.as_ref(),
                 &routes,
@@ -39,11 +41,13 @@ pub(crate) async fn cmd_bridge_status() -> Result<()> {
 }
 
 /// What `portman bridge status` prints. `routes` is what the `docker` CLI
-/// found. A daemon that reports no engine state gets no `docker` line.
+/// found. A daemon that reports no engine state gets no `docker` line, and
+/// only a cleanup that something holds up gets a `cleanup` line.
 fn bridge_status_lines(
     assessment: BridgeAssessment,
     phase: BridgePhase,
     retry_in_secs: Option<u64>,
+    cleanup: Option<BridgeCleanup>,
     mode: NetbridgeMode,
     docker: Option<&DockerStatus>,
     routes: &doctor::DockerRouteStatus,
@@ -51,8 +55,9 @@ fn bridge_status_lines(
     let mut lines = vec![
         format!("bridge:    {assessment}"),
         format!("netbridge: {}", phase.status_words(retry_in_secs)),
-        format!("mode:      {}", NetbridgeMode::display_word(mode)),
     ];
+    lines.extend(cleanup.map(|held| format!("cleanup:   {}", held.disable_words())));
+    lines.push(format!("mode:      {}", NetbridgeMode::display_word(mode)));
     lines.extend(docker.map(|docker| format!("docker:    {}", docker.summary())));
     lines.extend(doctor::docker_cli_note(
         docker,
@@ -213,6 +218,7 @@ mod tests {
             BridgeAssessment::Offline,
             phase,
             None,
+            None,
             NetbridgeMode::OptIn,
             docker,
             routes,
@@ -252,6 +258,7 @@ mod tests {
             BridgeAssessment::Offline,
             BridgePhase::Starting,
             Some(12),
+            None,
             NetbridgeMode::OptIn,
             None,
             &DockerRouteStatus::NoLabelledContainers,
@@ -260,6 +267,30 @@ mod tests {
         assert_eq!(
             waits[1],
             "netbridge: starting, the last start failed, tries again in 12s"
+        );
+    }
+
+    #[test]
+    fn bridge_status_says_what_holds_up_the_cleanup_of_a_disable_after_the_bridge_line() {
+        let held = bridge_status_lines(
+            BridgeAssessment::Offline,
+            BridgePhase::Disabled,
+            None,
+            Some(BridgeCleanup::NoAnswer { within_secs: 20 }),
+            NetbridgeMode::OptIn,
+            None,
+            &DockerRouteStatus::NoLabelledContainers,
+        );
+
+        assert_eq!(
+            held[1..4],
+            [
+                "netbridge: disabled",
+                "cleanup:   portman could not remove the dns forwarder and the `portman` \
+                 network: the container engine gave no answer within 20 s. It tries again \
+                 when it next connects to Docker, or at the next `portman bridge disable`",
+                "mode:      opt-in",
+            ]
         );
     }
 

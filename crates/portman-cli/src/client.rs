@@ -125,6 +125,10 @@ impl Settled {
         match self {
             Settled::Reached => done.to_string(),
             Settled::WaitsForDocker => format!("{done}; the bridge starts when Docker connects"),
+            Settled::LeftoversStay(BridgeCleanup::Pending) => format!(
+                "{done}; {}. `portman bridge status` prints a `cleanup` line for as long as something holds it up",
+                BridgeCleanup::Pending.disable_words()
+            ),
             Settled::LeftoversStay(held) => format!("{done}; {}", held.disable_words()),
         }
     }
@@ -763,7 +767,8 @@ mod tests {
         assert_eq!(
             settled.line("netbridge disabled"),
             "netbridge disabled; portman has not removed the dns forwarder and the `portman` \
-             network yet: the removal still runs"
+             network yet: the removal still runs. `portman bridge status` prints a `cleanup` line for as \
+             long as something holds it up"
         );
     }
 

@@ -72,6 +72,9 @@ pub(crate) async fn cmd_status(repo: bool) -> Result<()> {
                         _bridge_retry_in_secs
                     )
                 );
+                if let Some(line) = bridge_cleanup_line(_bridge_cleanup) {
+                    println!("{line}");
+                }
                 println!(
                     "netbridge mode:  {}",
                     portman_protocol::NetbridgeMode::display_word(_bridge_mode)
@@ -104,6 +107,13 @@ fn docker_line(docker: Option<&portman_protocol::DockerStatus>) -> Option<String
 #[cfg(any(target_os = "macos", test))]
 fn netbridge_line(phase: portman_protocol::BridgePhase, retry_in_secs: Option<u64>) -> String {
     format!("netbridge:       {}", phase.status_words(retry_in_secs))
+}
+
+/// The `bridge cleanup` line of `portman status`. Status prints it only
+/// while something holds up the cleanup that a disable asked for.
+#[cfg(any(target_os = "macos", test))]
+fn bridge_cleanup_line(cleanup: Option<portman_protocol::BridgeCleanup>) -> Option<String> {
+    cleanup.map(|held| format!("bridge cleanup:  {}", held.disable_words()))
 }
 
 /// Load and validate this repo's service config (walking up from the cwd).
@@ -1401,6 +1411,27 @@ mod tests {
         assert_eq!(
             InterruptedServices(Vec::new()).start_lines(),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn status_says_what_holds_up_the_cleanup_of_a_disable_only_while_something_does() {
+        let line = |json: &str| match serde_json::from_str(json).unwrap() {
+            Response::Status { bridge_cleanup, .. } => bridge_cleanup_line(bridge_cleanup),
+            other => panic!("expected status response, got {other:?}"),
+        };
+
+        assert_eq!(line(r#"{"kind":"status","bridge_phase":"disabled"}"#), None);
+        assert_eq!(
+            line(
+                r#"{"kind":"status","bridge_phase":"disabled","bridge_cleanup":{"state":"port_taken"}}"#
+            )
+            .as_deref(),
+            Some(
+                "bridge cleanup:  portman has not removed the dns forwarder and the `portman` \
+                 network: another program holds the UDP port of the bridge and can run a \
+                 bridge on them. It does not try again until the next `portman bridge disable`"
+            )
         );
     }
 
