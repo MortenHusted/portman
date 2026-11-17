@@ -75,10 +75,12 @@ presence/service status, labelled Docker networks, route interfaces for their
 subnets, and explicit commands for stopping the legacy bridge. Its verdict on
 the routes is the bridge health that the daemon reports, so `replacement:
 ready` needs `bridge: healthy`. The daemon assesses the health every 5 s and
-each time the bridge changes phase. For a bridge that is up with a health
-other than `healthy`, doctor reads the status again for up to 6 s and gives the
-verdict of the last reading, so that a run right after `portman bridge enable`
-or a mode change does not report a health from before the bridge. The
+each time the bridge changes phase. For a bridge that is up in `docker` mode
+with a health other than `healthy`, doctor reads the status again for up to
+6 s and gives the verdict of the last reading, so that a run right after
+`portman bridge enable` or a mode change does not give a verdict from before
+the bridge. In `opt-in` and `all` mode doctor reads the status once. Against a
+daemon up to 0.1.7, its `bridge:` word can then be up to 5 s old. The
 labelled-network lines show what the `docker` CLI and the routing table say.
 It does not stop
 or uninstall any legacy service. On macOS it also reports the DNS forwarder. For a

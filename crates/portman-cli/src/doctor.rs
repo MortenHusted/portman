@@ -70,9 +70,14 @@ impl DaemonSnapshot {
     }
 
     /// A daemon up to 0.1.7 assesses on its period only, and a later one
-    /// needs the time of one assessment after the bridge comes up.
-    fn health_can_be_behind_the_bridge(&self) -> bool {
+    /// needs the time of one assessment after the bridge comes up. The
+    /// health decides the verdict only for a bridge that is up in `docker`
+    /// mode. In `opt-in` mode a labelled container on a compose network
+    /// keeps the health at `routes_missing`, and a wait there took 6.2 s on
+    /// each run and changed no verdict.
+    fn verdict_can_be_from_before_the_bridge(&self) -> bool {
         self.bridge_phase == Some(BridgePhase::Up)
+            && self.bridge_mode == Some(NetbridgeMode::Docker)
             && self.bridge_assessment != Some(BridgeAssessment::Healthy)
     }
 }
@@ -90,7 +95,7 @@ where
     let first_read = tokio::time::Instant::now();
     loop {
         let daemon = DaemonSnapshot::from_status(read().await);
-        if !daemon.health_can_be_behind_the_bridge() || first_read.elapsed() >= HEALTH_BOUND {
+        if !daemon.verdict_can_be_from_before_the_bridge() || first_read.elapsed() >= HEALTH_BOUND {
             return daemon;
         }
         tokio::time::sleep(HEALTH_PAUSE).await;
@@ -729,13 +734,13 @@ pub(crate) fn render_report(report: &DoctorReport) -> String {
 fn bridge_guidance(daemon: &DaemonSnapshot) -> &'static [&'static str] {
     match (daemon.bridge_phase, daemon.bridge_mode) {
         (Some(BridgePhase::Up), Some(NetbridgeMode::Docker)) => {
-            health_guidance(daemon.bridge_assessment.unwrap_or_default())
+            up_in_docker_mode_guidance(daemon.bridge_assessment.unwrap_or_default())
         }
         (phase, _) => phase_guidance(phase),
     }
 }
 
-fn health_guidance(health: BridgeAssessment) -> &'static [&'static str] {
+fn up_in_docker_mode_guidance(health: BridgeAssessment) -> &'static [&'static str] {
     const LOOK_AT: &str =
         "`portman bridge status` names each labelled network and the interface of its route";
     match health {
