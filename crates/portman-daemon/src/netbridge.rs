@@ -2484,7 +2484,7 @@ mod tests {
         }
 
         /// Takes the lines since the last call and returns the warnings.
-        fn warnings(&self) -> Vec<String> {
+        fn take_warnings(&self) -> Vec<String> {
             let mut lines = self.lines();
             lines.retain(|line| line.contains("WARN"));
             lines
@@ -2661,7 +2661,7 @@ mod tests {
 
             assert_eq!(cleanup, Cleanup::Owed, "{frozen_at}");
             assert_eq!(asked.elapsed(), ENGINE_STEP_BUDGET, "{frozen_at}");
-            let warnings = logged.warnings();
+            let warnings = logged.take_warnings();
             assert_eq!(warnings.len(), 1, "{frozen_at} {warnings:?}");
             let no_answer = says_no_answer_within(ENGINE_STEP_BUDGET);
             assert!(warnings[0].contains(&no_answer), "{}", warnings[0]);
@@ -2683,7 +2683,7 @@ mod tests {
 
         assert!(started.is_none(), "a bridge started on a frozen engine");
         assert_eq!(asked.elapsed(), ENGINE_START_BUDGET);
-        let warnings = logged.warnings();
+        let warnings = logged.take_warnings();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         let cause = format!("err={}", says_no_answer_within(ENGINE_START_BUDGET));
         assert!(warnings[0].contains(&cause), "{}", warnings[0]);
@@ -2707,7 +2707,7 @@ mod tests {
             started.is_none(),
             "a bridge started with no key from the VM"
         );
-        let warnings = logged.warnings();
+        let warnings = logged.take_warnings();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         let cause = "err=netbridge setup container did not report VM_PUBKEY";
         assert!(warnings[0].contains(cause), "{}", warnings[0]);
