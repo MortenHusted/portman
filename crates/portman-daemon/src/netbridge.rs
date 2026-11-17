@@ -42,8 +42,9 @@
 //!     the bridge ensure it once, and again when the managed TLD set
 //!     changes. An ensure that does not put the forwarder in place leaves
 //!     the bridge up and is repeated a minute later. The forwarder outlives
-//!     the bridge and the daemon. It is removed only where the docker
-//!     network is, on the user's `Disable`.
+//!     the bridge and the daemon. Only the user's `Disable` removes it,
+//!     before the docker network. It goes also when the engine then keeps
+//!     a network that is in use.
 //!   - [`publish`] tells the rest of the daemon what the bridge is doing:
 //!     the [`phase`], the mode, and the interface index of the utun.
 
