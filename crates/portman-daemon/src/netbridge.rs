@@ -181,9 +181,6 @@ pub(crate) struct Handle {
 }
 
 impl Handle {
-    /// The seconds until the retry of a failed start, rounded up, so never
-    /// 0. `None` when no start waits for one, and from the instant the
-    /// retry is due, which is before the loop has taken the time back.
     pub(crate) fn retry_in_secs(&self) -> Option<u64> {
         let at = (*self.retry_at.read().expect("retry lock poisoned"))?;
         let left = at.saturating_duration_since(Instant::now());

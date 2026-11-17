@@ -338,9 +338,7 @@ impl Runtime {
     fn abort_tasks(&self) {
         // The kernel recycles utun names. Keep claiming this one after the
         // device is gone and route repair would treat a *recycled* utun —
-        // somebody else's VPN — as ours to repoint. The claim goes before
-        // the tasks that hold the device, so that a route command that
-        // fails because the interface is gone finds the claim gone too.
+        // somebody else's VPN — as ours to repoint.
         forget_own_utun(&self.utun_name);
         for t in &self.tasks {
             t.abort();
@@ -598,9 +596,7 @@ fn spawn_route_reconciler(docker: Docker, mode: NetbridgeMode, iface: String) ->
 
 /// One pass of the route reconciler. It runs on a blocking thread, and the
 /// abort of the reconciler task does not end it. A bridge lets go of its
-/// utun before the interface goes, and the routes go with the interface. So
-/// a command that fails or is refused for a utun that the bridge let go of
-/// is no failure, and the pass ends there.
+/// utun before the interface goes, and the routes go with the interface.
 fn reconcile_routes(route: &RunRoute, cmds: &[RouteCommand]) {
     for cmd in cmds {
         let Err(err) = ensure_route_command(route, cmd) else {
@@ -1642,13 +1638,8 @@ fn classify_existing_route(cidr: &str, existing_iface: &str, wanted_iface: &str)
     }
 }
 
-/// Runs `route` while the bridge holds `iface`, and refuses once the bridge
-/// let go of it. `route` takes an interface by its name, and the kernel
-/// gives the name of a utun that is gone to the next one, which can belong
-/// to a VPN. The claim is held for the whole command, so
-/// [`forget_own_utun`] waits for a command in flight. A bridge lets go
-/// before it closes the device, so no command names a utun that its bridge
-/// has closed.
+/// `route` takes an interface by its name, and the kernel gives the name of
+/// a utun that is gone to the next one, which can belong to a VPN.
 fn route_while_own(
     route: &RunRoute,
     iface: &str,
@@ -1713,9 +1704,6 @@ fn ensure_route_command(route: &RunRoute, cmd: &RouteCommand) -> Result<()> {
     }
 }
 
-/// Runs the `route` program with these arguments. Each `route` command of a
-/// bridge goes through one, so that a test can put its own in the place of
-/// [`sbin_route`].
 type RunRoute<'a> = dyn Fn(&[&str]) -> std::io::Result<std::process::Output> + 'a;
 
 fn sbin_route(args: &[&str]) -> std::io::Result<std::process::Output> {
@@ -2771,8 +2759,6 @@ destination: 172.18.0.0
         assert_eq!(engine.asked_for(), [] as [&str; 0]);
     }
 
-    /// Stands in for the utun device, which the pump tasks hold and close
-    /// when they end. It keeps whether the bridge claimed the utun then.
     struct Device {
         utun: &'static str,
         claimed_at_close: Shared<Option<bool>>,
@@ -2855,8 +2841,6 @@ destination: 172.18.0.0
         }
     }
 
-    /// What a `route` program gives back that ends with `code` and has
-    /// said `stderr`.
     fn route_ended(code: i32, stderr: &str) -> std::io::Result<std::process::Output> {
         use std::os::unix::process::ExitStatusExt;
 
@@ -2867,7 +2851,6 @@ destination: 172.18.0.0
         })
     }
 
-    /// As `route` ends for an interface that does not exist.
     fn no_such_interface(_: &[&str]) -> std::io::Result<std::process::Output> {
         route_ended(1, "route: bad address: utun-of-no-bridge")
     }
