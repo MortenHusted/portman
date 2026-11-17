@@ -335,12 +335,13 @@ mod tests {
     }
 
     #[test]
-    fn a_labelled_container_counts_through_portman_when_it_is_on_it_and_through_each_of_its_networks_otherwise(
+    fn a_labelled_container_counts_through_portman_when_the_registry_routes_it_there_and_through_each_of_its_networks_otherwise(
     ) {
         let web = Some("web.demo.test");
         let compose = ("demo_default", "172.18.0.2");
         let backend = ("acme_backend", "172.19.0.2");
         let portman = ("portman", "192.168.99.130");
+        let portman_without_ipv4 = ("portman", "");
         let names = |names: &[&str]| -> BTreeSet<String> {
             names.iter().map(|name| name.to_string()).collect()
         };
@@ -351,6 +352,10 @@ mod tests {
             (
                 vec![container(web, &[compose, portman])],
                 names(&["portman"]),
+            ),
+            (
+                vec![container(web, &[compose, portman_without_ipv4])],
+                names(&["demo_default", "portman"]),
             ),
             (
                 vec![container(web, &[backend, compose])],
@@ -372,23 +377,27 @@ mod tests {
     }
 
     #[test]
-    fn the_health_network_of_a_container_on_portman_holds_the_address_the_registry_routes_to() {
-        let both = container(
-            Some("web.demo.test"),
-            &[
-                ("demo_default", "172.18.0.2"),
-                ("portman", "192.168.99.130"),
-            ],
-        );
+    fn health_counts_a_container_through_portman_alone_only_when_the_registry_routes_it_there() {
+        let on_portman: std::net::Ipv4Addr = [192, 168, 99, 130].into();
+        let portman_alone = BTreeSet::from(["portman".to_string()]);
+        let mut routed_through_portman = 0;
+        for portman_address in ["192.168.99.130", "", "invalid IP", "fd00:99::2"] {
+            let both = container(
+                Some("web.demo.test"),
+                &[("demo_default", "172.18.0.2"), ("portman", portman_address)],
+            );
 
-        let routed_to = crate::discovery::observe(both.clone())
-            .and_then(|container| crate::discovery::pick_address(&container.addresses));
+            let routed_to = crate::discovery::observe(both.clone())
+                .and_then(|container| crate::discovery::pick_address(&container.addresses));
 
-        assert_eq!(routed_to, Some([192, 168, 99, 130].into()));
-        assert_eq!(
-            networks_in_use(&[both]),
-            BTreeSet::from(["portman".to_string()])
-        );
+            assert_eq!(
+                networks_in_use(&[both]) == portman_alone,
+                routed_to == Some(on_portman),
+                "portman address {portman_address:?}, registry routes to {routed_to:?}"
+            );
+            routed_through_portman += usize::from(routed_to == Some(on_portman));
+        }
+        assert_eq!(routed_through_portman, 1);
     }
 
     #[test]
