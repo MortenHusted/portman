@@ -346,7 +346,7 @@ impl Attempts {
                 self.failures += 1;
                 let retry_after = backoff(self.failures);
                 warn!(
-                    %err,
+                    err = %format_args!("{err:#}"),
                     attempt = self.failures,
                     retry_in_secs = retry_after.as_secs(),
                     "netbridge start failed"
