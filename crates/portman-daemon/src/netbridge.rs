@@ -1491,7 +1491,8 @@ mod tests {
         forwards: mpsc::UnboundedReceiver<Forwarding>,
         ensure: Arc<Mutex<Ensure>>,
         known_tlds: KnownTlds,
-        _dir: TempDir,
+        daemon: tokio::task::JoinHandle<Result<()>>,
+        dir: TempDir,
     }
 
     const LONGEST_WAIT: Duration = Duration::from_secs(3600);
@@ -1517,7 +1518,37 @@ mod tests {
         }
 
         fn spawn(session: Option<Session>, engine_starts_bridges: bool, forced_on: bool) -> Self {
+            Self::boot(
+                tempdir().unwrap(),
+                session,
+                engine_starts_bridges,
+                forced_on,
+            )
+        }
+
+        /// A daemon that boots on the `netbridge.json` that `saved` holds,
+        /// with an engine in its first session that fails every start.
+        fn boot_on(saved: Option<&str>) -> Self {
             let dir = tempdir().unwrap();
+            if let Some(saved) = saved {
+                std::fs::write(dir.path().join("netbridge.json"), saved).unwrap();
+            }
+            Self::boot(dir, S1, false, false)
+        }
+
+        /// Ends this daemon and boots another on what it saved.
+        async fn restart(self, session: Option<Session>) -> Self {
+            self.daemon.abort();
+            let _ = self.daemon.await;
+            Self::boot(self.dir, session, false, false)
+        }
+
+        fn boot(
+            dir: TempDir,
+            session: Option<Session>,
+            engine_starts_bridges: bool,
+            forced_on: bool,
+        ) -> Self {
             let (sessions, session_seen) = watch::channel(session);
             let bridges_held = Arc::new(AtomicUsize::new(0));
             let state_path = dir.path().join("netbridge.json");
@@ -1556,7 +1587,7 @@ mod tests {
                     cleanups_end: cleanups_end.clone(),
                 }),
             };
-            tokio::spawn(converge(
+            let daemon = tokio::spawn(converge(
                 engine,
                 handle.clone(),
                 rx,
@@ -1582,7 +1613,8 @@ mod tests {
                 forwards,
                 ensure,
                 known_tlds,
-                _dir: dir,
+                daemon,
+                dir,
             }
         }
 
@@ -2901,6 +2933,7 @@ mod tests {
         engine: Engine,
         fake: Arc<crate::engine::tests::FakeEngine>,
         sessions: watch::Sender<Link>,
+        state_path: PathBuf,
         _dir: TempDir,
     }
 
@@ -2909,6 +2942,12 @@ mod tests {
         /// path in `held`, and returns after the cleanup of the first
         /// session.
         async fn start(held: &[(&str, &str)]) -> Self {
+            Self::start_on(FREE_PORT, held).await
+        }
+
+        /// As [`OnFakeEngine::start`], with the bridges of this daemon on
+        /// UDP port `listen_port`.
+        async fn start_on(listen_port: u16, held: &[(&str, &str)]) -> Self {
             let (engine, sessions) = crate::engine::channel();
             let fake = crate::engine::tests::connect(&sessions);
             for (path, json) in held {
@@ -2916,7 +2955,7 @@ mod tests {
             }
             let linked = LinkedEngine {
                 link: engine.watch(),
-                listen_port: FREE_PORT,
+                listen_port,
             };
             let (handle, rx, phase_tx) = handle_pair();
             let dir = tempdir().unwrap();
@@ -2926,7 +2965,7 @@ mod tests {
                 handle.clone(),
                 rx,
                 phase_tx,
-                state_path,
+                state_path.clone(),
                 false,
                 KnownTlds::default(),
             ));
@@ -2936,6 +2975,7 @@ mod tests {
                 engine,
                 fake,
                 sessions,
+                state_path,
                 _dir: dir,
             }
         }
@@ -3277,5 +3317,137 @@ mod tests {
         );
         assert_eq!(rig.phase(), BridgePhase::Disabled);
         rig.no_attempt_follows().await;
+    }
+
+    /// What `netbridge.json` says about a cleanup that a disable left owed.
+    fn saved_debt(state_path: &Path) -> serde_json::Value {
+        let saved = std::fs::read(state_path).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        saved["cleanup_owed"].clone()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_that_found_no_session_is_paid_after_a_daemon_restart() {
+        let mut rig = Rig::spawn(None, false, false);
+        rig.send(Control::Disable).await;
+        rig.no_sweep_follows().await;
+        assert_eq!(saved_debt(&rig.state_path), true);
+
+        let mut rig = rig.restart(None).await;
+        rig.no_sweep_follows().await;
+        rig.engine_session(S1);
+
+        assert_eq!(
+            rig.next_sweep().await,
+            (Session(1), SetupContainerAndNetwork)
+        );
+        rig.no_sweep_follows().await;
+        assert_eq!(saved_debt(&rig.state_path), false);
+
+        let mut rig = rig.restart(S1).await;
+        assert_eq!(rig.next_sweep().await, (Session(1), SetupContainer));
+        rig.no_sweep_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_enable_ends_the_debt_and_the_next_disable_owes_anew() {
+        let mut rig = Rig::spawn(None, false, false);
+        rig.send(Control::Disable).await;
+        rig.no_sweep_follows().await;
+        assert_eq!(saved_debt(&rig.state_path), true);
+
+        rig.send(Control::Enable).await;
+        rig.reaches(BridgePhase::WaitingForDocker).await;
+        assert_eq!(saved_debt(&rig.state_path), false);
+
+        let mut rig = rig.restart(None).await;
+        rig.send(Control::Disable).await;
+        rig.no_sweep_follows().await;
+        assert_eq!(saved_debt(&rig.state_path), true);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_boot_owes_the_network_only_when_the_saved_state_says_so() {
+        // what `netbridge.json` holds at boot → what the first session is swept of
+        let table = [
+            (None, SetupContainer),
+            (Some(r#"{"enabled":false}"#), SetupContainer),
+            (
+                Some(r#"{"enabled":false,"cleanup_owed":false}"#),
+                SetupContainer,
+            ),
+            (
+                Some(r#"{"enabled":false,"cleanup_owed":true}"#),
+                SetupContainerAndNetwork,
+            ),
+        ];
+        for (saved, swept) in table {
+            let mut rig = Rig::boot_on(saved);
+
+            assert_eq!(rig.next_sweep().await, (Session(1), swept), "{saved:?}");
+            rig.no_sweep_follows().await;
+            rig.daemon.abort();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_debt_is_saved_until_a_cleanup_ends_it() {
+        #[derive(Debug)]
+        enum Engine {
+            RemovesTheNetwork,
+            RefusesANetworkInUse,
+            FailsTheRemoval,
+            GivesNoAnswer,
+        }
+        // how the engine takes the removal of the network → the debt that is saved
+        let table = [
+            (Engine::RemovesTheNetwork, false),
+            (Engine::RefusesANetworkInUse, false),
+            (Engine::FailsTheRemoval, true),
+            (Engine::GivesNoAnswer, true),
+        ];
+        for (engine, owed) in table {
+            let daemon = OnFakeEngine::start(&[(NETWORK, OWN_NETWORK)]).await;
+            match engine {
+                Engine::RemovesTheNetwork => {}
+                Engine::RefusesANetworkInUse => daemon.fake.fail_delete(NETWORK, Some(IN_USE)),
+                Engine::FailsTheRemoval => daemon.fake.fail_delete(NETWORK, Some(ENGINE_FAILED)),
+                Engine::GivesNoAnswer => daemon.fake.hang(NETWORK),
+            }
+
+            daemon.disable().await;
+
+            assert_eq!(saved_debt(&daemon.state_path), owed, "{engine:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listen_port_that_is_taken_ends_the_debt_for_that_disable() {
+        let another_daemons_bridge = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let taken = another_daemons_bridge.local_addr().unwrap().port();
+        let held = [(NETWORK, OWN_NETWORK), (FORWARDER, OWN_FORWARDER)];
+        let daemon = OnFakeEngine::start_on(taken, &held).await;
+        let (logged, _capture) = Logged::capture();
+
+        daemon.disable().await;
+
+        assert_eq!(daemon.fake.calls(), [] as [&str; 0]);
+        let lines = logged.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let final_for_this_disable = "the listen port is taken, and its holder may run a bridge \
+                                      on them. portman does not ask again until the next \
+                                      `portman bridge disable`";
+        assert!(lines[0].contains(final_for_this_disable), "{lines:?}");
+        assert_eq!(saved_debt(&daemon.state_path), false);
+
+        drop(another_daemons_bridge);
+        daemon.open_session(2).await;
+
+        let asked = daemon.fake.calls();
+        assert_eq!(
+            asked,
+            [format!("GET {SETUP_CONTAINER}")],
+            "asked for more than the setup container when the port was free again"
+        );
     }
 }
