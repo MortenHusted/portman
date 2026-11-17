@@ -1865,6 +1865,8 @@ fn strip_utun_prefix(pkt: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
     use super::*;
 
     #[test]
@@ -2884,6 +2886,293 @@ destination: 172.18.0.0
             Some(false),
             "the bridge claimed the utun when its device closed"
         );
+    }
+
+    /// What a pump's half of a device does when the pump reads from it or
+    /// writes to it.
+    #[derive(Clone, Copy)]
+    enum Ends {
+        ByAnError,
+        ByAPanic,
+    }
+
+    /// What the halves of one device see of the bridge's claim on `utun`.
+    #[derive(Clone)]
+    struct Seen {
+        utun: &'static str,
+        /// For each half that dropped, whether the bridge claimed the utun
+        /// at that moment.
+        claimed_at_drop: Shared<Vec<bool>>,
+        a_half_dropped: Arc<AtomicBool>,
+    }
+
+    impl Seen {
+        fn claim(utun: &'static str) -> Self {
+            remember_own_utun(utun);
+            Self {
+                utun,
+                claimed_at_drop: Shared::default(),
+                a_half_dropped: Arc::default(),
+            }
+        }
+
+        fn half(&self, ends: Ends) -> Half {
+            Half {
+                ends,
+                seen: self.clone(),
+            }
+        }
+
+        fn claimed_at_drop(&self) -> Vec<bool> {
+            self.claimed_at_drop.lock().unwrap().clone()
+        }
+    }
+
+    struct Half {
+        ends: Ends,
+        seen: Seen,
+    }
+
+    impl Half {
+        fn used(&self) -> std::task::Poll<std::io::Result<()>> {
+            match self.ends {
+                Ends::ByAnError => {
+                    std::task::Poll::Ready(Err(std::io::Error::other("the device is gone")))
+                }
+                Ends::ByAPanic => panic!("the pump panics"),
+            }
+        }
+    }
+
+    impl Drop for Half {
+        fn drop(&mut self) {
+            let claimed = is_own_utun(self.seen.utun);
+            self.seen.claimed_at_drop.lock().unwrap().push(claimed);
+            self.seen.a_half_dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl tokio::io::AsyncRead for Half {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.used()
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Half {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.used().map_ok(|()| bytes.len())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Route passes for one utun that run one after another on a thread,
+    /// with a stand-in for `route` that counts each command that starts or
+    /// still runs after a half of the device dropped.
+    struct Passes {
+        stop: Arc<AtomicBool>,
+        ended: Arc<AtomicU64>,
+        after_a_drop: Arc<AtomicU64>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl Passes {
+        /// Returns once a pass has run its commands, so the stand-in does
+        /// run while the bridge holds the utun.
+        fn start(seen: &Seen) -> Self {
+            let stop = Arc::<AtomicBool>::default();
+            let ended = Arc::<AtomicU64>::default();
+            let after_a_drop = Arc::<AtomicU64>::default();
+            let ran = Arc::<AtomicU64>::default();
+            let thread = {
+                let (seen, stop, ended) = (seen.clone(), stop.clone(), ended.clone());
+                let (after_a_drop, ran) = (after_a_drop.clone(), ran.clone());
+                std::thread::spawn(move || {
+                    let dropped = || seen.a_half_dropped.load(Ordering::SeqCst);
+                    let route = |_: &[&str]| {
+                        let started_late = dropped();
+                        ran.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_micros(200));
+                        if started_late || dropped() {
+                            after_a_drop.fetch_add(1, Ordering::SeqCst);
+                        }
+                        route_ended(0, "")
+                    };
+                    let cmds = [RouteCommand::add("192.0.2.0/24", seen.utun)];
+                    while !stop.load(Ordering::SeqCst) {
+                        reconcile_routes(&route, &cmds);
+                        ended.fetch_add(1, Ordering::SeqCst);
+                        std::thread::yield_now();
+                    }
+                })
+            };
+            while ran.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Self {
+                stop,
+                ended,
+                after_a_drop,
+                thread,
+            }
+        }
+
+        /// Lets two more passes end and returns the number of commands that
+        /// started or still ran after a half of the device dropped.
+        fn end(self) -> u64 {
+            let ended = self.ended.load(Ordering::SeqCst);
+            while self.ended.load(Ordering::SeqCst) < ended + 2 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.stop.store(true, Ordering::SeqCst);
+            self.thread.join().unwrap();
+            self.after_a_drop.load(Ordering::SeqCst)
+        }
+    }
+
+    async fn tx_pump(half: Half) -> JoinHandle<()> {
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (host, vm) = (Keypair::generate(), Keypair::generate());
+        let peer = Arc::new(Mutex::new(Peer::new(&host, vm.public(), None)));
+        spawn_tx(udp, peer, Arc::default(), half)
+    }
+
+    /// An ICMP echo from the VM's end of the tunnel to the host's.
+    const PACKET: &[u8] = &[
+        0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 192, 168, 99, 2,
+        192, 168, 99, 1, b'e', b'c', b'h', b'o', b'!', b'!', b'!', b'!',
+    ];
+
+    /// An rx pump, and a packet from the VM's end of the tunnel that the
+    /// pump writes to `half`.
+    async fn rx_pump_that_gets_a_packet(half: Half) -> JoinHandle<()> {
+        let (host, vm) = (Keypair::generate(), Keypair::generate());
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let to_host = udp.local_addr().unwrap();
+        let peer = Arc::new(Mutex::new(Peer::new(&host, vm.public(), None)));
+        let pump = spawn_rx(udp, peer, Arc::default(), half);
+
+        let mut vm = Peer::new(&vm, host.public(), None);
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (mut frame, mut answer) = ([0u8; 2048], [0u8; 2048]);
+        let TunnResult::WriteToNetwork(initiation) = vm.encapsulate(PACKET, &mut frame) else {
+            panic!("no handshake initiation");
+        };
+        socket.send_to(initiation, to_host).await.unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(60), socket.recv_from(&mut answer));
+        let (n, _) = answered
+            .await
+            .expect("the pump answers the handshake")
+            .unwrap();
+        if let TunnResult::WriteToNetwork(keepalive) = vm.decapsulate(&answer[..n], &mut frame) {
+            socket.send_to(keepalive, to_host).await.unwrap();
+        }
+        let TunnResult::WriteToNetwork(data) = vm.encapsulate(PACKET, &mut frame) else {
+            panic!("no data frame");
+        };
+        socket.send_to(data, to_host).await.unwrap();
+        pump
+    }
+
+    async fn ended(pump: JoinHandle<()>) -> Result<(), tokio::task::JoinError> {
+        tokio::time::timeout(Duration::from_secs(60), pump)
+            .await
+            .expect("the pump ends by itself")
+    }
+
+    #[tokio::test]
+    async fn a_pump_that_fails_lets_go_of_the_utun_before_its_half_of_the_device_drops() {
+        let seen = Seen::claim("utun-of-a-pump-that-fails");
+        let passes = Passes::start(&seen);
+
+        let pump = tx_pump(seen.half(Ends::ByAnError)).await;
+        assert!(ended(pump).await.is_ok());
+
+        assert_eq!(passes.end(), 0, "route commands after the half dropped");
+        assert_eq!(seen.claimed_at_drop(), [false]);
+    }
+
+    #[tokio::test]
+    async fn a_pump_that_panics_lets_go_of_the_utun_before_its_half_of_the_device_drops() {
+        let tx = Seen::claim("utun-of-a-tx-pump-that-panics");
+        let passes = Passes::start(&tx);
+        let pump = tx_pump(tx.half(Ends::ByAPanic)).await;
+        assert!(ended(pump).await.unwrap_err().is_panic());
+        assert_eq!(passes.end(), 0, "route commands after the tx half dropped");
+        assert_eq!(tx.claimed_at_drop(), [false]);
+
+        let rx = Seen::claim("utun-of-an-rx-pump-that-panics");
+        let passes = Passes::start(&rx);
+        let pump = rx_pump_that_gets_a_packet(rx.half(Ends::ByAPanic)).await;
+        assert!(ended(pump).await.unwrap_err().is_panic());
+        assert_eq!(passes.end(), 0, "route commands after the rx half dropped");
+        assert_eq!(rx.claimed_at_drop(), [false]);
+    }
+
+    #[tokio::test]
+    async fn when_both_pumps_end_the_bridge_has_let_go_of_the_utun_before_the_device_closes() {
+        let seen = Seen::claim("utun-of-two-pumps-that-end");
+        let passes = Passes::start(&seen);
+
+        let tx = tx_pump(seen.half(Ends::ByAnError)).await;
+        let rx = rx_pump_that_gets_a_packet(seen.half(Ends::ByAPanic)).await;
+        assert!(ended(tx).await.is_ok());
+        assert!(ended(rx).await.unwrap_err().is_panic());
+
+        assert_eq!(passes.end(), 0, "route commands after a half dropped");
+        assert_eq!(seen.claimed_at_drop(), [false, false]);
+    }
+
+    #[tokio::test]
+    async fn the_route_reconciler_ends_with_the_pass_that_finds_the_utun_let_go() {
+        static RAN: AtomicU64 = AtomicU64::new(0);
+        let route = |_: &[&str]| {
+            RAN.fetch_add(1, Ordering::SeqCst);
+            route_ended(0, "")
+        };
+        let engine = FakeEngine::start().await;
+        let reconciler = |utun: &str| {
+            let docker = engine.docker.clone();
+            spawn_route_reconciler(docker, NetbridgeMode::OptIn, utun.to_string(), route)
+        };
+
+        let let_go = reconciler("utun-let-go-before-the-reconciler");
+        tokio::time::timeout(Duration::from_secs(30), let_go)
+            .await
+            .expect("the reconciler ends")
+            .unwrap();
+        assert_eq!(RAN.load(Ordering::SeqCst), 0);
+
+        let utun = "utun-held-under-the-reconciler";
+        remember_own_utun(utun);
+        let held = reconciler(utun);
+        while RAN.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!held.is_finished(), "the reconciler ended under its bridge");
+        forget_own_utun(utun);
+        held.abort();
     }
 
     #[derive(Clone, Default)]
