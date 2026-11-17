@@ -909,6 +909,8 @@ mod tests {
                 "say: bridge: when Docker answers again, remove the forwarder and its network with:",
                 "say:     docker rm -f portman-netbridge-dns",
                 "say:     docker network rm portman",
+                "say: bridge: do not run them while another portman daemon runs a bridge on \
+                 this engine: they would remove its forwarder and network",
             ]
         );
     }
@@ -919,7 +921,7 @@ mod tests {
         let no_engine = BridgeLeftovers::NoEngine {
             reason: "no docker socket found".into(),
         };
-        for (bridge_enabled, lines) in [(false, 0), (true, 4)] {
+        for bridge_enabled in [false, true] {
             let mac = StandInMac {
                 bridge_enabled,
                 ..StandInMac::new(Some(no_engine.clone()))
@@ -935,9 +937,10 @@ mod tests {
             );
             let said: Vec<String> = bridge_leftover_lines(&no_engine)
                 .into_iter()
+                .filter(|_| bridge_enabled)
                 .map(|line| format!("say: {line}"))
                 .collect();
-            assert_eq!(did[5..], said[..lines], "bridge_enabled={bridge_enabled}");
+            assert_eq!(did[5..], said, "bridge_enabled={bridge_enabled}");
         }
     }
 
@@ -948,6 +951,8 @@ mod tests {
         let by_hand = [
             "    docker rm -f portman-netbridge-dns",
             "    docker network rm portman",
+            "bridge: do not run them while another portman daemon runs a bridge on this \
+             engine: they would remove its forwarder and network",
         ];
 
         assert_eq!(
@@ -969,6 +974,7 @@ mod tests {
                 "bridge: to remove the forwarder and its network by hand, run:",
                 by_hand[0],
                 by_hand[1],
+                by_hand[2],
             ]
         );
         assert_eq!(
@@ -981,6 +987,7 @@ mod tests {
                  again, remove the forwarder and its network with:",
                 by_hand[0],
                 by_hand[1],
+                by_hand[2],
             ]
         );
     }
