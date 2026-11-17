@@ -287,7 +287,7 @@ impl Runtime {
             ForwarderStep::Create => {}
         }
         create_dns_forwarder(&self.docker, &image, cmd).await?;
-        Ok(DnsForwarder::InPlace)
+        Ok(DnsForwarder::Started)
     }
 
     /// Cleanly tear down the bridge. Aborts the pump tasks and removes
@@ -1012,8 +1012,11 @@ pub fn dns_forwarder_args(managed_tlds: &BTreeSet<String>) -> Vec<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnsForwarder {
     /// The engine holds the forwarder container with the wanted command,
-    /// from the current setup image. It ran already or was started now.
+    /// from the current setup image, and it ran before this ensure.
     InPlace,
+    /// The engine created that container now and started it. A dnsmasq
+    /// that ends at once shows only at a later ensure, as `Restarting`.
+    Started,
     /// The engine has no setup image whose entrypoint has the `dns` mode.
     /// `portman bridge prepare` builds one. Nothing was created or removed.
     ImageWithoutDnsMode,
@@ -2509,7 +2512,7 @@ destination: 172.18.0.0
 
         let ensured = engine.bridge().await.ensure_dns_forwarder(&managed).await;
 
-        assert_eq!(ensured.unwrap(), DnsForwarder::InPlace);
+        assert_eq!(ensured.unwrap(), DnsForwarder::Started);
         let requests = engine.requests();
         let asked: Vec<&str> = requests.iter().map(|(asked, _)| asked.as_str()).collect();
         assert_eq!(
@@ -2560,17 +2563,17 @@ destination: 172.18.0.0
             ),
             (
                 held_forwarder(&for_another_tld_set, RUNNING),
-                Some(DnsForwarder::InPlace),
+                Some(DnsForwarder::Started),
                 replaced.clone(),
             ),
             (
                 held_forwarder(&for_another_tld_set, RESTARTING),
-                Some(DnsForwarder::InPlace),
+                Some(DnsForwarder::Started),
                 replaced.clone(),
             ),
             (
                 held_forwarder(&wanted, r#"{"Running": false}"#),
-                Some(DnsForwarder::InPlace),
+                Some(DnsForwarder::Started),
                 replaced,
             ),
             (r#"{"Id": "dddd2222"}"#.to_string(), None, vec![]),

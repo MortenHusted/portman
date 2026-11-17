@@ -41,7 +41,9 @@
 //!   - a bridge that is up gets the DNS forwarder in the VM: the loop makes
 //!     the bridge ensure it once, and again when the managed TLD set
 //!     changes. An ensure that does not put the forwarder in place leaves
-//!     the bridge up and is repeated a minute later. The forwarder outlives
+//!     the bridge up and is repeated a minute later. So is one that started
+//!     the forwarder, because a dnsmasq that ends at once shows only then.
+//!     The forwarder outlives
 //!     the bridge and the daemon. Only the user's `Disable` removes it,
 //!     before the docker network. It goes also when the engine then keeps
 //!     a network that is in use.
@@ -82,8 +84,8 @@ const SETUP_CHECK_BUDGET: Duration = Duration::from_secs(3);
 
 const RETRY_BASE: Duration = Duration::from_secs(5);
 const RETRY_CAP: Duration = Duration::from_secs(60);
-/// The wait before the next ensure of a DNS forwarder that is not in place.
-/// It is also how soon a setup image that the user built with `portman
+/// The wait before the next ensure of a DNS forwarder that is not in place
+/// or that was started only now. It is also how soon a setup image that the user built with `portman
 /// bridge prepare` is noticed.
 const FORWARDER_RETRY: Duration = Duration::from_secs(60);
 
@@ -210,7 +212,8 @@ struct Running<B> {
 struct Forwarded {
     tlds: BTreeSet<String>,
     ended: Ensured,
-    /// When the next ensure is due. `None` for a forwarder that is in place.
+    /// When the next ensure is due. `None` for a forwarder that was found
+    /// in place.
     retry_at: Option<Instant>,
 }
 
@@ -218,6 +221,8 @@ struct Forwarded {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ensured {
     InPlace,
+    /// Created and started now. The next ensure shows whether it stays up.
+    Started,
     /// The setup image in the engine cannot run the forwarder.
     ImageWithoutDnsMode,
     /// The engine starts the right container again and again.
@@ -607,6 +612,7 @@ async fn forward(
     let ensured = bridge.ensure_dns_forwarder(&tlds).await;
     let ended = match &ensured {
         Ok(DnsForwarder::InPlace) => Ensured::InPlace,
+        Ok(DnsForwarder::Started) => Ensured::Started,
         Ok(DnsForwarder::ImageWithoutDnsMode) => Ensured::ImageWithoutDnsMode,
         Ok(DnsForwarder::Restarting) => Ensured::Restarting,
         Err(_) => Ensured::Failed,
@@ -617,6 +623,11 @@ async fn forward(
         (Ok(DnsForwarder::InPlace), false) => {
             info!(?tlds, "dns forwarder in place at 192.168.99.129");
         }
+        (Ok(DnsForwarder::Started), false) => info!(
+            ?tlds,
+            look_again_in_secs = retry_in_secs,
+            "dns forwarder started at 192.168.99.129"
+        ),
         (Ok(DnsForwarder::ImageWithoutDnsMode), false) => warn!(
             retry_in_secs,
             "dns forwarder unavailable: the netbridge setup image has no dns mode; run `portman bridge prepare`"
@@ -1232,6 +1243,7 @@ mod tests {
     #[derive(Debug, Clone, Copy)]
     enum Ensure {
         PutsItInPlace,
+        StartsIt,
         FindsAnImageWithoutTheDnsMode,
         FindsItRestarting,
         Fails,
@@ -1349,6 +1361,7 @@ mod tests {
             let ensure = *self.probe.ensure.lock().unwrap();
             match ensure {
                 Ensure::PutsItInPlace => Ok(DnsForwarder::InPlace),
+                Ensure::StartsIt => Ok(DnsForwarder::Started),
                 Ensure::FindsAnImageWithoutTheDnsMode => Ok(DnsForwarder::ImageWithoutDnsMode),
                 Ensure::FindsItRestarting => Ok(DnsForwarder::Restarting),
                 Ensure::Fails => anyhow::bail!("the engine refused the container"),
@@ -2049,6 +2062,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_forwarder_that_is_not_in_place_leaves_the_bridge_up_and_is_tried_each_minute() {
         let not_in_place = [
+            Ensure::StartsIt,
             Ensure::FindsAnImageWithoutTheDnsMode,
             Ensure::FindsItRestarting,
             Ensure::Fails,
@@ -2084,13 +2098,17 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_forwarder_that_keeps_restarting_is_reported_once_and_not_each_minute() {
+    async fn a_forwarder_that_ends_after_its_start_is_seen_a_minute_later_and_reported_once() {
         let (logged, _capture) = Logged::capture();
         let mut rig = Rig::spawn(S1, true, false);
-        rig.the_next_ensure(Ensure::FindsItRestarting);
+        rig.the_next_ensure(Ensure::StartsIt);
         rig.send(Control::Enable).await;
+        let started = rig.next_forward().await;
 
-        for _ in 0..3 {
+        rig.the_next_ensure(Ensure::FindsItRestarting);
+        let first_look = rig.next_forward().await;
+        assert_eq!(first_look.at - started.at, FORWARDER_RETRY);
+        for _ in 0..2 {
             rig.next_forward().await;
         }
         rig.the_next_ensure(Ensure::PutsItInPlace);
@@ -2102,8 +2120,13 @@ mod tests {
             .iter()
             .filter(|line| line.contains("dns forwarder"))
             .collect();
-        assert_eq!(about_the_forwarder.len(), 2, "{lines:?}");
-        let (restarting, in_place) = (about_the_forwarder[0], about_the_forwarder[1]);
+        assert_eq!(about_the_forwarder.len(), 3, "{lines:?}");
+        let (started, restarting, in_place) = (
+            about_the_forwarder[0],
+            about_the_forwarder[1],
+            about_the_forwarder[2],
+        );
+        assert!(started.contains("started at"), "{started}");
         assert!(restarting.contains("WARN"), "{restarting}");
         assert!(restarting.contains("keeps restarting"), "{restarting}");
         assert!(
