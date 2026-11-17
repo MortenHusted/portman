@@ -409,7 +409,10 @@ fn forwarder_query_name(phase: Option<BridgePhase>, routes: &[Entry]) -> Result<
         .filter(|host| !host.starts_with("*.") && !host.ends_with(".localhost"))
         .min()
         .map(String::from)
-        .ok_or_else(|| "no hostname is registered".to_string())
+        .ok_or_else(|| {
+            "no registered hostname to look up; a wildcard and a `.localhost` name are not looked up"
+                .to_string()
+        })
 }
 
 /// The TCP routes that a container reaches only from the `portman` network:
@@ -1501,7 +1504,7 @@ mod tests {
     #[test]
     fn doctor_prints_one_line_for_each_state_of_the_dns_forwarder() {
         let not_sent = ForwarderQuery::NotSent {
-            why: "no hostname is registered".to_string(),
+            why: "no registered hostname to look up; a wildcard and a `.localhost` name are not looked up".to_string(),
         };
         let unanswered = ForwarderQuery::Unanswered {
             name: "web.demo.test".to_string(),
@@ -1526,7 +1529,7 @@ mod tests {
             ),
             (
                 running(not_sent),
-                "dns forwarder: running at 192.168.99.129, not queried (no hostname is registered)",
+                "dns forwarder: running at 192.168.99.129, not queried (no registered hostname to look up; a wildcard and a `.localhost` name are not looked up)",
             ),
             (
                 absent,
@@ -1596,9 +1599,9 @@ mod tests {
         let table = [
             (up, &routes[..], name("db.demo.test")),
             (up, &routes[..3], name("web.demo.test")),
-            (up, &routes[..1], why("no hostname is registered")),
-            (up, &routes[2..3], why("no hostname is registered")),
-            (up, &[][..], why("no hostname is registered")),
+            (up, &routes[..1], why("no registered hostname to look up; a wildcard and a `.localhost` name are not looked up")),
+            (up, &routes[2..3], why("no registered hostname to look up; a wildcard and a `.localhost` name are not looked up")),
+            (up, &[][..], why("no registered hostname to look up; a wildcard and a `.localhost` name are not looked up")),
             (
                 Some(BridgePhase::Disabled),
                 &routes[..],
