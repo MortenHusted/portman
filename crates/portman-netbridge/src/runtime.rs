@@ -329,6 +329,13 @@ impl Runtime {
     }
 
     async fn end_tasks(&mut self) {
+        self.abort_tasks();
+        for t in self.tasks.drain(..) {
+            let _ = t.await;
+        }
+    }
+
+    fn abort_tasks(&self) {
         // The kernel recycles utun names. Keep claiming this one after the
         // device is gone and route repair would treat a *recycled* utun —
         // somebody else's VPN — as ours to repoint. The claim goes before
@@ -338,18 +345,12 @@ impl Runtime {
         for t in &self.tasks {
             t.abort();
         }
-        for t in self.tasks.drain(..) {
-            let _ = t.await;
-        }
     }
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        forget_own_utun(&self.utun_name);
-        for t in &self.tasks {
-            t.abort();
-        }
+        self.abort_tasks();
     }
 }
 
@@ -2784,7 +2785,7 @@ destination: 172.18.0.0
             (logged, capture)
         }
 
-        fn warnings(&self) -> Vec<String> {
+        fn take_warnings(&self) -> Vec<String> {
             let bytes = std::mem::take(&mut *self.0.lock().unwrap());
             let text = String::from_utf8(bytes).unwrap();
             let warnings = text.lines().filter(|line| line.contains(" WARN "));
@@ -2803,7 +2804,7 @@ destination: 172.18.0.0
 
         remember_own_utun(no_such_interface);
         reconcile_routes(&pass);
-        let warnings = logged.warnings();
+        let warnings = logged.take_warnings();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
             warnings[0].contains("route reconcile failed"),
@@ -2812,7 +2813,7 @@ destination: 172.18.0.0
 
         forget_own_utun(no_such_interface);
         reconcile_routes(&pass);
-        assert_eq!(logged.warnings(), [] as [&str; 0]);
+        assert_eq!(logged.take_warnings(), [] as [&str; 0]);
     }
 
     #[tokio::test]
@@ -2829,7 +2830,7 @@ destination: 172.18.0.0
         let mut asked = engine.asked_for();
         asked.retain(|asked| asked.ends_with(NETWORK_INSPECT));
         assert_eq!(asked, ["DELETE /networks/portman"]);
-        let warnings = logged.warnings();
+        let warnings = logged.take_warnings();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("has active endpoints"), "{warnings:?}");
     }
@@ -2837,6 +2838,7 @@ destination: 172.18.0.0
     #[tokio::test]
     async fn a_shutdown_for_a_disable_says_whether_a_later_cleanup_has_anything_left_to_try() {
         let forwarder = dns_forwarder_args(&tlds(&["test"]));
+        // the removal that fails, and how → how the shutdown ends
         let cases = [
             (None, Cleanup::Complete),
             (Some((NETWORK_INSPECT, IN_USE)), Cleanup::Complete),
