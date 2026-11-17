@@ -1,6 +1,7 @@
 //! Background assessment of "is the host ↔ VM bridge healthy?".
 //!
-//! Every 5 seconds, and when the engine link changes:
+//! Every 5 seconds, when the engine link changes, and when the netbridge
+//! task publishes the bridge's phase:
 //!   1. Ask Docker for the running Portman-labelled containers, and take the
 //!      networks that the health needs a route to. A container that the
 //!      registry routes to its address on the `portman` network needs that
@@ -61,7 +62,7 @@ pub(crate) async fn run(
     engine: Engine,
     shared: Shared,
     bridge_ifindex: crate::upstream::BridgeIfIndex,
-    _phase: watch::Receiver<BridgePhase>,
+    mut phase: watch::Receiver<BridgePhase>,
 ) -> anyhow::Result<()> {
     let mut ticker = tokio::time::interval(ASSESSMENT_PERIOD);
     let mut link = engine.watch();
@@ -69,11 +70,16 @@ pub(crate) async fn run(
     // assessment ASAP after startup rather than leaving the menubar on
     // "unknown" for 5s. A change of the engine link is assessed at once, so
     // that the assessment does not stay `offline` for a period after the
-    // engine connects.
+    // engine connects. So is each phase that the netbridge task publishes,
+    // because a bridge that comes up or goes away changes the routes, and a
+    // status that says `up` beside the health of the routes from before reads
+    // as a fault. A mode change of a running bridge replaces that bridge, so
+    // it shows here as its phases.
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
             Ok(()) = link.changed() => {}
+            Ok(()) = phase.changed() => {}
         }
         let assessment = assess(&engine, &bridge_ifindex).await;
         debug!(
