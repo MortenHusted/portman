@@ -27,7 +27,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
-use std::process::{Command as StdCommand, Output};
+use std::process::{Command as StdCommand, Output, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,6 +94,11 @@ const SETUP_STOP_TIMEOUT_SECS: i32 = 5;
 const SETUP_REMOVE_TIMEOUT: Duration = Duration::from_secs(10);
 const LABEL_HOST: &str = "dev.portman.host";
 const ROUTE_RECONCILE_PERIOD: Duration = Duration::from_secs(5);
+/// A `route` command takes milliseconds. A bridge that ends waits for the
+/// command that runs for its utun, so one that takes longer is ended.
+const ROUTE_LIMIT: Duration = Duration::from_secs(3);
+/// How long a command that was killed gets to go away.
+const KILL_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeOptions {
@@ -1559,7 +1564,7 @@ fn remember_own_utun(name: &str) {
 
 /// Ends the claim on `name` and waits for the `route` command that runs at
 /// this moment. No later command runs for the name, so the wait is for one
-/// command.
+/// command, which [`ROUTE_LIMIT`] bounds.
 fn forget_own_utun(name: &str) {
     OWN_UTUNS
         .lock()
@@ -1739,7 +1744,37 @@ fn ensure_route_command(route: &RunRoute, cmd: &RouteCommand) -> Result<(), Rout
 type RunRoute<'a> = dyn Fn(&[&str]) -> std::io::Result<Output> + 'a;
 
 fn sbin_route(args: &[&str]) -> std::io::Result<Output> {
-    StdCommand::new("/sbin/route").args(args).output()
+    output_within(StdCommand::new("/sbin/route").args(args), ROUTE_LIMIT)
+}
+
+/// Runs `command` to its end and returns what it printed. A command that
+/// runs longer than `limit` is killed.
+fn output_within(command: &mut StdCommand, limit: Duration) -> std::io::Result<Output> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if exits_within(&mut child, limit)? {
+        return child.wait_with_output();
+    }
+    child.kill()?;
+    exits_within(&mut child, KILL_GRACE)?;
+    let timed_out = format!("the command did not end within {limit:?}");
+    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, timed_out))
+}
+
+fn exits_within(child: &mut std::process::Child, limit: Duration) -> std::io::Result<bool> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// Runs one `route` command for `iface`, while the bridge holds it.
@@ -3000,6 +3035,56 @@ destination: 172.18.0.0
             .expect("the bridge lets go once the command has ended");
         pass.join().unwrap();
         bridge.join().unwrap();
+    }
+
+    #[test]
+    fn a_command_that_outlives_its_limit_is_ended_and_one_that_does_not_gives_its_output() {
+        let prints = "echo out; echo err >&2; exit 3";
+        let within = Duration::from_secs(60);
+        let ended = output_within(StdCommand::new("sh").args(["-c", prints]), within).unwrap();
+        assert_eq!(ended.status.code(), Some(3));
+        assert_eq!(
+            (ended.stdout, ended.stderr),
+            (b"out\n".into(), b"err\n".into())
+        );
+
+        let began = std::time::Instant::now();
+        let limit = Duration::from_millis(100);
+        let hung = output_within(StdCommand::new("sleep").arg("60"), limit);
+        assert_eq!(hung.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        let took = began.elapsed();
+        assert!(took < Duration::from_secs(10), "it took {took:?}");
+    }
+
+    #[test]
+    fn a_route_program_that_hangs_holds_a_bridge_that_ends_no_longer_than_its_limit() {
+        let utun = "utun-of-a-route-that-hangs";
+        remember_own_utun(utun);
+        let (started, command_runs) = std::sync::mpsc::channel();
+        let pass = std::thread::spawn(move || {
+            let hangs = |_: &[&str]| {
+                let _ = started.send(());
+                output_within(
+                    StdCommand::new("sleep").arg("60"),
+                    Duration::from_millis(200),
+                )
+            };
+            let cmds: Vec<RouteCommand> = (0..40)
+                .map(|n| RouteCommand::add(format!("10.{n}.0.0/16"), utun))
+                .collect();
+            reconcile_routes(&hangs, &cmds);
+        });
+        command_runs.recv().unwrap();
+
+        let began = std::time::Instant::now();
+        forget_own_utun(utun);
+        let waited = began.elapsed();
+        pass.join().unwrap();
+
+        assert!(
+            waited < Duration::from_secs(5),
+            "the bridge waited {waited:?} for a route program that hangs"
+        );
     }
 
     #[tokio::test]
