@@ -17,9 +17,10 @@
 //!     or a retry timer. Before each step it takes the messages that are in
 //!     the channel. A message that arrives later waits for the step to end:
 //!     the loop does not cancel a step in flight. The bridge gives the
-//!     engine 30 s for each step, so a message waits no longer than that
-//!     for an engine that froze. A start that is cut there fails and is
-//!     retried, and a cleanup stays owed.
+//!     engine [`ENGINE_STEP_BUDGET`] for each step and
+//!     [`ENGINE_START_BUDGET`] for a start, so a message waits no longer
+//!     than that for an engine that froze. A start that is cut there fails
+//!     and is retried, and a cleanup stays owed.
 //!   - a bridge is built on one engine session. When no session exists the
 //!     loop ends the bridge and asks the engine nothing. When another
 //!     session opens, the loop keeps the bridge if that engine says within
@@ -70,7 +71,10 @@ use bollard::query_parameters::InspectContainerOptions;
 use bollard::Docker;
 use portman_core::netbridge_state::{self, NetbridgeState};
 use portman_core::NetbridgeMode;
-use portman_netbridge::runtime::{Cleanup, DnsForwarder, Leftovers, Runtime, RuntimeOptions};
+use portman_netbridge::runtime::{
+    Cleanup, DnsForwarder, Leftovers, Runtime, RuntimeOptions, ENGINE_START_BUDGET,
+    ENGINE_STEP_BUDGET,
+};
 use portman_netbridge::tunnel::{Keypair, HOST_WG_LISTEN_PORT};
 use tokio::sync::{mpsc, watch, Notify, RwLock};
 use tokio::time::Instant;
@@ -90,7 +94,8 @@ const ENABLE_ENV: &str = "PORTMAN_NETBRIDGE";
 /// head, so a VM that froze with its socket open would never end this
 /// check. The budget bounds this check alone. A later step that asks the
 /// same engine holds the loop, and with it every control message, for the
-/// 30 s that the bridge gives the engine for a step.
+/// [`ENGINE_STEP_BUDGET`] that the bridge gives the engine for a step, or
+/// for the [`ENGINE_START_BUDGET`] of a start.
 const SETUP_CHECK_BUDGET: Duration = Duration::from_secs(3);
 
 const RETRY_BASE: Duration = Duration::from_secs(5);
@@ -2636,13 +2641,13 @@ mod tests {
         assert!(warnings[0].contains(&cause), "{}", warnings[0]);
     }
 
-    /// The longest that one step of the bridge waits for the engine, as the
-    /// README states it.
-    const STATED_BOUND: Duration = Duration::from_secs(30);
-    const SAYS_NO_ANSWER: &str = "the container engine gave no answer within 30 s";
+    fn says_no_answer_within(budget: Duration) -> String {
+        let secs = budget.as_secs();
+        format!("the container engine gave no answer within {secs} s")
+    }
 
     #[tokio::test(start_paused = true)]
-    async fn a_cleanup_on_an_engine_that_froze_ends_owed_at_the_stated_bound_and_says_so() {
+    async fn a_cleanup_on_an_engine_that_froze_ends_owed_when_its_budget_is_spent_and_says_so() {
         for frozen_at in [SETUP_CONTAINER, FORWARDER, NETWORK] {
             let (engine, fake) = engine_with_leftovers(FREE_PORT);
             fake.hang(frozen_at);
@@ -2655,15 +2660,16 @@ mod tests {
                 .unwrap_or_else(|_| panic!("the cleanup waited for the engine at {frozen_at}"));
 
             assert_eq!(cleanup, Cleanup::Owed, "{frozen_at}");
-            assert_eq!(asked.elapsed(), STATED_BOUND, "{frozen_at}");
+            assert_eq!(asked.elapsed(), ENGINE_STEP_BUDGET, "{frozen_at}");
             let warnings = logged.warnings();
             assert_eq!(warnings.len(), 1, "{frozen_at} {warnings:?}");
-            assert!(warnings[0].contains(SAYS_NO_ANSWER), "{}", warnings[0]);
+            let no_answer = says_no_answer_within(ENGINE_STEP_BUDGET);
+            assert!(warnings[0].contains(&no_answer), "{}", warnings[0]);
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_start_on_an_engine_that_froze_fails_at_the_stated_bound_and_says_so() {
+    async fn a_start_on_an_engine_that_froze_fails_when_its_budget_is_spent_and_says_so() {
         let (engine, fake) = engine_with_leftovers(FREE_PORT);
         fake.hang(NETWORK);
         let (logged, _capture) = Logged::capture();
@@ -2676,10 +2682,10 @@ mod tests {
             .expect("the start waited for the engine");
 
         assert!(started.is_none(), "a bridge started on a frozen engine");
-        assert_eq!(asked.elapsed(), STATED_BOUND);
+        assert_eq!(asked.elapsed(), ENGINE_START_BUDGET);
         let warnings = logged.warnings();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        let cause = format!("err={SAYS_NO_ANSWER}");
+        let cause = format!("err={}", says_no_answer_within(ENGINE_START_BUDGET));
         assert!(warnings[0].contains(&cause), "{}", warnings[0]);
     }
 
@@ -2707,14 +2713,11 @@ mod tests {
         assert!(warnings[0].contains(cause), "{}", warnings[0]);
         let waited = asked.elapsed();
         assert!(waited > Duration::from_secs(39), "{waited:?}");
-        assert!(
-            fake.calls().ends_with(&[
-                "DELETE /containers/portman-netbridge-setup".to_string(),
-                format!("GET {SETUP_CONTAINER}"),
-            ]),
-            "the start did not see its setup container gone: {:?}",
-            fake.calls()
-        );
+        let removals = fake
+            .calls()
+            .into_iter()
+            .filter(|call| call == "DELETE /containers/portman-netbridge-setup");
+        assert_eq!(removals.count(), 2, "the old setup container and its own");
     }
 
     #[tokio::test(start_paused = true)]

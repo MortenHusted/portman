@@ -93,6 +93,8 @@ const SETUP_STOP_TIMEOUT_SECS: i32 = 5;
 /// How long to wait for docker to finish removing the setup container before
 /// giving up and saying so.
 const SETUP_REMOVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a new setup container has to print the VM's public key.
+const SETUP_KEY_TIMEOUT: Duration = Duration::from_secs(10);
 const LABEL_HOST: &str = "dev.portman.host";
 const ROUTE_RECONCILE_PERIOD: Duration = Duration::from_secs(5);
 /// A `route` command takes milliseconds. A bridge that ends waits for the
@@ -100,22 +102,42 @@ const ROUTE_RECONCILE_PERIOD: Duration = Duration::from_secs(5);
 const ROUTE_LIMIT: Duration = Duration::from_secs(3);
 /// How long a command that was killed gets to go away.
 const KILL_GRACE: Duration = Duration::from_millis(500);
-/// How long the engine has to answer all that one step of a bridge asks it:
-/// a start, a stop, a cleanup of leftovers, an ensure of the DNS forwarder.
-/// The limit of the caller's client is for one request and ends at the head
-/// of the response, so a VM that froze with its socket open held a step for
-/// a multiple of that limit, or without end once a head was in. A step on
-/// an engine that answers takes under a second. The deadlines inside one
-/// start add up to 25 s, and the budget is above them.
-const ENGINE_BUDGET: Duration = Duration::from_secs(30);
+/// The waits inside one removal of the setup container: the engine's stop
+/// of it, and the wait until the engine has let go of it.
+const SETUP_REMOVAL_WAITS_SECS: u64 =
+    SETUP_STOP_TIMEOUT_SECS as u64 + SETUP_REMOVE_TIMEOUT.as_secs();
+/// What the requests of one step get on top of the waits inside it. On an
+/// engine that answers they take under a second together.
+const REQUESTS_MARGIN_SECS: u64 = 5;
+
+/// How long the engine has to answer all that a stop, a cleanup of
+/// leftovers or an ensure of the DNS forwarder asks it. The limit of the
+/// caller's client is for one request and ends at the head of the response,
+/// so a VM that froze with its socket open held a step for a multiple of
+/// that limit, or without end once a head was in. Each of these steps
+/// removes the setup container at most once, and the budget is the waits of
+/// that removal and [`REQUESTS_MARGIN_SECS`], so that it cuts no step on an
+/// engine that answers.
+pub const ENGINE_STEP_BUDGET: Duration =
+    Duration::from_secs(SETUP_REMOVAL_WAITS_SECS + REQUESTS_MARGIN_SECS);
+
+/// As [`ENGINE_STEP_BUDGET`], for a start. A start removes the setup
+/// container of an earlier bridge, waits [`SETUP_KEY_TIMEOUT`] for the key
+/// of the new one, and removes that one when no key came. The budget is
+/// those waits and [`REQUESTS_MARGIN_SECS`], so that a start that uses up
+/// every wait still ends with its own error and with its setup container
+/// gone.
+pub const ENGINE_START_BUDGET: Duration = Duration::from_secs(
+    2 * SETUP_REMOVAL_WAITS_SECS + SETUP_KEY_TIMEOUT.as_secs() + REQUESTS_MARGIN_SECS,
+);
 
 /// A step that is cut leaves in the engine what it had done by then.
-async fn within_budget<T>(step: impl Future<Output = T>) -> Result<T> {
-    let cut = tokio::time::timeout(ENGINE_BUDGET, step).await;
+async fn within<T>(budget: Duration, step: impl Future<Output = T>) -> Result<T> {
+    let cut = tokio::time::timeout(budget, step).await;
     cut.map_err(|_| {
         anyhow!(
             "the container engine gave no answer within {} s",
-            ENGINE_BUDGET.as_secs()
+            budget.as_secs()
         )
     })
 }
@@ -185,15 +207,19 @@ impl Runtime {
     /// As [`Runtime::start_with_options`], with the host keypair supplied by
     /// the caller. A caller that retries a failed start passes the same
     /// keypair, and the key is then logged once and not for every retry.
-    /// A start that the engine does not answer fails when [`ENGINE_BUDGET`]
-    /// is spent. It can leave a setup container, which the next start or
-    /// cleanup removes.
+    /// A start that the engine does not answer fails when
+    /// [`ENGINE_START_BUDGET`] is spent. It can leave a setup container,
+    /// which the next start or cleanup removes.
     pub async fn start_with_keypair(
         docker: Docker,
         options: RuntimeOptions,
         host_kp: &Keypair,
     ) -> Result<Self> {
-        within_budget(Self::bring_up(docker, options, host_kp)).await?
+        within(
+            ENGINE_START_BUDGET,
+            Self::bring_up(docker, options, host_kp),
+        )
+        .await?
     }
 
     async fn bring_up(docker: Docker, options: RuntimeOptions, host_kp: &Keypair) -> Result<Self> {
@@ -312,12 +338,12 @@ impl Runtime {
     /// without portman's labels is an error and stays as it is. The bridge
     /// holds the listen port, so no other daemon has a bridge up whose
     /// forwarder this could replace. An ensure that the engine does not
-    /// answer fails when [`ENGINE_BUDGET`] is spent.
+    /// answer fails when [`ENGINE_STEP_BUDGET`] is spent.
     pub async fn ensure_dns_forwarder(
         &self,
         managed_tlds: &BTreeSet<String>,
     ) -> Result<DnsForwarder> {
-        within_budget(self.ensure_forwarder(managed_tlds)).await?
+        within(ENGINE_STEP_BUDGET, self.ensure_forwarder(managed_tlds)).await?
     }
 
     async fn ensure_forwarder(&self, managed_tlds: &BTreeSet<String>) -> Result<DnsForwarder> {
@@ -348,6 +374,9 @@ impl Runtime {
     /// resolving every name that is not portman's.
     /// `portman bridge disable` (user intent) still wants the network
     /// gone; call [`Runtime::shutdown_and_remove_network`] for that.
+    /// The engine has [`ENGINE_STEP_BUDGET`] to remove the setup container.
+    /// On an engine that does not answer in that time the bridge is still
+    /// down when this returns, and the container can still be there.
     pub async fn shutdown(mut self) {
         self.end_tasks().await;
         let container = Leftovers::SetupContainer;
@@ -362,7 +391,9 @@ impl Runtime {
     /// only while a running container is attached, and that is logged. A
     /// stopped container that refers to the network fails to start
     /// afterwards. The return value says whether a later cleanup has
-    /// anything left to try, as [`remove_leftovers`] does.
+    /// anything left to try, as [`remove_leftovers`] does. The engine has
+    /// [`ENGINE_STEP_BUDGET`] for all of it, and a removal that is cut
+    /// there ends owed.
     pub async fn shutdown_and_remove_network(mut self) -> Cleanup {
         self.end_tasks().await;
         let everything = Leftovers::SetupContainerAndNetwork;
@@ -747,7 +778,7 @@ async fn spawn_setup_container(
     }
     // Poll until the setup container is running and has printed `VM_PUBKEY=`,
     // instead of a fixed 2s sleep that slows normal starts and fails under load.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + SETUP_KEY_TIMEOUT;
     loop {
         if let Err(err) = ensure_setup_container_running(docker).await {
             best_effort_remove_setup_container(docker, held).await;
@@ -1359,6 +1390,9 @@ pub enum Cleanup {
 /// bridge listens on: holding any other port shows nothing about a running
 /// bridge. When the port is taken, nothing is removed and the engine is not
 /// asked.
+///
+/// The engine has [`ENGINE_STEP_BUDGET`] for all the removals. A cleanup
+/// that is cut there ends owed.
 pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Leftovers) -> Cleanup {
     let held = match ListenPort::claim(listen_port).await {
         Ok(held) => held,
@@ -1374,15 +1408,13 @@ pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Left
     remove_with_port_held(docker, &held, leftovers).await
 }
 
-/// A cleanup that the engine does not answer ends owed when
-/// [`ENGINE_BUDGET`] is spent.
 async fn remove_with_port_held(
     docker: &Docker,
     held: &ListenPort,
     leftovers: Leftovers,
 ) -> Cleanup {
     let removals = remove_each(docker, held, leftovers);
-    within_budget(removals).await.unwrap_or_else(|error| {
+    within(ENGINE_STEP_BUDGET, removals).await.unwrap_or_else(|error| {
         warn!(
             %error,
             "netbridge cleanup ended early, and what it was to remove can still be in the engine"
@@ -3715,9 +3747,6 @@ destination: 172.18.0.0
 
     /// How long the daemon's client waits for the head of an answer.
     const DAEMONS_CLIENT_LIMIT: Duration = Duration::from_secs(120);
-    /// The longest that one step of the bridge waits for the engine, as the
-    /// README states it.
-    const STATED_BOUND: Duration = Duration::from_secs(30);
 
     #[derive(Debug, Clone, Copy)]
     enum Step {
@@ -3727,7 +3756,7 @@ destination: 172.18.0.0
     }
 
     #[tokio::test(start_paused = true)]
-    async fn each_step_of_a_bridge_on_an_engine_that_froze_ends_at_the_stated_bound() {
+    async fn each_step_of_a_bridge_on_an_engine_that_froze_ends_when_its_budget_is_spent() {
         for step in [Step::Stop, Step::StopForADisable, Step::EnsureTheForwarder] {
             let engine = FakeEngine::start().await;
             let mut bridge = engine.bridge().await;
@@ -3744,12 +3773,25 @@ destination: 172.18.0.0
                 Step::EnsureTheForwarder => {
                     let ensured = bridge.ensure_dns_forwarder(&tlds(&["test"])).await;
                     let said = format!("{:#}", ensured.unwrap_err());
-                    let no_answer = "the container engine gave no answer within 30 s";
+                    let no_answer = "the container engine gave no answer within 20 s";
                     assert!(said.contains(no_answer), "{said}");
                 }
             }
 
-            assert_eq!(asked.elapsed(), STATED_BOUND, "{step:?}");
+            assert_eq!(asked.elapsed(), ENGINE_STEP_BUDGET, "{step:?}");
+        }
+    }
+
+    #[test]
+    fn the_readme_states_the_budgets_that_a_bridge_gives_the_engine() {
+        let readme = include_str!("../../../README.md");
+        let (step, start) = (ENGINE_STEP_BUDGET.as_secs(), ENGINE_START_BUDGET.as_secs());
+        let stated = [
+            format!("waits {step} s for the engine in each step of the bridge, and {start} s in a start"),
+            format!("`the container engine gave no answer within {step} s`"),
+        ];
+        for sentence in stated {
+            assert!(readme.contains(&sentence), "the README lacks: {sentence}");
         }
     }
 
