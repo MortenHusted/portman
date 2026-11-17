@@ -480,7 +480,9 @@ enum Owes {
     NoSession,
     Cleanup {
         leftovers: Leftovers,
-        /// When the session has been open for the [`HEAD_START`].
+        /// When the session has been open for the [`HEAD_START`]. For the
+        /// stop of a running bridge, which holds the listen port, it is
+        /// when the session opened.
         from: Instant,
     },
     /// The session had its cleanup.
@@ -505,7 +507,13 @@ impl Owes {
 
 impl Debt {
     /// `opened` is when the loop saw `session` open.
-    fn owes(&self, session: Option<Session>, opened: Instant, network_owed: bool) -> Owes {
+    fn owes(
+        &self,
+        session: Option<Session>,
+        opened: Instant,
+        network_owed: bool,
+        a_bridge_runs: bool,
+    ) -> Owes {
         match session {
             None => Owes::NoSession,
             Some(session) if self.swept == Some(session) => Owes::Nothing,
@@ -515,7 +523,11 @@ impl Debt {
                 } else {
                     Leftovers::SetupContainer
                 },
-                from: opened + HEAD_START,
+                from: if a_bridge_runs {
+                    opened
+                } else {
+                    opened + HEAD_START
+                },
             },
         }
     }
@@ -724,7 +736,8 @@ async fn converge<E: BridgeEngine>(
         let intent = wanted.intent();
         let built = running.as_ref().map(|r| r.built);
         let now = Instant::now();
-        let owes = debt.owes(session, opened, wanted.saved.cleanup_owed);
+        let network_owed = wanted.saved.cleanup_owed;
+        let owes = debt.owes(session, opened, network_owed, built.is_some());
         handle.publish_cleanup(debt.status(&intent, owes, now), debt.disables);
         publish(
             &handle,
