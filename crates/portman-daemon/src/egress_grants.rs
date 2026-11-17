@@ -292,9 +292,9 @@ mod tests {
         assert!(store.permits("qwen.localhost", "route-v1", &headers()));
         clock.advance(1);
         assert!(!store.permits("qwen.localhost", "route-v1", &headers()));
-        let reloaded = GrantStore::with_clock(path, clock.clone());
-        reloaded.revoke("run-2".into()).unwrap();
-        assert!(issue(&reloaded, "run-2", START + 120).is_err());
+        store.revoke("run-2".into()).unwrap();
+        let reloaded = GrantStore::with_clock(path, clock);
+        assert!(issue_token(&reloaded, "run-2", OTHER_TOKEN, START + 120).is_err());
     }
     #[test]
     fn revoked_grant_is_denied_and_cannot_be_issued_again_before_it_expires() {
