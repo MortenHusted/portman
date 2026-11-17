@@ -74,6 +74,7 @@ docker run -d --name portman-netbridge-dns \
   portman-netbridge/setup:local \
   dns --keep-in-foreground --no-hosts \
   --listen-address=192.168.99.129 --bind-interfaces --strict-order \
+  --log-facility=- \
   --server=/test/192.168.99.1 --server=/test/@vm-resolver@ \
   --server=/host.docker.internal/#
 ```

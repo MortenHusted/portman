@@ -977,7 +977,8 @@ fn docker_removal_already_underway(err: &DockerError) -> bool {
 /// strict order it asks portman first and the VM's resolver second for a
 /// name under a managed TLD, so a name that portman refuses still resolves.
 /// Every other name goes to the resolvers in the VM's `/etc/resolv.conf`,
-/// which dnsmasq reads itself.
+/// which dnsmasq reads itself. It logs to stderr, where `docker logs` finds
+/// what it wrote.
 pub fn dns_forwarder_args(managed_tlds: &BTreeSet<String>) -> Vec<String> {
     let mut args = vec![
         "dns".to_string(),
@@ -986,6 +987,7 @@ pub fn dns_forwarder_args(managed_tlds: &BTreeSet<String>) -> Vec<String> {
         format!("--listen-address={DOCKER_BRIDGE_GATEWAY}"),
         "--bind-interfaces".to_string(),
         "--strict-order".to_string(),
+        "--log-facility=-".to_string(),
     ];
     let forwarded = managed_tlds
         .iter()
@@ -2028,12 +2030,13 @@ destination: 172.18.0.0
         names.iter().map(|name| name.to_string()).collect()
     }
 
-    const DNSMASQ_BASE: [&str; 5] = [
+    const DNSMASQ_BASE: [&str; 6] = [
         "--keep-in-foreground",
         "--no-hosts",
         "--listen-address=192.168.99.129",
         "--bind-interfaces",
         "--strict-order",
+        "--log-facility=-",
     ];
     const TO_THE_VM: &str = "--server=/host.docker.internal/#";
 
