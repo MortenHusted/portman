@@ -994,22 +994,26 @@ impl BridgeEngine for LinkedEngine {
         let listen_port = self.listen_port;
         match runtime::try_remove_leftovers(&docker, listen_port, leftovers).await {
             Ok(ended) => Swept::Ended(ended),
-            Err(err) => {
-                let until = match leftovers {
-                    Leftovers::SetupContainer => "",
-                    Leftovers::SetupContainerAndNetwork => {
-                        ". portman does not ask again until the next `portman bridge disable`"
-                    }
-                };
-                info!(
-                    listen_port,
-                    %err,
-                    "netbridge leftovers stay in the engine: the listen port is taken, and its holder may run a bridge on them{until}"
-                );
-                Swept::PortTaken
-            }
+            Err(err) => unclaimed(listen_port, leftovers, &err),
         }
     }
+}
+
+/// How a cleanup ended whose claim on the listen port failed with `err`. The
+/// engine was not asked.
+fn unclaimed(listen_port: u16, leftovers: Leftovers, err: &std::io::Error) -> Swept {
+    let until = match leftovers {
+        Leftovers::SetupContainer => "",
+        Leftovers::SetupContainerAndNetwork => {
+            ". portman does not ask again until the next `portman bridge disable`"
+        }
+    };
+    info!(
+        listen_port,
+        %err,
+        "netbridge leftovers stay in the engine: the listen port is taken, and its holder may run a bridge on them{until}"
+    );
+    Swept::PortTaken
 }
 
 fn docker_of(link: &watch::Receiver<Link>, wanted: Session) -> Result<Docker> {
