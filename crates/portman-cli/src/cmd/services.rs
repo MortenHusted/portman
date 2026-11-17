@@ -275,6 +275,7 @@ struct RestartReport {
     dependencies: Vec<String>,
     in_backoff: Vec<NotStarted>,
     not_started: Vec<NotStarted>,
+    unconfirmed: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -412,10 +413,7 @@ impl InterruptedServices {
         })
         .await;
         let Some(rows) = rows else {
-            report.fail(
-                known,
-                "the new daemon stopped answering after the start request",
-            );
+            report.unconfirmed = names;
             return report;
         };
         for service in known {
@@ -496,6 +494,14 @@ impl RestartReport {
                 "could not start {name} again: {why}. Run `portman up {name}` in {place}.",
                 name = service.name,
                 place = service.place()
+            ));
+        }
+        if !self.unconfirmed.is_empty() {
+            lines.push(format!(
+                "the new daemon stopped answering after the start request, so the install \
+                 cannot tell whether these services started: {}. \
+                 Run `portman status` when the daemon answers again.",
+                self.unconfirmed.join(", ")
             ));
         }
         lines
@@ -1140,8 +1146,9 @@ mod tests {
         assert_eq!(
             report.lines(),
             [
-                "could not start web again: the new daemon stopped answering after the start \
-                 request. Run `portman up web` in /Users/dev/acme/web."
+                "the new daemon stopped answering after the start request, so the install \
+                 cannot tell whether these services started: web. \
+                 Run `portman status` when the daemon answers again."
             ]
         );
     }
@@ -1186,8 +1193,9 @@ mod tests {
         assert_eq!(
             report.lines(),
             [
-                "could not start web again: the new daemon stopped answering after the start \
-                 request. Run `portman up web` in /Users/dev/acme/web."
+                "the new daemon stopped answering after the start request, so the install \
+                 cannot tell whether these services started: web. \
+                 Run `portman status` when the daemon answers again."
             ]
         );
     }
