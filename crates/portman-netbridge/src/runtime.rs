@@ -2773,6 +2773,45 @@ destination: 172.18.0.0
         assert_eq!(engine.asked_for(), [] as [&str; 0]);
     }
 
+    /// Stands in for the utun device, which the pump tasks hold and close
+    /// when they end. It keeps whether the bridge claimed the utun then.
+    struct Device {
+        utun: &'static str,
+        claimed_at_close: Shared<Option<bool>>,
+    }
+
+    impl Drop for Device {
+        fn drop(&mut self) {
+            *self.claimed_at_close.lock().unwrap() = Some(is_own_utun(self.utun));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bridge_that_ends_lets_go_of_its_utun_before_it_closes_the_device() {
+        let utun = "utun-of-a-bridge-that-ends";
+        let claimed_at_close = Shared::<Option<bool>>::default();
+        let device = Device {
+            utun,
+            claimed_at_close: claimed_at_close.clone(),
+        };
+        let engine = FakeEngine::start().await;
+        let mut bridge = engine.bridge().await;
+        bridge.utun_name = utun.to_string();
+        remember_own_utun(utun);
+        bridge.tasks = vec![tokio::spawn(async move {
+            let _device = device;
+            std::future::pending::<()>().await
+        })];
+
+        bridge.abandon().await;
+
+        assert_eq!(
+            *claimed_at_close.lock().unwrap(),
+            Some(false),
+            "the bridge claimed the utun when its device closed"
+        );
+    }
+
     #[derive(Clone, Default)]
     struct Logged(Shared<Vec<u8>>);
 
