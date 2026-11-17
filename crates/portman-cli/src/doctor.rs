@@ -346,7 +346,7 @@ async fn dns_forwarder_status(phase: Option<BridgePhase>, routes: &[Entry]) -> D
         async { printed(docker_stdout(&container).await) },
         async {
             match forwarder_query_name(phase, routes) {
-                Ok(name) => look_up_through_forwarder(name),
+                Ok(name) => look_up_through_forwarder(&["docker"], name, LOOKUP_BOUND).await,
                 Err(why) => ForwarderQuery::NotSent { why },
             }
         },
@@ -443,26 +443,53 @@ fn targets_the_portman_network(target: &str) -> bool {
 /// the forwarder as its only resolver, as a container started with `--dns
 /// 192.168.99.129` has. The container is the setup image's `getent`, and
 /// the engine removes it when the lookup ends. The resolver options set
-/// one attempt with a timeout of 2 s, so that a lookup with no answer ends.
-fn look_up_through_forwarder(name: String) -> ForwarderQuery {
+/// one attempt with a timeout of [`LOOKUP_RESOLVER_SECS`], so that a lookup
+/// with no answer ends.
+///
+/// `docker` is the command that stands for the `docker` CLI. A run that has
+/// not ended after `bound` is killed. The engine can then still hold the
+/// container, and never removes one that it created and did not start, so
+/// the container has a name and is removed by it.
+async fn look_up_through_forwarder(
+    docker: &[&str],
+    name: String,
+    bound: Duration,
+) -> ForwarderQuery {
     let forwarder = DNS_FORWARDER_IP.to_string();
-    let ran = StdCommand::new("docker")
-        .args(["run", "--rm", "--dns", &forwarder])
-        .args(["--dns-opt", "timeout:2", "--dns-opt", "attempts:1"])
-        .args(["--entrypoint", "getent", SETUP_IMAGE, "hosts", &name])
-        .output();
-    match ran {
-        Ok(ran) => forwarder_query(
-            name,
-            ran.status.success(),
-            &String::from_utf8_lossy(&ran.stdout),
-            &String::from_utf8_lossy(&ran.stderr),
-        ),
-        Err(err) => ForwarderQuery::Unanswered {
-            name,
-            detail: err.to_string(),
-        },
-    }
+    let container = format!("portman-doctor-lookup-{}", std::process::id());
+    let resolver_wait = format!("timeout:{LOOKUP_RESOLVER_SECS}");
+    let (program, first_args) = docker.split_first().expect("a command has a program");
+    let run = [
+        first_args,
+        &["run", "--rm", "--name", &container, "--dns", &forwarder],
+        &["--dns-opt", &resolver_wait, "--dns-opt", "attempts:1"],
+        &["--entrypoint", "getent", SETUP_IMAGE, "hosts", &name],
+    ]
+    .concat();
+    let detail = match bounded_output(program, &run, bound).await {
+        Ok(ran) => {
+            return forwarder_query(
+                name,
+                ran.status.success(),
+                &String::from_utf8_lossy(&ran.stdout),
+                &String::from_utf8_lossy(&ran.stderr),
+            )
+        }
+        Err(DockerCliError::NoAnswer(no_answer)) => {
+            let remove = [first_args, &["rm", "--force", &container]].concat();
+            match run_docker(program, &remove, DOCKER_CLI_BOUND).await {
+                Ok(_) => no_answer,
+                Err(DockerCliError::Failed(gone)) if gone.contains("No such container") => {
+                    no_answer
+                }
+                Err(_) => format!(
+                    "{no_answer}; the lookup container can still exist, `docker rm --force {container}` removes it"
+                ),
+            }
+        }
+        Err(error) => error.to_string(),
+    };
+    ForwarderQuery::Unanswered { name, detail }
 }
 
 /// What the lookup container's exit and output say. `getent` prints nothing
@@ -1015,14 +1042,25 @@ const NO_ENGINE: [&str; 3] = [
     "error during connect",
 ];
 
+/// How long the resolver of the lookup container waits for the forwarder.
+const LOOKUP_RESOLVER_SECS: u64 = 2;
+
+/// How long the lookup container has to end. `docker run` makes the engine
+/// create and start the container, the resolver in it waits for up to
+/// [`LOOKUP_RESOLVER_SECS`], and the engine then removes the container. The
+/// engine gets [`DOCKER_CLI_BOUND`] before the lookup and again after it, as
+/// it gets for any other call: 3 s, 2 s and 3 s.
+const LOOKUP_BOUND: Duration =
+    Duration::from_secs(2 * DOCKER_CLI_BOUND.as_secs() + LOOKUP_RESOLVER_SECS);
+
 /// Runs `program`, and kills it when it has not ended after `bound`. The
 /// `docker` CLI itself waits for minutes on a socket that accepts a
 /// connection and never answers.
-async fn run_docker(
+async fn bounded_output(
     program: &str,
     args: &[&str],
     bound: Duration,
-) -> Result<String, DockerCliError> {
+) -> Result<std::process::Output, DockerCliError> {
     let child = tokio::process::Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -1031,14 +1069,24 @@ async fn run_docker(
         .kill_on_drop(true)
         .spawn()
         .map_err(|err| DockerCliError::NotStarted(err.to_string()))?;
-    let output = match tokio::time::timeout(bound, child.wait_with_output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(err)) => return Err(DockerCliError::Failed(err.to_string())),
+    match tokio::time::timeout(bound, child.wait_with_output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(err)) => Err(DockerCliError::Failed(err.to_string())),
         Err(_) => {
             let waited = bound.as_secs_f32();
-            return Err(DockerCliError::NoAnswer(format!("no answer in {waited} s")));
+            Err(DockerCliError::NoAnswer(format!("no answer in {waited} s")))
         }
-    };
+    }
+}
+
+/// [`bounded_output`], with a call that failed sorted by whether an engine
+/// answered it.
+async fn run_docker(
+    program: &str,
+    args: &[&str],
+    bound: Duration,
+) -> Result<String, DockerCliError> {
+    let output = bounded_output(program, args, bound).await?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
     }
@@ -1652,6 +1700,74 @@ mod tests {
                 forwarder_query(name(), succeeded, stdout, stderr),
                 want,
                 "succeeded={succeeded} stdout={stdout:?} stderr={stderr:?}"
+            );
+        }
+    }
+
+    /// Runs the lookup against a script that stands for `docker`. The script
+    /// gets the CLI's arguments as `$@`. Returns the query and the argument
+    /// line of each call that the script got.
+    async fn look_up_with(script: &str, bound: Duration) -> (ForwarderQuery, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        let script = format!("echo \"$*\" >> '{}'\n{script}", calls.display());
+        let docker = ["sh", "-c", &script, "docker"];
+
+        let query = look_up_through_forwarder(&docker, "web.demo.test".to_string(), bound).await;
+
+        let calls = std::fs::read_to_string(calls).unwrap();
+        (query, calls.lines().map(String::from).collect())
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_does_not_end_is_killed_and_its_container_is_removed() {
+        let container = format!("portman-doctor-lookup-{}", std::process::id());
+        let hangs_then = |rm: &str| format!("case $1 in run) exec sleep 2;; rm) {rm};; esac");
+        let no_engine = "echo 'Cannot connect to the Docker daemon' >&2; exit 1";
+        let gone = "echo 'Error response from daemon: No such container' >&2; exit 1";
+        let left = format!(
+            "no answer in 0.1 s; the lookup container can still exist, `docker rm --force {container}` removes it"
+        );
+        // how `docker rm` ends → what doctor says about the lookup
+        let table = [
+            ("exit 0", "no answer in 0.1 s"),
+            (gone, "no answer in 0.1 s"),
+            (no_engine, left.as_str()),
+        ];
+        for (rm, detail) in table {
+            let (query, calls) = look_up_with(&hangs_then(rm), Duration::from_millis(100)).await;
+
+            let unanswered = ForwarderQuery::Unanswered {
+                name: "web.demo.test".to_string(),
+                detail: detail.to_string(),
+            };
+            assert_eq!(query, unanswered, "{rm}");
+            assert_eq!(calls.len(), 2, "{calls:?}");
+            let named = format!("run --rm --name {container} --dns 192.168.99.129 ");
+            assert!(calls[0].starts_with(&named), "{calls:?}");
+            assert_eq!(calls[1], format!("rm --force {container}"), "{rm}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_ends_in_time_removes_nothing() {
+        let found = "echo '192.168.99.1  web.demo.test'";
+        let unanswered = ForwarderQuery::Unanswered {
+            name: "web.demo.test".to_string(),
+            detail: "getent found no address".to_string(),
+        };
+        // how `docker run` ends → the query
+        let table = [(found, answered()), ("exit 2", unanswered)];
+        for (run, want) in table {
+            let (query, calls) = look_up_with(run, Duration::from_secs(60)).await;
+
+            assert_eq!(query, want, "{run}");
+            assert_eq!(calls.len(), 1, "{calls:?}");
+            assert!(
+                calls[0].ends_with(
+                    "--dns-opt timeout:2 --dns-opt attempts:1 --entrypoint getent portman-netbridge/setup:local hosts web.demo.test"
+                ),
+                "{calls:?}"
             );
         }
     }
