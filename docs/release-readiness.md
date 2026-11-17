@@ -158,7 +158,8 @@ the compose line `dns: [192.168.99.129]`.
   `portman` network, also when the engine then keeps a network that is in
   use. A forwarder that could not be removed beside such a network stays
   until the next disable. With no engine reachable at the disable, the daemon
-  removes both in the next Docker session, unless the daemon restarts first.
+  removes both in the next Docker session, also when the daemon restarted in
+  between.
 - `portman uninstall` removes the setup container, the forwarder and the
   network by the same rules, and leaves the saved bridge state as it is. It
   removes the plist and the daemon's binary first and waits up to 30 s for
