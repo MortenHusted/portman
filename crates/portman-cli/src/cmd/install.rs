@@ -140,12 +140,12 @@ pub(crate) async fn cmd_install_linux() -> Result<()> {
     eprintln!("writing {} (sudo required)", DAEMON_UNIT_PATH);
     sudo_write(std::path::Path::new(DAEMON_UNIT_PATH), &unit)?;
 
-    let interrupted = InterruptedServices::record().await;
     eprintln!("enabling systemd service…");
     run_sudo(&["systemctl", "daemon-reload"])?;
     run_sudo(&["systemctl", "enable", "--now", "portman-daemon"])?;
     // `enable --now` is a no-op when the unit is already active — an
     // upgrade must actually swap onto the new binary.
+    let interrupted = InterruptedServices::record().await;
     run_sudo(&["systemctl", "restart", "portman-daemon"])
         .inspect_err(|_| interrupted.say_how_to_start())?;
     interrupted.restore().await;
