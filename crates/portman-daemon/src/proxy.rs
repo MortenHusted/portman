@@ -1620,7 +1620,6 @@ mod tests {
                 host,
                 &crate::egress_grants::route_identity(target, spec),
                 headers,
-                crate::now_unix_ms() / 1000,
             )
         }
         async fn resolve(&self, _: &portman_protocol::EgressSpec) -> Option<String> {
