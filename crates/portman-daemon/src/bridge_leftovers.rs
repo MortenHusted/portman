@@ -17,7 +17,7 @@ use portman_netbridge::runtime::{
 };
 use portman_netbridge::tunnel::HOST_WG_LISTEN_PORT;
 
-use crate::engine::{self, Sockets};
+use crate::engine::{self, Absent, Sockets};
 
 /// How the removal of a bridge's leftovers ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +29,7 @@ pub enum BridgeLeftovers {
     /// The engine at `socket` can still hold them. Another process holds
     /// the listen port, or a removal failed.
     Owed { socket: PathBuf },
-    /// No engine answered. `reason` says why.
+    /// No engine answered. `reason` says where the removal looked.
     NoEngine { reason: String },
 }
 
@@ -64,9 +64,9 @@ async fn remove_from(
 ) -> BridgeLeftovers {
     let found = match engine::connect(sockets, open).await {
         Ok(found) => found,
-        Err(reason) => {
+        Err(absent) => {
             return BridgeLeftovers::NoEngine {
-                reason: reason.to_string(),
+                reason: where_no_engine_answered(absent),
             }
         }
     };
@@ -80,6 +80,18 @@ async fn remove_from(
     {
         Cleanup::Complete => BridgeLeftovers::NoneLeft { socket },
         Cleanup::Owed => BridgeLeftovers::Owed { socket },
+    }
+}
+
+/// [`Absent`] in its own words tells the user which daemon setting to
+/// change. An uninstall reads none of them, so it says only where it looked.
+fn where_no_engine_answered(absent: Absent) -> String {
+    match absent {
+        Absent::Unreachable { socket, error } => {
+            format!("no answer on {}: {error}", socket.display())
+        }
+        Absent::NoSocketAt(socket) => format!("no docker socket at {}", socket.display()),
+        Absent::NoSocket | Absent::Idle => "no docker socket found".to_string(),
     }
 }
 
