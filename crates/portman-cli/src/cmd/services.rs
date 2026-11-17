@@ -534,6 +534,7 @@ fn why_not_ready(row: &ServiceStatusInfo) -> String {
     }
 }
 
+/// The answer to the last status request, or `None` when that request got none.
 async fn poll_services<F, Fut>(
     send: &mut F,
     limit: Duration,
@@ -544,18 +545,17 @@ where
     Fut: Future<Output = Result<Response>>,
 {
     let deadline = Instant::now() + limit;
-    let mut last = None;
     loop {
         let answer = timeout_at(deadline, send(Request::ServiceStatus)).await;
-        if let Ok(Ok(Response::ServiceStatuses { services })) = answer {
-            let finished = done(&services);
-            last = Some(services);
-            if finished {
-                return last;
-            }
-        }
-        if Instant::now() >= deadline {
-            return last;
+        let rows = match answer {
+            Ok(Ok(Response::ServiceStatuses { services })) => Some(services),
+            _ => None,
+        };
+        // A request after this pause must have one more pause before the
+        // limit, or a daemon that answers could miss it.
+        let no_time_for_another = Instant::now() + POLL_PAUSE * 2 > deadline;
+        if rows.as_deref().is_some_and(&done) || no_time_for_another {
+            return rows;
         }
         sleep(POLL_PAUSE).await;
     }
