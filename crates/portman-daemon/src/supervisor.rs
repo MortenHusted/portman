@@ -2769,22 +2769,33 @@ mod tests {
         }
     }
 
-    /// A port no other test in this binary will hand out.
+    /// A port no other test will hand out, in this binary or in another copy
+    /// of it that runs at the same time.
     ///
     /// Bind-then-release alone is a race: tests run in parallel, and between
     /// releasing here and the service binding it, another test's kernel-chosen
     /// ephemeral port can land on the same number — the service then exits 1
     /// ("address in use") and a reconciliation/readiness test flakes. Marching
     /// a process-wide counter through a range the kernel doesn't allocate from
-    /// makes same-binary collisions impossible; the bind check still guards
-    /// against ports held by other processes.
+    /// makes same-binary collisions impossible.
+    ///
+    /// Every copy of this binary marches through the same range, so two gate
+    /// runs at once would hand out the same numbers. The UDP socket on the
+    /// same number is the claim that the other copy sees: it leaves the TCP
+    /// port free for the test and lasts until this process exits. The TCP
+    /// bind check still guards against a port that an unrelated process holds.
     fn free_port() -> u16 {
         use std::sync::atomic::{AtomicU16, Ordering};
         static NEXT: AtomicU16 = AtomicU16::new(24_000);
+        static CLAIMS: Mutex<Vec<std::net::UdpSocket>> = Mutex::new(Vec::new());
         loop {
             let candidate = NEXT.fetch_add(1, Ordering::Relaxed);
             assert!(candidate < 32_000, "test port range exhausted");
+            let Ok(claim) = std::net::UdpSocket::bind(("127.0.0.1", candidate)) else {
+                continue;
+            };
             if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+                CLAIMS.lock().unwrap().push(claim);
                 return candidate;
             }
         }
