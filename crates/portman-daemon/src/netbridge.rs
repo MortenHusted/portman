@@ -46,8 +46,10 @@
 //!     taken ends the debt as a network in use does: the holder may run a
 //!     bridge on the forwarder and the network, and a debt that waited for
 //!     the port would be paid the first time the port is free for a
-//!     moment. The debt is saved in `netbridge.json` with the flag, so a
-//!     daemon that restarts still owes it. An `Enable` ends it.
+//!     moment. A claim on the port that fails for any other reason says
+//!     nothing about a bridge, and the debt stays owed. The debt is saved
+//!     in `netbridge.json` with the flag, so a daemon that restarts still
+//!     owes it. An `Enable` ends it.
 //!   - a failed start is retried with a growing delay. The wait does not
 //!     hold up control messages, and a new session starts the delay over.
 //!   - a bridge that is up gets the DNS forwarder in the VM: the loop makes
@@ -502,6 +504,9 @@ pub(crate) enum Swept {
     /// not asked. Another daemon's bridge holds that port, and so can a
     /// process that is not portman.
     PortTaken,
+    /// The claim on that port failed for another reason, which says nothing
+    /// about a bridge, so the engine was not asked.
+    ClaimFailed,
     /// Another session existed at the call, so the engine was not asked.
     SessionEnded,
 }
@@ -514,7 +519,9 @@ impl Swept {
     fn ends_the_debt(self) -> bool {
         match self {
             Swept::Ended(CleanupEnd::Complete) | Swept::PortTaken => true,
-            Swept::Ended(CleanupEnd::Failed | CleanupEnd::NoAnswer) | Swept::SessionEnded => false,
+            Swept::Ended(CleanupEnd::Failed | CleanupEnd::NoAnswer)
+            | Swept::ClaimFailed
+            | Swept::SessionEnded => false,
         }
     }
 
@@ -524,7 +531,7 @@ impl Swept {
     fn holds(self) -> Option<BridgeCleanup> {
         match self {
             Swept::Ended(CleanupEnd::Complete) | Swept::SessionEnded => None,
-            Swept::Ended(CleanupEnd::Failed) => Some(BridgeCleanup::Failed),
+            Swept::Ended(CleanupEnd::Failed) | Swept::ClaimFailed => Some(BridgeCleanup::Failed),
             Swept::Ended(CleanupEnd::NoAnswer) => Some(BridgeCleanup::NoAnswer {
                 within_secs: runtime::ENGINE_STEP_BUDGET.as_secs(),
             }),
@@ -900,8 +907,8 @@ pub(crate) trait BridgeEngine {
 
     /// Removes `leftovers` that carry portman's label from the engine of
     /// `session`, and says how that ended. Does nothing when another
-    /// session exists at the call, or when the UDP port that a bridge
-    /// listens on is taken.
+    /// session exists at the call, or when it does not get the UDP port
+    /// that a bridge listens on.
     async fn remove_leftovers(&self, session: Session, leftovers: Leftovers) -> Swept;
 }
 
@@ -1000,8 +1007,17 @@ impl BridgeEngine for LinkedEngine {
 }
 
 /// How a cleanup ended whose claim on the listen port failed with `err`. The
-/// engine was not asked.
+/// engine was not asked. Only an address in use says that the port has a
+/// holder.
 fn unclaimed(listen_port: u16, leftovers: Leftovers, err: &std::io::Error) -> Swept {
+    if err.kind() != std::io::ErrorKind::AddrInUse {
+        warn!(
+            listen_port,
+            %err,
+            "netbridge leftovers stay in the engine: the claim on the listen port failed. portman tries again at the next docker session"
+        );
+        return Swept::ClaimFailed;
+    }
     let until = match leftovers {
         Leftovers::SetupContainer => "",
         Leftovers::SetupContainerAndNetwork => {

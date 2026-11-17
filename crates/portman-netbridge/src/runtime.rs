@@ -1430,9 +1430,9 @@ pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Left
 }
 
 /// As [`remove_leftovers`], for a caller that acts on why a cleanup did not
-/// finish. The error is that of the claim on `listen_port`: the port is
-/// taken, nothing was removed and the engine was not asked. This function
-/// does not log it.
+/// finish. The error is that of the claim on `listen_port`: nothing was
+/// removed and the engine was not asked. Only an address in use says that
+/// the port is taken. This function does not log the error.
 pub async fn try_remove_leftovers(
     docker: &Docker,
     listen_port: u16,
