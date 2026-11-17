@@ -1024,14 +1024,6 @@ fn render_status_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
         // whenever we have a Status response. Netbridge health is a separate
         // concern and gets its own colored word on the netbridge line, so a
         // flapped bridge no longer makes portman itself look degraded.
-        let (bridge_color, bridge_word) = match s.bridge_assessment.as_str() {
-            "healthy" => (Color::Green, "healthy"),
-            "routes_missing" => (Color::Yellow, "flapped"),
-            // Red, not yellow: the route looks fine and nothing works.
-            "tunnel_dead" => (Color::Red, "dead tunnel"),
-            "offline" => (Color::Yellow, "docker down"),
-            _ => (Color::DarkGray, "unknown"),
-        };
         let ports = Line::from(vec![
             Span::styled("  dns  ", Style::default().fg(Color::Gray)),
             Span::styled(s.dns_port.to_string(), Style::default().bold()),
@@ -1059,24 +1051,7 @@ fn render_status_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
             )),
             third,
             fourth,
-            Line::from(vec![
-                Span::styled("  netbridge ", Style::default().fg(Color::Gray)),
-                Span::styled(
-                    s.bridge_phase.display_word(),
-                    Style::default()
-                        .fg(match s.bridge_phase {
-                            BridgePhase::Up => Color::Green,
-                            BridgePhase::Disabled => Color::Gray,
-                            _ => Color::Yellow,
-                        })
-                        .bold(),
-                ),
-                Span::styled(
-                    format!("  {}  ", NetbridgeMode::display_word(s.bridge_mode)),
-                    Style::default().fg(Color::Gray),
-                ),
-                Span::styled(bridge_word, Style::default().fg(bridge_color)),
-            ]),
+            bridge_row(s, inner.width),
             Line::from(Span::styled(
                 if bridge_toggle_disables(s.bridge_phase) {
                     "  [b] disable..."
@@ -1104,6 +1079,55 @@ fn render_status_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
         ]
     };
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The bridge row of the status panel: the phase, the mode and the health.
+/// A row too narrow for all three leaves the mode out, then the health and
+/// not the mode, then both. A row too narrow for the phase shows `waiting`
+/// for a bridge that waits for Docker, which the engine row above names.
+fn bridge_row(status: &StatusSnapshot, width: u16) -> Line<'static> {
+    let phase_style = Style::default()
+        .fg(match status.bridge_phase {
+            BridgePhase::Up => Color::Green,
+            BridgePhase::Disabled => Color::Gray,
+            _ => Color::Yellow,
+        })
+        .bold();
+    let (health_color, health) = match status.bridge_assessment.as_str() {
+        "healthy" => (Color::Green, "  healthy"),
+        "routes_missing" => (Color::Yellow, "  flapped"),
+        // Red, not yellow: the route looks fine and nothing works.
+        "tunnel_dead" => (Color::Red, "  dead tunnel"),
+        "offline" => (Color::Yellow, "  docker down"),
+        _ => (Color::DarkGray, "  unknown"),
+    };
+    let label = Span::styled("  netbridge ", Style::default().fg(Color::Gray));
+    let phase = Span::styled(status.bridge_phase.display_word(), phase_style);
+    let short_phase = match status.bridge_phase {
+        BridgePhase::WaitingForDocker => Span::styled("waiting", phase_style),
+        _ => phase.clone(),
+    };
+    let mode = Span::styled(
+        format!("  {}", NetbridgeMode::display_word(status.bridge_mode)),
+        Style::default().fg(Color::Gray),
+    );
+    let health = Span::styled(health, Style::default().fg(health_color));
+
+    let fullest_first = [
+        vec![phase.clone(), mode.clone(), health.clone()],
+        vec![phase.clone(), health],
+        vec![phase.clone(), mode],
+        vec![phase],
+    ];
+    let fits = |row: &Vec<Span<'static>>| {
+        let columns: usize = row.iter().map(|span| span.content.len()).sum();
+        label.content.len() + columns <= usize::from(width)
+    };
+    let row = fullest_first
+        .into_iter()
+        .find(fits)
+        .unwrap_or_else(|| vec![short_phase]);
+    Line::from([vec![label], row].concat())
 }
 
 /// The engine row of the status panel. The engine version, or the reason
@@ -2385,7 +2409,7 @@ mod tests {
         ];
         for (phase, hint) in table {
             let rows = status_rows(phase);
-            let bridge = format!("  netbridge {}  opt-in  ", phase.display_word());
+            let bridge = format!("  netbridge {}  ", phase.display_word());
             assert!(
                 rows.iter().any(|row| row.contains(&bridge)),
                 "phase={phase:?}\n{rows:#?}"
