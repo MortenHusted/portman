@@ -807,8 +807,11 @@ mod tests {
         services: Vec<ServiceStatusInfo>,
         ends: std::collections::HashMap<String, (ServiceState, String)>,
         depends: std::collections::HashMap<String, Vec<String>>,
+        courses: std::collections::HashMap<String, std::collections::VecDeque<Step>>,
         start_requests: Vec<Vec<String>>,
     }
+
+    type Step = (ServiceState, u32, &'static str);
 
     impl NewDaemon {
         fn holding(names: &[&str]) -> Self {
@@ -821,10 +824,36 @@ mod tests {
             }
         }
 
+        fn after_the_start_request<const N: usize>(&mut self, name: &str, steps: [Step; N]) {
+            self.courses.insert(name.into(), steps.into());
+        }
+
+        fn take_one_step(&mut self) {
+            for row in &mut self.services {
+                let Some(course) = self.courses.get_mut(&row.name) else {
+                    continue;
+                };
+                let last_step_stays = course.len() == 1;
+                let step = if last_step_stays {
+                    course.front().copied()
+                } else {
+                    course.pop_front()
+                };
+                if let Some((state, restarts, detail)) = step {
+                    row.state = state;
+                    row.restarts = restarts;
+                    row.detail = detail.into();
+                }
+            }
+        }
+
         fn answer(&mut self, request: Request) -> Result<Response> {
             if self.refused_connections > 0 {
                 self.refused_connections -= 1;
                 bail!("connection refused");
+            }
+            if matches!(request, Request::ServiceStatus) && !self.start_requests.is_empty() {
+                self.take_one_step();
             }
             if let Request::ServiceUp { names } = request {
                 let dependencies = names.iter().filter_map(|name| self.depends.get(name));
@@ -941,14 +970,73 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_service_whose_first_start_fails_is_named_at_once_while_the_daemon_keeps_trying() {
+    async fn a_service_that_is_ready_on_its_second_attempt_is_started_again() {
         let mut daemon = NewDaemon::holding(&["jobs", "web"]);
-        daemon.ends.insert(
-            "web".into(),
-            (
-                ServiceState::Backoff,
-                "port 3000 is taken; restarting in 1000ms".into(),
-            ),
+        daemon.after_the_start_request(
+            "web",
+            [
+                (
+                    ServiceState::Backoff,
+                    1,
+                    "port 3000 is taken; restarting in 500ms",
+                ),
+                (ServiceState::Starting, 1, ""),
+                (ServiceState::Ready, 1, ""),
+            ],
+        );
+
+        let report = restore(
+            InterruptedServices(vec![up("web"), up("jobs")]),
+            &mut daemon,
+        )
+        .await;
+
+        assert_eq!(report.lines(), ["started again: web, jobs"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_service_that_fails_for_good_on_its_second_attempt_is_named_as_failed() {
+        let mut daemon = NewDaemon::holding(&["web"]);
+        daemon.after_the_start_request(
+            "web",
+            [
+                (
+                    ServiceState::Backoff,
+                    1,
+                    "exited with status 1; restarting in 500ms",
+                ),
+                (ServiceState::Starting, 1, ""),
+                (ServiceState::Failed, 1, "exited with status 1"),
+            ],
+        );
+
+        let report = restore(InterruptedServices(vec![up("web")]), &mut daemon).await;
+
+        assert_eq!(
+            report.lines(),
+            ["could not start web again: failed (exited with status 1). \
+              Run `portman up web` in /Users/dev/acme/web."]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_service_that_fails_twice_is_named_while_the_daemon_keeps_trying() {
+        let mut daemon = NewDaemon::holding(&["jobs", "web"]);
+        daemon.after_the_start_request(
+            "web",
+            [
+                (
+                    ServiceState::Backoff,
+                    1,
+                    "port 3000 is taken; restarting in 500ms",
+                ),
+                (ServiceState::Starting, 1, ""),
+                (
+                    ServiceState::Backoff,
+                    2,
+                    "port 3000 is taken; restarting in 1000ms",
+                ),
+            ],
         );
         let began = Instant::now();
 
