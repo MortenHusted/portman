@@ -263,6 +263,12 @@ const POLL_PAUSE: Duration = Duration::from_millis(300);
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct InterruptedServices(Vec<UpService>);
 
+#[derive(Debug, PartialEq, Eq)]
+enum Recorded {
+    Services(InterruptedServices),
+    NoAnswerInTime,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UpService {
     name: String,
@@ -295,7 +301,7 @@ impl UpService {
 
 impl InterruptedServices {
     pub(crate) async fn record() -> Self {
-        let Some(recorded) = Self::record_from(request).await else {
+        let Recorded::Services(recorded) = Self::record_from(request).await else {
             eprintln!(
                 "the daemon gave no answer within 3s, so the install cannot name the services \
                  that are up. They stop with the daemon. Start each one again with `portman up` \
@@ -312,18 +318,18 @@ impl InterruptedServices {
         recorded
     }
 
-    async fn record_from<F, Fut>(mut send: F) -> Option<Self>
+    async fn record_from<F, Fut>(mut send: F) -> Recorded
     where
         F: FnMut(Request) -> Fut,
         Fut: Future<Output = Result<Response>>,
     {
-        let answer = timeout(RECORD_LIMIT, send(Request::ServiceStatus))
-            .await
-            .ok()?;
-        let Ok(Response::ServiceStatuses { services }) = answer else {
-            return Some(Self(Vec::new()));
+        let Ok(answer) = timeout(RECORD_LIMIT, send(Request::ServiceStatus)).await else {
+            return Recorded::NoAnswerInTime;
         };
-        Some(Self(
+        let Ok(Response::ServiceStatuses { services }) = answer else {
+            return Recorded::Services(Self(Vec::new()));
+        };
+        Recorded::Services(Self(
             services
                 .into_iter()
                 .filter(is_up)
@@ -863,7 +869,7 @@ mod tests {
 
         assert_eq!(
             recorded,
-            Some(InterruptedServices(vec![up("web"), up("jobs")]))
+            Recorded::Services(InterruptedServices(vec![up("web"), up("jobs")]))
         );
     }
 
@@ -872,8 +878,10 @@ mod tests {
         let recorded = InterruptedServices::record_from(|_| {
             std::future::ready(Err(anyhow::anyhow!("no daemon socket")))
         })
-        .await
-        .expect("a refused connection is an answer");
+        .await;
+        let Recorded::Services(recorded) = recorded else {
+            panic!("a refused connection is an answer");
+        };
         assert_eq!(recorded, InterruptedServices(Vec::new()));
 
         let report = recorded
@@ -1065,7 +1073,7 @@ mod tests {
 
         let recorded = returned(InterruptedServices::record_from(no_answer)).await;
 
-        assert_eq!(recorded, None);
+        assert_eq!(recorded, Recorded::NoAnswerInTime);
         assert_took(began, Duration::from_secs(3));
     }
 
