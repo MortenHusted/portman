@@ -2397,6 +2397,125 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_bridge_row_is_never_cut_and_drops_the_mode_then_the_health_then_shortens_the_phase() {
+        use portman_protocol::BridgeAssessment::{Healthy, Offline, RoutesMissing, TunnelDead};
+        use BridgePhase::{Disabled, Starting, Stopping, Up, WaitingForDocker};
+        // (terminal columns, phase, assessment) → the bridge row
+        let table = [
+            (120, Up, Healthy, "  netbridge up  opt-in  healthy"),
+            (120, Up, TunnelDead, "  netbridge up  opt-in  dead tunnel"),
+            (
+                120,
+                Disabled,
+                Offline,
+                "  netbridge disabled  opt-in  docker down",
+            ),
+            (
+                120,
+                Starting,
+                Offline,
+                "  netbridge starting  opt-in  docker down",
+            ),
+            (
+                120,
+                Stopping,
+                Healthy,
+                "  netbridge stopping  opt-in  healthy",
+            ),
+            (
+                120,
+                WaitingForDocker,
+                Offline,
+                "  netbridge waiting for docker  opt-in",
+            ),
+            (100, Up, Healthy, "  netbridge up  opt-in  healthy"),
+            (100, Up, TunnelDead, "  netbridge up  dead tunnel"),
+            (100, Disabled, Offline, "  netbridge disabled  docker down"),
+            (
+                100,
+                WaitingForDocker,
+                Offline,
+                "  netbridge waiting for docker",
+            ),
+            (80, Up, Healthy, "  netbridge up  healthy"),
+            (80, Up, RoutesMissing, "  netbridge up  flapped"),
+            (80, Up, TunnelDead, "  netbridge up  dead tunnel"),
+            (80, Disabled, Offline, "  netbridge disabled"),
+            (80, Starting, Offline, "  netbridge starting"),
+            (80, WaitingForDocker, Offline, "  netbridge waiting"),
+            (60, Up, Healthy, "  netbridge up"),
+            (60, WaitingForDocker, Offline, "  netbridge waiting"),
+        ];
+        for (columns, phase, assessment, row) in table {
+            let mut state = status_state(phase, None);
+            state.status.as_mut().unwrap().bridge_assessment = assessment;
+            let rows = status_panel(columns, &state);
+            let at = format!("columns={columns} phase={phase:?} {assessment:?}\n{rows:#?}");
+            assert_eq!(rows[4].trim_end(), row, "{at}");
+            assert!(row.chars().count() <= rows[4].chars().count(), "{at}");
+        }
+    }
+
+    /// The words inside the border of the modal titled `title`, on a
+    /// terminal of `columns` columns, with one space between two words.
+    fn modal_text(columns: u16, state: &State, title: &str) -> String {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(columns, 40)).unwrap();
+        terminal.draw(|f| view(f, state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String { (0..columns).map(|x| buffer[(x, y)].symbol()).collect() };
+        let top = (0..40)
+            .find(|y| row(*y).contains(title))
+            .unwrap_or_else(|| panic!("no modal titled {title:?}"));
+        let left = (0..columns)
+            .find(|x| buffer[(*x, top)].symbol() == "╭" && buffer[(*x, top + 1)].symbol() == "│")
+            .expect("the modal has a top left corner");
+        let right = (left + 1..columns)
+            .find(|x| buffer[(*x, top)].symbol() == "╮")
+            .expect("the modal has a top right corner");
+        let inside: Vec<String> = (top + 1..40)
+            .take_while(|y| buffer[(left, *y)].symbol() == "│")
+            .map(|y| {
+                (left + 1..right)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let words: Vec<&str> = inside
+            .iter()
+            .flat_map(|row| row.split_whitespace())
+            .collect();
+        words.join(" ")
+    }
+
+    #[test]
+    fn the_disable_confirmation_says_what_a_disable_removes_in_the_words_of_the_cli() {
+        let cli = crate::cmd::bridge::bridge_command_lines(Settled::Reached, false, "disabled");
+        for columns in [120, 80] {
+            let mut state = status_state(BridgePhase::Up, None);
+            state.modal = Modal::ConfirmBridgeDisable;
+
+            let text = modal_text(columns, &state, " confirm netbridge disable ");
+
+            let at = format!("columns={columns}\n{text}");
+            assert!(!text.contains("Containers stay attached"), "{at}");
+            assert!(
+                text.contains(
+                    "The `portman` docker network goes too, unless a running container is \
+                     attached to it."
+                ),
+                "{at}"
+            );
+            for line in &cli[1..] {
+                assert!(text.contains(line.as_str()), "{at}");
+            }
+            assert!(
+                text.ends_with("[y] disable [n] keep running [Esc] cancel"),
+                "{at}"
+            );
+        }
+    }
+
     /// The status bar, on a terminal of `columns` columns.
     fn status_bar(columns: u16, state: &State) -> String {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(columns, 40)).unwrap();
