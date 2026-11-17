@@ -219,6 +219,8 @@ enum Ensured {
     InPlace,
     /// The setup image in the engine cannot run the forwarder.
     ImageWithoutDnsMode,
+    /// The engine starts the right container again and again.
+    Restarting,
     Failed,
 }
 
@@ -605,6 +607,7 @@ async fn forward(
     let ended = match &ensured {
         Ok(DnsForwarder::InPlace) => Ensured::InPlace,
         Ok(DnsForwarder::ImageWithoutDnsMode) => Ensured::ImageWithoutDnsMode,
+        Ok(DnsForwarder::Restarting) => Ensured::Restarting,
         Err(_) => Ensured::Failed,
     };
     let repeats = last.is_some_and(|last| last.ended == ended && last.tlds == tlds);
@@ -616,6 +619,10 @@ async fn forward(
         (Ok(DnsForwarder::ImageWithoutDnsMode), false) => warn!(
             retry_in_secs,
             "dns forwarder unavailable: the netbridge setup image has no dns mode; run `portman bridge prepare`"
+        ),
+        (Ok(DnsForwarder::Restarting), false) => warn!(
+            retry_in_secs,
+            "dns forwarder keeps restarting and is left as it is; `docker logs portman-netbridge-dns` shows why"
         ),
         (Err(err), false) => warn!(%err, retry_in_secs, "dns forwarder not in place"),
         (_, true) => debug!(?ended, "dns forwarder: the same as a minute ago"),
@@ -1225,6 +1232,7 @@ mod tests {
     enum Ensure {
         PutsItInPlace,
         FindsAnImageWithoutTheDnsMode,
+        FindsItRestarting,
         Fails,
     }
 
@@ -1341,6 +1349,7 @@ mod tests {
             match ensure {
                 Ensure::PutsItInPlace => Ok(DnsForwarder::InPlace),
                 Ensure::FindsAnImageWithoutTheDnsMode => Ok(DnsForwarder::ImageWithoutDnsMode),
+                Ensure::FindsItRestarting => Ok(DnsForwarder::Restarting),
                 Ensure::Fails => anyhow::bail!("the engine refused the container"),
             }
         }
@@ -2038,7 +2047,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_forwarder_that_is_not_in_place_leaves_the_bridge_up_and_is_tried_each_minute() {
-        for ensure in [Ensure::FindsAnImageWithoutTheDnsMode, Ensure::Fails] {
+        let not_in_place = [
+            Ensure::FindsAnImageWithoutTheDnsMode,
+            Ensure::FindsItRestarting,
+            Ensure::Fails,
+        ];
+        for ensure in not_in_place {
             let mut rig = Rig::spawn(S1, true, false);
             rig.the_next_ensure(ensure);
             rig.send(Control::Enable).await;
@@ -2066,6 +2080,36 @@ mod tests {
             assert_eq!(in_place.at - forwards[3].at, FORWARDER_RETRY, "{ensure:?}");
             rig.no_forward_follows().await;
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_forwarder_that_keeps_restarting_is_reported_once_and_not_each_minute() {
+        let (logged, _capture) = Logged::capture();
+        let mut rig = Rig::spawn(S1, true, false);
+        rig.the_next_ensure(Ensure::FindsItRestarting);
+        rig.send(Control::Enable).await;
+
+        for _ in 0..3 {
+            rig.next_forward().await;
+        }
+        rig.the_next_ensure(Ensure::PutsItInPlace);
+        rig.next_forward().await;
+        rig.no_forward_follows().await;
+
+        let lines = logged.lines();
+        let about_the_forwarder: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("dns forwarder"))
+            .collect();
+        assert_eq!(about_the_forwarder.len(), 2, "{lines:?}");
+        let (restarting, in_place) = (about_the_forwarder[0], about_the_forwarder[1]);
+        assert!(restarting.contains("WARN"), "{restarting}");
+        assert!(restarting.contains("keeps restarting"), "{restarting}");
+        assert!(
+            restarting.contains("docker logs portman-netbridge-dns"),
+            "{restarting}"
+        );
+        assert!(in_place.contains("in place"), "{in_place}");
     }
 
     #[tokio::test(start_paused = true)]

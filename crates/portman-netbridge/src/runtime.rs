@@ -39,8 +39,8 @@ use bollard::query_parameters::{
     RemoveContainerOptionsBuilder, StartContainerOptions, StopContainerOptionsBuilder,
 };
 use bollard::secret::{
-    ContainerCreateBody, HostConfig, Ipam, IpamConfig, NetworkCreateRequest, RestartPolicy,
-    RestartPolicyNameEnum,
+    ContainerCreateBody, ContainerState, HostConfig, Ipam, IpamConfig, NetworkCreateRequest,
+    RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::Docker;
 use boringtun::noise::TunnResult;
@@ -260,9 +260,12 @@ impl Runtime {
     /// Makes the engine run one DNS forwarder for `managed_tlds`. It creates
     /// the container when the engine has none, and replaces it only when it
     /// does not run, runs another command, or comes from another build of
-    /// the setup image. A container of that name without portman's labels is
-    /// an error and stays as it is. The bridge holds the listen port, so no
-    /// other daemon has a bridge up whose forwarder this could replace.
+    /// the setup image. One that has the wanted command from the current
+    /// image and that the engine starts again and again stays as it is,
+    /// because a new one would end the same way. A container of that name
+    /// without portman's labels is an error and stays as it is. The bridge
+    /// holds the listen port, so no other daemon has a bridge up whose
+    /// forwarder this could replace.
     pub async fn ensure_dns_forwarder(
         &self,
         managed_tlds: &BTreeSet<String>,
@@ -275,6 +278,7 @@ impl Runtime {
         let found = dns_forwarder_snapshot(&self.docker).await?;
         match forwarder_step(found.as_ref(), &image, &cmd) {
             ForwarderStep::Keep => return Ok(DnsForwarder::InPlace),
+            ForwarderStep::LeaveRestarting => return Ok(DnsForwarder::Restarting),
             ForwarderStep::Foreign => anyhow::bail!(
                 "docker container `{DNS_CONTAINER}` already exists but is not managed by portman"
             ),
@@ -1012,6 +1016,11 @@ pub enum DnsForwarder {
     /// The engine has no setup image whose entrypoint has the `dns` mode.
     /// `portman bridge prepare` builds one. Nothing was created or removed.
     ImageWithoutDnsMode,
+    /// The engine holds the forwarder container with the wanted command,
+    /// from the current setup image, and starts it again and again. Nothing
+    /// was created or removed. `docker logs` of [`DNS_CONTAINER`] shows why
+    /// dnsmasq ends.
+    Restarting,
 }
 
 /// The id of the setup image, when the engine has one with the `dns` mode.
@@ -1044,12 +1053,36 @@ struct ForwarderSnapshot {
     id: String,
     labels: HashMap<String, String>,
     cmd: Vec<String>,
-    running: bool,
+    state: ForwarderState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwarderState {
+    Running,
+    /// The process ended and the restart policy starts it again.
+    Restarting,
+    Stopped,
+}
+
+/// The engine reports a container that it restarts as running too, so
+/// `Restarting` is asked about first.
+fn forwarder_state(state: Option<ContainerState>) -> ForwarderState {
+    let state = state.unwrap_or_default();
+    if state.restarting == Some(true) {
+        ForwarderState::Restarting
+    } else if state.running == Some(true) {
+        ForwarderState::Running
+    } else {
+        ForwarderState::Stopped
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum ForwarderStep {
     Keep,
+    /// The container is the one to run, and it does not stay up. A new one
+    /// from the same image with the same command would end the same way.
+    LeaveRestarting,
     Create,
     Replace,
     /// Something else owns the name. It is not portman's to remove.
@@ -1066,10 +1099,11 @@ fn forwarder_step(found: Option<&ForwarderSnapshot>, image: &str, cmd: &[String]
         return ForwarderStep::Foreign;
     }
     let from_this_image = found.labels.get(DNS_FROM_IMAGE_LABEL).map(String::as_str) == Some(image);
-    if found.running && from_this_image && found.cmd == cmd {
-        ForwarderStep::Keep
-    } else {
-        ForwarderStep::Replace
+    let is_the_one_to_run = from_this_image && found.cmd == cmd;
+    match found.state {
+        ForwarderState::Running if is_the_one_to_run => ForwarderStep::Keep,
+        ForwarderState::Restarting if is_the_one_to_run => ForwarderStep::LeaveRestarting,
+        _ => ForwarderStep::Replace,
     }
 }
 
@@ -1087,7 +1121,7 @@ async fn dns_forwarder_snapshot(docker: &Docker) -> Result<Option<ForwarderSnaps
         id: info.id.unwrap_or_else(|| DNS_CONTAINER.to_string()),
         labels: config.labels.unwrap_or_default(),
         cmd: config.cmd.unwrap_or_default(),
-        running: info.state.and_then(|state| state.running).unwrap_or(false),
+        state: forwarder_state(info.state),
     }))
 }
 
@@ -2163,7 +2197,11 @@ destination: 172.18.0.0
         assert!(said.contains("names no nameserver"), "{said}");
     }
 
-    fn forwarder(labels: &[(&str, &str)], cmd: &[&str], running: bool) -> ForwarderSnapshot {
+    fn forwarder(
+        labels: &[(&str, &str)],
+        cmd: &[&str],
+        state: ForwarderState,
+    ) -> ForwarderSnapshot {
         ForwarderSnapshot {
             id: "dddd2222".to_string(),
             labels: labels
@@ -2171,8 +2209,35 @@ destination: 172.18.0.0
                 .map(|(key, value)| (key.to_string(), value.to_string()))
                 .collect(),
             cmd: cmd.iter().map(|arg| arg.to_string()).collect(),
-            running,
+            state,
         }
+    }
+
+    #[test]
+    fn a_container_that_the_engine_restarts_is_not_taken_for_one_that_runs() {
+        use ForwarderState::{Restarting, Running, Stopped};
+        // (State.Running, State.Restarting) of an inspect → the state
+        let table = [
+            (Some(true), Some(false), Running),
+            (Some(true), None, Running),
+            (Some(true), Some(true), Restarting),
+            (Some(false), Some(true), Restarting),
+            (Some(false), Some(false), Stopped),
+            (None, None, Stopped),
+        ];
+        for (running, restarting, want) in table {
+            let state = ContainerState {
+                running,
+                restarting,
+                ..Default::default()
+            };
+            assert_eq!(
+                forwarder_state(Some(state)),
+                want,
+                "running={running:?} restarting={restarting:?}"
+            );
+        }
+        assert_eq!(forwarder_state(None), Stopped);
     }
 
     #[test]
@@ -2185,13 +2250,20 @@ destination: 172.18.0.0
         let from_an_older_image = [OURS[0], OURS[1], (DNS_FROM_IMAGE_LABEL, "sha256:0000")];
         let setup_container = [OURS[0], (ROLE_LABEL, SETUP_ROLE_LABEL_VALUE), OURS[2]];
         let wanted = ["dns", "--server=/test/192.168.99.1"];
-        let (up, stopped) = (true, false);
-        use ForwarderStep::{Create, Foreign, Keep, Replace};
+        use ForwarderState::{Restarting as restarting, Running as up, Stopped as stopped};
+        use ForwarderStep::{Create, Foreign, Keep, LeaveRestarting, Replace};
         // the container the engine holds → the step
         let table = [
             (None, Create),
             (Some(forwarder(&OURS, &wanted, up)), Keep),
             (Some(forwarder(&OURS, &wanted, stopped)), Replace),
+            (Some(forwarder(&OURS, &wanted, restarting)), LeaveRestarting),
+            (Some(forwarder(&OURS, &["dns"], restarting)), Replace),
+            (
+                Some(forwarder(&from_an_older_image, &wanted, restarting)),
+                Replace,
+            ),
+            (Some(forwarder(&[], &wanted, restarting)), Foreign),
             (Some(forwarder(&OURS, &["dns"], up)), Replace),
             (Some(forwarder(&from_an_older_image, &wanted, up)), Replace),
             (Some(forwarder(&OURS[..2], &wanted, up)), Replace),
