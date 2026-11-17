@@ -3635,6 +3635,60 @@ destination: 172.18.0.0
         );
     }
 
+    fn route_printed(stdout: &str) -> std::io::Result<std::process::Output> {
+        let mut printed = route_ended(0, "")?;
+        printed.stdout = stdout.into();
+        Ok(printed)
+    }
+
+    #[test]
+    fn a_route_pass_adds_a_route_only_to_a_subnet_that_has_none_of_its_own() {
+        let utun = "utun-with-a-route-to-a-slash-20";
+        let its_own_route = format!(
+            "\
+   route to: 192.168.16.0
+destination: 192.168.16.0
+       mask: 255.255.240.0
+  interface: {utun}
+"
+        );
+        let default_route = "\
+   route to: 192.168.32.0
+destination: default
+       mask: default
+    gateway: 192.0.2.1
+  interface: en0
+";
+        let ran = std::cell::RefCell::new(Vec::new());
+        // Answers as `route` does on a Mac whose table holds a route to
+        // `192.168.16.0/20` and a default route.
+        let route = |args: &[&str]| {
+            ran.borrow_mut().push(args.join(" "));
+            match args {
+                ["-n", "get", "-net", "192.168.16.0/20"] => route_printed(&its_own_route),
+                ["-n", "get", ..] => route_printed(default_route),
+                _ => route_ended(0, ""),
+            }
+        };
+        let pass = [
+            RouteCommand::add("192.168.16.0/20", utun),
+            RouteCommand::add("192.168.32.0/20", utun),
+        ];
+
+        remember_own_utun(utun);
+        reconcile_routes(&route, &pass);
+        forget_own_utun(utun);
+
+        assert_eq!(
+            ran.take(),
+            [
+                "-n get -net 192.168.16.0/20",
+                "-n get -net 192.168.32.0/20",
+                "-n add -net 192.168.32.0/20 -interface utun-with-a-route-to-a-slash-20",
+            ]
+        );
+    }
+
     #[test]
     fn a_bridge_lets_go_of_its_utun_only_after_the_route_command_that_runs_for_it() {
         use std::sync::mpsc;
