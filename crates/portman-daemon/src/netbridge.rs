@@ -2710,10 +2710,9 @@ mod tests {
         listen_port: u16,
     ) -> (LinkedEngine, Arc<crate::engine::tests::FakeEngine>) {
         let (engine, fake) = empty_engine(listen_port);
-        fake.hold(SETUP_CONTAINER, OWN_SETUP_CONTAINER);
-        fake.hold(NETWORK, OWN_NETWORK);
-        fake.hold(FORWARDER, OWN_FORWARDER);
-        fake.hold(&format!("{FORWARDER_BY_ID}/json"), OWN_FORWARDER);
+        for (path, json) in LEFTOVERS {
+            fake.hold(path, json);
+        }
         (engine, fake)
     }
 
