@@ -2004,8 +2004,12 @@ fn route_result(verb: &str, output: std::io::Result<Output>) -> Result<()> {
     Ok(())
 }
 
-/// The utun of the specific route to `cidr`, asked for while the bridge
-/// holds `iface`.
+/// The utun of the route to exactly `cidr`, asked for while the bridge
+/// holds `iface`. `-net` with the prefix length makes the kernel look for
+/// that prefix alone. A route to a wider prefix that covers the subnet,
+/// such as the one of a VPN, does not answer for it. The kernel answers
+/// with the default route when the subnet has no route of its own, and the
+/// `destination:` line tells the two answers apart.
 fn specific_route_utun_interface(
     route: &RunRoute,
     iface: &str,
@@ -2014,7 +2018,7 @@ fn specific_route_utun_interface(
     let Some(addr) = cidr.split('/').next() else {
         return Ok(None);
     };
-    let Ok(output) = while_bridge_holds(iface, || route(&["-n", "get", addr]))? else {
+    let Ok(output) = while_bridge_holds(iface, || route(&["-n", "get", "-net", cidr]))? else {
         return Ok(None);
     };
     if !output.status.success() {
@@ -3616,9 +3620,9 @@ destination: 172.18.0.0
         assert_eq!(
             ran.take(),
             [
-                "-n get 192.0.2.0",
+                "-n get -net 192.0.2.0/24",
                 "-n add -net 192.0.2.0/24 -interface utun-let-go-before-the-pass",
-                "-n get 198.51.100.0",
+                "-n get -net 198.51.100.0/24",
                 "-n add -net 198.51.100.0/24 -interface utun-let-go-before-the-pass",
             ]
         );
