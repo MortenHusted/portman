@@ -102,7 +102,11 @@ pub(crate) async fn cmd_bridge(req: Request, desired_enabled: bool, verb: &str) 
 /// What `portman bridge enable` and `portman bridge disable` print when the
 /// bridge has settled. Only a bridge on macOS has a DNS forwarder for a
 /// disable to remove.
-fn bridge_command_lines(settled: Settled, desired_enabled: bool, verb: &str) -> Vec<String> {
+pub(crate) fn bridge_command_lines(
+    settled: Settled,
+    desired_enabled: bool,
+    verb: &str,
+) -> Vec<String> {
     let mut lines = vec![settled.line(&format!("netbridge {verb}"))];
     if !desired_enabled && cfg!(target_os = "macos") {
         lines.push(format!(
@@ -129,15 +133,29 @@ pub(crate) async fn cmd_bridge_mode(mode: Option<String>) -> Result<()> {
     match request(Request::BridgeSetMode { mode }).await? {
         Response::Ok => {
             let settled = wait_for_bridge_mode(mode, before).await?;
-            let done = format!(
-                "netbridge mode set to {}",
-                NetbridgeMode::display_word(mode)
-            );
-            println!("{}", settled.line(&done));
+            for line in bridge_mode_lines(settled, mode) {
+                println!("{line}");
+            }
             Ok(())
         }
         other => other.unexpected(),
     }
+}
+
+/// What `portman bridge mode <mode>` prints when the daemon reports the
+/// mode. A bridge that waits for Docker has not started in it.
+fn bridge_mode_lines(settled: Settled, mode: NetbridgeMode) -> Vec<String> {
+    let mut lines = vec![format!(
+        "netbridge mode set to {}",
+        NetbridgeMode::display_word(mode)
+    )];
+    if settled == Settled::WaitsForDocker {
+        lines.push(
+            "Docker is not connected; the bridge starts in this mode when Docker connects"
+                .to_string(),
+        );
+    }
+    lines
 }
 
 pub(crate) async fn cmd_bridge_prepare() -> Result<()> {
@@ -249,6 +267,21 @@ mod tests {
         assert_eq!(
             bridge_command_lines(Settled::WaitsForDocker, true, "enabled"),
             ["netbridge enabled; the bridge starts when Docker connects"]
+        );
+    }
+
+    #[test]
+    fn a_mode_change_says_when_docker_is_not_connected_and_when_the_mode_applies() {
+        assert_eq!(
+            bridge_mode_lines(Settled::Reached, NetbridgeMode::Docker),
+            ["netbridge mode set to docker"]
+        );
+        assert_eq!(
+            bridge_mode_lines(Settled::WaitsForDocker, NetbridgeMode::All),
+            [
+                "netbridge mode set to all",
+                "Docker is not connected; the bridge starts in this mode when Docker connects",
+            ]
         );
     }
 

@@ -231,8 +231,11 @@ enum ModePoll {
 /// With `wait_for_up` the bridge was up before the request. A daemon that
 /// sends the phase sends `disabled` only for a bridge that nobody wants, so
 /// that `disabled` is final. A daemon that sends no phase reads as disabled
-/// while it replaces the bridge, so that wait goes on. The new mode beside
-/// `waiting_for_docker` ends the wait, as it ends a wait for up in [`poll`].
+/// while it replaces the bridge, so that wait goes on.
+///
+/// The new mode beside `waiting_for_docker` ends every wait, as that phase
+/// ends a wait for up in [`poll`]: the daemon starts the bridge in the new
+/// mode when an engine connects, and the command says so.
 fn mode_poll(
     wanted: NetbridgeMode,
     wait_for_up: bool,
@@ -247,10 +250,10 @@ fn mode_poll(
             _ => ModePoll::Contested,
         };
     }
-    if !wait_for_up || now.phase() == BridgePhase::Up {
-        ModePoll::Reached
-    } else if now.sent_phase == BridgePhase::WaitingForDocker {
+    if now.sent_phase == BridgePhase::WaitingForDocker {
         ModePoll::WaitsForDocker
+    } else if !wait_for_up || now.phase() == BridgePhase::Up {
+        ModePoll::Reached
     } else if now.sent_phase == BridgePhase::Disabled {
         ModePoll::TurnedOff
     } else {
