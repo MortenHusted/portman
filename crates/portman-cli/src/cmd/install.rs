@@ -218,16 +218,49 @@ trait Uninstall {
     fn say(&self, line: &str);
 }
 
+/// The plist goes before the engine is asked. An uninstall that is
+/// interrupted while it waits for the engine then leaves no plist that
+/// starts the daemon again at the next boot.
 #[cfg(target_os = "macos")]
 async fn uninstall(mac: &impl Uninstall) {
     let engine_socket = daemon_engine_socket(mac.daemon_status()).await;
     mac.stop_daemon();
+    mac.remove_service_files();
     mac.wait_for_daemon_exit();
-    let leftovers = mac.remove_bridge_leftovers(engine_socket).await;
-    for line in bridge_leftover_lines(&leftovers) {
+    let removal = mac.remove_bridge_leftovers(engine_socket);
+    let lines = match tokio::time::timeout(REMOVAL_BUDGET, removal).await {
+        Ok(leftovers) => bridge_leftover_lines(&leftovers),
+        Err(_) => stalled_removal_lines(),
+    };
+    for line in lines {
         mac.say(&line);
     }
-    mac.remove_service_files();
+}
+
+/// How long the engine has to remove what the bridge left. The engine's
+/// client bounds only the wait for the head of each response, so an engine
+/// that stalls after the connect probe would hold the uninstall for
+/// minutes. A removal that the engine answers needs the 3 s of the probe,
+/// up to 15 s for the stop and removal of the setup container, and two
+/// short requests more.
+#[cfg(target_os = "macos")]
+const REMOVAL_BUDGET: Duration = Duration::from_secs(35);
+
+#[cfg(target_os = "macos")]
+fn stalled_removal_lines() -> Vec<String> {
+    let by_hand = portman_daemon::manual_removal_commands().map(|command| format!("    {command}"));
+    [
+        vec![
+            format!(
+                "bridge: Docker gave no answer in {} s and may still hold the dns forwarder",
+                REMOVAL_BUDGET.as_secs()
+            ),
+            "bridge: when Docker answers again, remove the forwarder and its network with:"
+                .to_string(),
+        ],
+        by_hand.to_vec(),
+    ]
+    .concat()
 }
 
 #[cfg(target_os = "macos")]
