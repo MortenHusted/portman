@@ -3,9 +3,9 @@
 use std::future::Future;
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use portman_protocol::{ServiceState, ServiceStatusInfo};
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{sleep, timeout, timeout_at, Duration, Instant};
 
 use crate::client::request;
 use portman_protocol::{Request, Response};
@@ -255,6 +255,7 @@ pub(crate) fn readiness_timeout_message(
     )
 }
 
+const RECORD_LIMIT: Duration = Duration::from_secs(3);
 const NEW_DAEMON_LIMIT: Duration = Duration::from_secs(30);
 const READY_LIMIT: Duration = Duration::from_secs(120);
 const POLL_PAUSE: Duration = Duration::from_millis(300);
@@ -305,7 +306,10 @@ impl InterruptedServices {
         F: FnMut(Request) -> Fut,
         Fut: Future<Output = Result<Response>>,
     {
-        let Ok(Response::ServiceStatuses { services }) = send(Request::ServiceStatus).await else {
+        let answer = timeout(RECORD_LIMIT, send(Request::ServiceStatus))
+            .await
+            .ok()?;
+        let Ok(Response::ServiceStatuses { services }) = answer else {
             return Some(Self(Vec::new()));
         };
         Some(Self(
@@ -359,14 +363,20 @@ impl InterruptedServices {
         }
 
         let names: Vec<String> = known.iter().map(|service| service.name.clone()).collect();
-        let asked = send(Request::ServiceUp {
+        let start = send(Request::ServiceUp {
             names: names.clone(),
-        })
-        .await
-        .and_then(|response| match response {
-            Response::ServiceStatuses { .. } => Ok(()),
-            other => other.unexpected(),
         });
+        let asked = timeout(NEW_DAEMON_LIMIT, start)
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow!(
+                    "the new daemon did not answer the start request within 30s"
+                ))
+            })
+            .and_then(|response| match response {
+                Response::ServiceStatuses { .. } => Ok(()),
+                other => other.unexpected(),
+            });
         if let Err(err) = asked {
             report.fail(known, &format!("{err:#}"));
             return report;
@@ -469,7 +479,8 @@ where
     let deadline = Instant::now() + limit;
     let mut last = None;
     loop {
-        if let Ok(Response::ServiceStatuses { services }) = send(Request::ServiceStatus).await {
+        let answer = timeout_at(deadline, send(Request::ServiceStatus)).await;
+        if let Ok(Ok(Response::ServiceStatuses { services })) = answer {
             let finished = done(&services);
             last = Some(services);
             if finished {
