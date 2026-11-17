@@ -1,9 +1,12 @@
 //! Background assessment of "is the host ↔ VM bridge healthy?".
 //!
 //! Every 5 seconds, and when the engine link changes:
-//!   1. Ask Docker for the set of networks that currently have Portman-labelled
-//!      containers on them. With no engine connected the assessment is
-//!      `offline` and nothing is asked.
+//!   1. Ask Docker for the running Portman-labelled containers, and take the
+//!      networks that the health needs a route to. A container that the
+//!      registry routes to its address on the `portman` network needs that
+//!      network only. Any other labelled container needs each of its
+//!      networks. With no engine connected the assessment is `offline` and
+//!      nothing is asked.
 //!   2. For each such network, read its subnet(s) and ask the macOS
 //!      routing table whether that subnet is routed via the active bridge
 //!      interface (or a live legacy `utun` when the native bridge is disabled).
@@ -27,7 +30,7 @@ use bollard::query_parameters::{ListContainersOptionsBuilder, ListNetworksOption
 use bollard::Docker;
 use tracing::{debug, warn};
 
-use crate::discovery::PORTMAN_NETWORK;
+use crate::discovery::{self, PORTMAN_NETWORK};
 use crate::engine::Engine;
 
 /// How often to re-assess. 5s matches the menubar's own refresh cadence;
@@ -87,9 +90,9 @@ async fn assess(
     let Ok(docker) = engine.docker() else {
         return BridgeAssessment::Offline;
     };
-    // Find docker networks that currently have at least one Portman-labelled
-    // container on them. Unrelated compose/default networks are not Portman
-    // health inputs.
+    // Unrelated compose/default networks are not Portman health inputs, and
+    // neither is the second network of a container that the registry routes
+    // through `portman`.
     let subnets = match subnets_with_portman_containers(&docker).await {
         Ok(s) => s,
         Err(err) => {
@@ -124,8 +127,8 @@ async fn assess(
     BridgeAssessment::Healthy
 }
 
-/// Set of docker network subnets (CIDR strings like "172.18.0.0/16")
-/// that have at least one Portman-labelled container attached right now.
+/// Set of docker network subnets (CIDR strings like "172.18.0.0/16") of the
+/// networks that [`networks_in_use`] names for the running containers.
 async fn subnets_with_portman_containers(docker: &Docker) -> anyhow::Result<BTreeSet<String>> {
     let opts = ListContainersOptionsBuilder::default().all(false).build();
     let containers = docker.list_containers(Some(opts)).await?;
@@ -159,13 +162,18 @@ async fn subnets_with_portman_containers(docker: &Docker) -> anyhow::Result<BTre
     Ok(out)
 }
 
-/// A container on the `portman` network counts through that network only:
-/// the registry routes it to its address there, and the bridge routes that
-/// network in every mode.
+/// A container that the registry routes to its address on the `portman`
+/// network counts through that network only, because the bridge routes that
+/// network in every mode. Any other labelled container counts through each
+/// of its networks.
 fn networks_in_use(containers: &[ContainerSummary]) -> BTreeSet<String> {
     let mut networks_in_use: BTreeSet<String> = BTreeSet::new();
     for c in containers {
         if !has_portman_host_label(c.labels.as_ref()) {
+            continue;
+        }
+        if routed_through_portman(c) {
+            networks_in_use.insert(PORTMAN_NETWORK.to_string());
             continue;
         }
         if let Some(nets) = c
@@ -173,10 +181,6 @@ fn networks_in_use(containers: &[ContainerSummary]) -> BTreeSet<String> {
             .as_ref()
             .and_then(|s| s.networks.as_ref())
         {
-            if nets.contains_key(PORTMAN_NETWORK) {
-                networks_in_use.insert(PORTMAN_NETWORK.to_string());
-                continue;
-            }
             for name in nets.keys() {
                 // Skip virtual networks that don't have routed subnets.
                 if matches!(name.as_str(), "host" | "none") {
@@ -187,6 +191,14 @@ fn networks_in_use(containers: &[ContainerSummary]) -> BTreeSet<String> {
         }
     }
     networks_in_use
+}
+
+/// Asks the registry's own choice of address, so that the health cannot name
+/// `portman` for a container that the registry routes elsewhere.
+fn routed_through_portman(container: &ContainerSummary) -> bool {
+    discovery::observe(container.clone()).is_some_and(|container| {
+        discovery::pick(&container.addresses).is_some_and(|(network, _)| network == PORTMAN_NETWORK)
+    })
 }
 
 fn has_portman_host_label(labels: Option<&std::collections::HashMap<String, String>>) -> bool {
