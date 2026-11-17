@@ -1078,7 +1078,12 @@ async fn bounded_output(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|err| DockerCliError::NotStarted(err.to_string()))?;
+        .map_err(|err| {
+            DockerCliError::NotStarted(match err.kind() {
+                std::io::ErrorKind::NotFound => format!("`{program}` not found"),
+                _ => err.to_string(),
+            })
+        })?;
     match tokio::time::timeout(bound, child.wait_with_output()).await {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(err)) => Err(DockerCliError::Failed(err.to_string())),
@@ -1280,7 +1285,7 @@ mod tests {
     fn a_note_says_when_the_docker_cli_and_the_daemon_see_different_engines() {
         let no_engine = DockerCliError::NoAnswer("failed to connect to the docker API".into());
         let gone = DockerCliError::Failed("No such container: 0a1b2c".into());
-        let no_program = DockerCliError::NotStarted("No such file or directory".into());
+        let no_program = DockerCliError::NotStarted("`docker` not found".into());
         let answered = &[Ok(())][..];
         let silent = &[Err(&no_engine)][..];
         let mixed = &[Ok(()), Err(&no_engine)][..];
@@ -1382,7 +1387,7 @@ mod tests {
         let gone = "Error response from daemon: No such container: 0a1b2c";
         let errors = [
             DockerCliError::Failed(gone.to_string()),
-            DockerCliError::NotStarted("No such file or directory (os error 2)".to_string()),
+            DockerCliError::NotStarted("`docker` not found".to_string()),
         ];
         for error in errors {
             let mut report = with_docker(Some(connected_docker()));
@@ -1692,7 +1697,7 @@ mod tests {
         let no_container = "Error response from daemon: No such container: portman-netbridge-dns";
         let no_object = "Error: No such object: portman-netbridge-dns";
         let no_engine = "Cannot connect to the Docker daemon";
-        let no_cli = "No such file or directory (os error 2)";
+        let no_cli = "`docker` not found";
         let unavailable = |message: &str| DnsForwarderStatus::DockerUnavailable {
             message: message.to_string(),
         };
