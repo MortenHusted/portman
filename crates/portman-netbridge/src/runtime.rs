@@ -858,6 +858,23 @@ fn docker_not_found(err: &DockerError) -> bool {
     )
 }
 
+/// Is this the engine's refusal to remove a network that is in use?
+///
+/// The engine answers a removal of a network that has active endpoints
+/// with 403, and a running container is what holds an endpoint. Its other
+/// 403 answers to a removal are for kinds of network that portman does not
+/// create: one that the engine predefines, an ingress network, and a
+/// configuration network that another network uses.
+fn docker_network_in_use(err: &DockerError) -> bool {
+    matches!(
+        err,
+        DockerError::DockerResponseServerError {
+            status_code: 403,
+            ..
+        }
+    )
+}
+
 /// Is this docker error "the container is already going away"?
 ///
 /// The setup container runs with `auto_remove`, so stopping it makes docker
@@ -888,10 +905,13 @@ pub enum Leftovers {
 /// How a cleanup of [`Leftovers`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cleanup {
-    /// Nothing that was asked for is left for portman to remove.
+    /// Nothing is left for a later cleanup to try. What was asked for is
+    /// gone or is not portman's, or the engine refused to remove the network
+    /// because it is in use, and that network stays.
     Complete,
-    /// The cleanup was skipped, or a removal failed or was refused. What was
-    /// asked for can still be in the engine.
+    /// The cleanup was skipped, or a removal failed for a reason that says
+    /// nothing about what it was to remove. What was asked for can still be
+    /// in the engine.
     Owed,
 }
 
@@ -918,18 +938,35 @@ pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Left
         }
     };
     let container_gone = best_effort_remove_setup_container(docker, &held).await;
-    let network_gone = leftovers == Leftovers::SetupContainer
-        || remove_portman_network_if_owned(docker, &held).await;
-    if container_gone && network_gone {
-        Cleanup::Complete
-    } else {
-        Cleanup::Owed
+    let network = match leftovers {
+        Leftovers::SetupContainer => None,
+        Leftovers::SetupContainerAndNetwork => {
+            Some(remove_portman_network_if_owned(docker, &held).await)
+        }
+    };
+    match network {
+        Some(NetworkCleanup::InUse) => Cleanup::Complete,
+        None | Some(NetworkCleanup::NoneLeft) if container_gone => Cleanup::Complete,
+        None | Some(NetworkCleanup::NoneLeft | NetworkCleanup::Owed) => Cleanup::Owed,
     }
 }
 
-/// Whether the engine is left with no network of portman's. A network of
-/// that name that something else owns is not portman's to remove.
-async fn remove_portman_network_if_owned(docker: &Docker, _held: &ListenPort) -> bool {
+/// How a removal of the network named `portman` ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkCleanup {
+    /// The engine holds no network of portman's. A network of that name
+    /// that something else owns is not portman's to remove.
+    NoneLeft,
+    /// The engine refused the removal because the network is in use. A
+    /// removal that is asked for again later can take the network from
+    /// under containers that have stopped since.
+    InUse,
+    /// The removal was not tried, or it failed for a reason that says
+    /// nothing about the network.
+    Owed,
+}
+
+async fn remove_portman_network_if_owned(docker: &Docker, _held: &ListenPort) -> NetworkCleanup {
     let inspected = docker
         .inspect_network(PORTMAN_NETWORK, None::<InspectNetworkOptions>)
         .await;
@@ -937,15 +974,23 @@ async fn remove_portman_network_if_owned(docker: &Docker, _held: &ListenPort) ->
         NetworkRemoval::Remove => match docker.remove_network(PORTMAN_NETWORK).await {
             Ok(()) => {
                 info!(network = PORTMAN_NETWORK, "docker network removed");
-                true
+                NetworkCleanup::NoneLeft
+            }
+            Err(err) if docker_network_in_use(&err) => {
+                warn!(
+                    network = PORTMAN_NETWORK,
+                    error = %err,
+                    "docker network stays: the engine refused to remove it while it is in use. The next `portman bridge disable` asks again"
+                );
+                NetworkCleanup::InUse
             }
             Err(err) => {
                 warn!(
                     network = PORTMAN_NETWORK,
                     error = %err,
-                    "could not remove docker network (likely has attached containers)"
+                    "could not remove docker network"
                 );
-                false
+                NetworkCleanup::Owed
             }
         },
         NetworkRemoval::Foreign => {
@@ -953,16 +998,16 @@ async fn remove_portman_network_if_owned(docker: &Docker, _held: &ListenPort) ->
                 network = PORTMAN_NETWORK,
                 "skipping docker network removal because it is not marked as portman-managed"
             );
-            true
+            NetworkCleanup::NoneLeft
         }
-        NetworkRemoval::Absent => true,
+        NetworkRemoval::Absent => NetworkCleanup::NoneLeft,
         NetworkRemoval::Unknown(err) => {
             warn!(
                 network = PORTMAN_NETWORK,
                 error = %err,
                 "could not inspect docker network before removal"
             );
-            false
+            NetworkCleanup::Owed
         }
     }
 }

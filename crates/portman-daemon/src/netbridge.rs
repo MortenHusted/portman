@@ -30,9 +30,12 @@
 //!     stopped container of the user can still refer to it. That removal
 //!     stays owed until a cleanup has done it: with no session it waits for
 //!     one, and a cleanup that was skipped or that failed is tried again on
-//!     the next session. The debt is not saved, so a daemon restart ends
-//!     it. Each removal needs the UDP port that a bridge listens on, so
-//!     that it cannot take what another daemon's bridge runs on.
+//!     the next session. A network that the engine refuses to remove
+//!     because it is in use is not owed. It stays until the next `Disable`,
+//!     so that no later session removes it under containers that have
+//!     stopped. The debt is not saved, so a daemon restart ends it. Each
+//!     removal needs the UDP port that a bridge listens on, so that it
+//!     cannot take what another daemon's bridge runs on.
 //!   - a failed start is retried with a growing delay. The wait does not
 //!     hold up control messages, and a new session starts the delay over.
 //!   - [`publish`] tells the rest of the daemon what the bridge is doing:
@@ -589,7 +592,7 @@ pub(crate) trait BridgeEngine {
     async fn runs_container(&self, session: Session, id: &str) -> bool;
 
     /// Removes `leftovers` that carry portman's label from the engine of
-    /// `session`, and says whether that is done. Does nothing when another
+    /// `session`, and says whether any is still owed. Does nothing when another
     /// session exists at the call, or when the UDP port that a bridge
     /// listens on is taken. Another daemon's bridge holds that port. So do
     /// the tasks of a bridge that this daemon dropped, until their abort
@@ -1953,6 +1956,141 @@ mod tests {
             );
             assert_eq!(removed(NETWORK), network == Some(OWN_NETWORK), "{calls:?}");
         }
+    }
+
+    /// How the engine answers the removal of a network that a running
+    /// container is attached to.
+    const IN_USE: (&str, &str) = (
+        "403 Forbidden",
+        r#"error while removing network: network portman has active endpoints (name:"demo-web-1" id:"aaaaaaaaaaaa")"#,
+    );
+    const ENGINE_FAILED: (&str, &str) =
+        ("500 Internal Server Error", "the engine is shutting down");
+
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_that_failed_stays_owed_and_a_network_in_use_does_not() {
+        let container = "/containers/portman-netbridge-setup";
+        let connection_cut = None;
+        // the removals that fail, and how → how the cleanup ends
+        let cases = [
+            (vec![(NETWORK, Some(IN_USE))], Cleanup::Complete),
+            (vec![(NETWORK, Some(ENGINE_FAILED))], Cleanup::Owed),
+            (vec![(NETWORK, connection_cut)], Cleanup::Owed),
+            (vec![(container, Some(ENGINE_FAILED))], Cleanup::Owed),
+            (
+                vec![(container, Some(ENGINE_FAILED)), (NETWORK, Some(IN_USE))],
+                Cleanup::Complete,
+            ),
+        ];
+        for (failures, want) in cases {
+            let (engine, fake) = engine_with_leftovers(FREE_PORT);
+            for (path, answer) in &failures {
+                fake.fail_delete(path, *answer);
+            }
+
+            let cleanup = engine
+                .remove_leftovers(Session(1), SetupContainerAndNetwork)
+                .await;
+
+            assert_eq!(cleanup, want, "{failures:?}");
+        }
+    }
+
+    /// The control loop on the daemon's engine, with the bridge off.
+    struct OnFakeEngine {
+        handle: Handle,
+        engine: Engine,
+        fake: Arc<crate::engine::tests::FakeEngine>,
+        sessions: watch::Sender<Link>,
+        _dir: TempDir,
+    }
+
+    impl OnFakeEngine {
+        /// Starts the loop on an engine that answers an inspect of each
+        /// path in `held`, and returns after the cleanup of the first
+        /// session.
+        async fn start(held: &[(&str, &str)]) -> Self {
+            let (engine, sessions) = crate::engine::channel();
+            let fake = crate::engine::tests::connect(&sessions);
+            for (path, json) in held {
+                fake.hold(path, json);
+            }
+            let linked = LinkedEngine {
+                link: engine.watch(),
+                listen_port: FREE_PORT,
+            };
+            let (handle, rx, phase_tx) = handle_pair();
+            let dir = tempdir().unwrap();
+            let state_path = dir.path().join("netbridge.json");
+            tokio::spawn(converge(
+                linked,
+                handle.clone(),
+                rx,
+                phase_tx,
+                state_path,
+                false,
+            ));
+            tokio::time::sleep(LONGEST_WAIT).await;
+            Self {
+                handle,
+                engine,
+                fake,
+                sessions,
+                _dir: dir,
+            }
+        }
+
+        /// Returns when the loop has nothing left to do for the message.
+        async fn disable(&self) {
+            self.handle.tx.send(Control::Disable).await.unwrap();
+            tokio::time::sleep(LONGEST_WAIT).await;
+        }
+
+        /// Opens another session on the same engine, and returns when the
+        /// loop has nothing left to do for it.
+        async fn open_session(&self, session: u64) {
+            self.sessions.send_replace(Link::Connected {
+                session: Session(session),
+                docker: self.engine.docker().unwrap(),
+            });
+            tokio::time::sleep(LONGEST_WAIT).await;
+        }
+
+        /// The requests about the docker network, in order.
+        fn network_calls(&self) -> Vec<String> {
+            let mut calls = self.fake.calls();
+            calls.retain(|call| call.ends_with(NETWORK));
+            calls
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_network_in_use_stays_and_only_the_next_disable_asks_for_it_again() {
+        let daemon = OnFakeEngine::start(&[(NETWORK, OWN_NETWORK)]).await;
+        daemon.fake.fail_delete(NETWORK, Some(IN_USE));
+        let refused = [format!("GET {NETWORK}"), format!("DELETE {NETWORK}")];
+        let (logged, _capture) = Logged::capture();
+
+        daemon.disable().await;
+
+        assert_eq!(daemon.network_calls(), refused);
+        let lines = logged.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("WARN"), "{lines:?}");
+        assert!(lines[0].contains("has active endpoints"), "{lines:?}");
+
+        daemon.open_session(2).await;
+
+        assert_eq!(
+            daemon.network_calls(),
+            refused,
+            "asked again on a session where the user's containers can have stopped"
+        );
+        assert_eq!(logged.lines(), [] as [&str; 0]);
+
+        daemon.disable().await;
+
+        assert_eq!(daemon.network_calls(), [refused.clone(), refused].concat());
     }
 
     #[tokio::test(start_paused = true)]

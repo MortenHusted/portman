@@ -752,6 +752,10 @@ pub(crate) mod tests {
         /// The paths whose inspect gets the head of a response and never
         /// its body.
         hangs: Mutex<Vec<String>>,
+        /// What answers a delete of each path in place of the removal: a
+        /// status line and a message, or with `None` the end of the
+        /// connection.
+        failed_deletes: Mutex<HashMap<String, Option<(&'static str, &'static str)>>>,
         /// The method and path of each [`Asked::Other`].
         calls: Mutex<Vec<String>>,
         stream_ends: watch::Sender<u64>,
@@ -801,6 +805,7 @@ pub(crate) mod tests {
                 listed: Mutex::new(Listed::Containers("[]".into())),
                 holds: Default::default(),
                 hangs: Default::default(),
+                failed_deletes: Default::default(),
                 calls: Default::default(),
                 stream_ends: watch::Sender::new(0),
                 probed: Default::default(),
@@ -911,8 +916,8 @@ pub(crate) mod tests {
         }
 
         /// Answers an inspect with what the engine holds at the path, takes
-        /// a delete for the removal of that, and takes any other request as
-        /// done.
+        /// a delete for the removal of that unless the delete is to fail,
+        /// and takes any other request as done.
         async fn serve_held(&self, pipe: &mut tokio::io::DuplexStream, request_line: &str) {
             let mut words = request_line.split(' ');
             let (method, url) = (words.next().unwrap(), words.next().unwrap());
@@ -921,6 +926,17 @@ pub(crate) mod tests {
             self.calls.lock().unwrap().push(format!("{method} {path}"));
             if self.hangs.lock().unwrap().iter().any(|hung| hung == path) {
                 never_finish(pipe).await;
+            }
+            if method == "DELETE" {
+                let failed = self.failed_deletes.lock().unwrap().get(path).copied();
+                match failed {
+                    Some(Some((status, message))) => {
+                        let body = serde_json::json!({ "message": message }).to_string();
+                        return respond(pipe, status, &body).await;
+                    }
+                    Some(None) => return,
+                    None => {}
+                }
             }
             let held = match method {
                 "GET" => self.holds.lock().unwrap().get(path).cloned(),
@@ -953,6 +969,17 @@ pub(crate) mod tests {
         #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
         pub(crate) fn hang(&self, path: &str) {
             self.hangs.lock().unwrap().push(path.into());
+        }
+
+        /// Makes the engine keep what it holds at `path`. It answers a
+        /// delete of it with the status line and message of `answer`, or
+        /// with `None` ends the connection and answers nothing.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        pub(crate) fn fail_delete(&self, path: &str, answer: Option<(&'static str, &'static str)>) {
+            self.failed_deletes
+                .lock()
+                .unwrap()
+                .insert(path.into(), answer);
         }
 
         #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
