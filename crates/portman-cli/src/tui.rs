@@ -133,8 +133,9 @@ struct State {
     resource_usage: Option<ResourceUsageSnapshot>,
     resource_history: Vec<portman_protocol::ResourceSeries>,
     error: Option<(String, Instant)>,
-    /// What the last bridge command said beyond its success. It stays on
-    /// the status bar while the bridge waits for Docker.
+    /// What the last bridge command said beyond its success. The next
+    /// command clears it, and so does a refresh that finds the bridge no
+    /// longer waiting for Docker.
     notice: Option<String>,
     entries_sel: ListState,
     tlds_sel: ListState,

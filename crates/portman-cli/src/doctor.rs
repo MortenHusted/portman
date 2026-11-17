@@ -734,9 +734,10 @@ fn route_interface_for_cidr(cidr: &str) -> Option<String> {
     parse_route_get_interface(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// How long one `docker` CLI call has to end. The daemon gives an engine
-/// the same three seconds before it reports the engine unreachable, so the
-/// CLI and the daemon call an engine silent after the same wait.
+/// How long one `docker` CLI call has to end, process start included. A
+/// socket that accepts and never answers would otherwise hold the command
+/// for minutes. An engine that is alive and slower than this reads as one
+/// that gave no answer.
 const DOCKER_CLI_BOUND: Duration = Duration::from_secs(3);
 
 async fn docker_stdout(args: &[&str]) -> Result<String, DockerCliError> {
@@ -744,8 +745,8 @@ async fn docker_stdout(args: &[&str]) -> Result<String, DockerCliError> {
 }
 
 /// What the `docker` CLI prints when it reaches no engine. The words differ
-/// between releases: Docker 29.9 names "the docker API", and older ones name
-/// "the Docker daemon".
+/// between releases: some name "the docker API", and others name "the
+/// Docker daemon".
 const NO_ENGINE: [&str; 3] = [
     "connect to the docker API",
     "connect to the Docker daemon",
@@ -1088,9 +1089,9 @@ mod tests {
         let fails_with = |stderr: &str| format!("echo '{stderr}' >&2; exit 1");
         let no_engine = "failed to connect to the docker API at unix:///run/demo/docker.sock; \
                          check if the path is correct and if the daemon is running";
-        let no_engine_before_29 = "Cannot connect to the Docker daemon at \
+        let no_engine_other_wording = "Cannot connect to the Docker daemon at \
                                    unix:///run/demo/docker.sock. Is the docker daemon running?";
-        let gone = "Error response from daemon: No such container: kafka-connect-1";
+        let gone = "Error response from daemon: No such container: demo-web-1";
         // the script that stands for `docker` → what the call returns
         let table = [
             ("echo 0a1b2c".to_string(), Ok("0a1b2c\n".to_string())),
@@ -1099,8 +1100,10 @@ mod tests {
                 Err(DockerCliError::NoAnswer(no_engine.to_string())),
             ),
             (
-                fails_with(no_engine_before_29),
-                Err(DockerCliError::NoAnswer(no_engine_before_29.to_string())),
+                fails_with(no_engine_other_wording),
+                Err(DockerCliError::NoAnswer(
+                    no_engine_other_wording.to_string(),
+                )),
             ),
             (
                 fails_with(gone),

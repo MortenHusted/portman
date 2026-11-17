@@ -194,10 +194,11 @@ where
 /// `mode` requests in the order they arrive, so of two commands that start a
 /// few milliseconds apart, the second can read the mode of the first before
 /// its own shows. The grace time is for that. It is too short for a daemon
-/// that is in the middle of a bridge start or shutdown: the daemon's loop
-/// holds a request until that step ends, and a wait that reads the mode of
-/// the step for longer than the grace time fails although the daemon applies
-/// its mode afterwards. A wait ends at the first read after the grace time,
+/// that is in the middle of a bridge start for another command's mode: the
+/// daemon's loop holds a request until that start ends. A wait whose read
+/// before its request came before the daemon published that mode then reads
+/// it for longer than the grace time, and fails although the daemon applies
+/// its own mode afterwards. A wait ends at the first read after the grace time,
 /// and no pause between reads is longer than 500 ms.
 const MODE_GRACE: Duration = Duration::from_millis(500);
 
