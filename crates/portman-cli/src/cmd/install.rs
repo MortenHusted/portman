@@ -235,6 +235,15 @@ enum SavedBridge {
     Unknown,
 }
 
+#[cfg(target_os = "macos")]
+fn saved_bridge(saved: &portman_core::netbridge_state::NetbridgeState) -> SavedBridge {
+    if saved.enabled {
+        SavedBridge::On
+    } else {
+        SavedBridge::Off
+    }
+}
+
 /// The plist goes before the engine is asked. An uninstall that is
 /// interrupted while it waits for the engine then leaves no plist that
 /// starts the daemon again at the next boot.
@@ -331,8 +340,7 @@ impl Uninstall for ThisMac {
 
     fn saved_bridge_state(&self) -> SavedBridge {
         match portman_core::paths::netbridge_state_path() {
-            Ok(path) if portman_core::netbridge_state::load(&path).enabled => SavedBridge::On,
-            Ok(_) => SavedBridge::Off,
+            Ok(path) => saved_bridge(&portman_core::netbridge_state::load(&path)),
             Err(_) => SavedBridge::Unknown,
         }
     }
@@ -939,6 +947,21 @@ mod tests {
                  this engine: they would remove its forwarder and network",
             ]
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bridge_is_saved_as_off_only_when_no_disable_still_owes_its_removal() {
+        use portman_core::netbridge_state::NetbridgeState;
+        let saved = |enabled, cleanup_owed| NetbridgeState {
+            enabled,
+            cleanup_owed,
+            ..NetbridgeState::default()
+        };
+
+        assert_eq!(saved_bridge(&saved(false, false)), SavedBridge::Off);
+        assert_eq!(saved_bridge(&saved(true, false)), SavedBridge::On);
+        assert_eq!(saved_bridge(&saved(false, true)), SavedBridge::On);
     }
 
     #[cfg(target_os = "macos")]
