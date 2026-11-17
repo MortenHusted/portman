@@ -2769,36 +2769,40 @@ mod tests {
         }
     }
 
-    /// A port no other test will hand out, in this binary or in another copy
-    /// of it that runs at the same time.
+    /// A port no other test in this binary will hand out.
     ///
     /// Bind-then-release alone is a race: tests run in parallel, and between
     /// releasing here and the service binding it, another test's kernel-chosen
     /// ephemeral port can land on the same number — the service then exits 1
     /// ("address in use") and a reconciliation/readiness test flakes. Marching
     /// a process-wide counter through a range the kernel doesn't allocate from
-    /// makes same-binary collisions impossible.
-    ///
-    /// Every copy of this binary marches through the same range, so two gate
-    /// runs at once would hand out the same numbers. The UDP socket on the
-    /// same number is the claim that the other copy sees: it leaves the TCP
-    /// port free for the test and lasts until this process exits. The TCP
-    /// bind check still guards against a port that an unrelated process holds.
-    fn free_port() -> u16 {
+    /// makes same-binary collisions impossible; the bind check still guards
+    /// against ports held by other processes.
+    fn port_claimed_across_test_processes() -> u16 {
         use std::sync::atomic::{AtomicU16, Ordering};
         static NEXT: AtomicU16 = AtomicU16::new(24_000);
-        static CLAIMS: Mutex<Vec<std::net::UdpSocket>> = Mutex::new(Vec::new());
         loop {
             let candidate = NEXT.fetch_add(1, Ordering::Relaxed);
             assert!(candidate < 32_000, "test port range exhausted");
-            let Ok(claim) = std::net::UdpSocket::bind(("127.0.0.1", candidate)) else {
-                continue;
-            };
-            if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
-                CLAIMS.lock().unwrap().push(claim);
+            if claim_across_test_processes_with_udp_twin(candidate)
+                && std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok()
+            {
                 return candidate;
             }
         }
+    }
+
+    fn claim_across_test_processes_with_udp_twin(tcp_port: u16) -> bool {
+        static UDP_TWINS_HELD_UNTIL_PROCESS_EXIT: Mutex<Vec<std::net::UdpSocket>> =
+            Mutex::new(Vec::new());
+        let Ok(udp_twin) = std::net::UdpSocket::bind(("127.0.0.1", tcp_port)) else {
+            return false;
+        };
+        UDP_TWINS_HELD_UNTIL_PROCESS_EXIT
+            .lock()
+            .unwrap()
+            .push(udp_twin);
+        true
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2969,7 +2973,7 @@ mod tests {
     async fn readiness_port_gates_until_listener_binds() {
         let dir = tempdir().unwrap();
         let sup = test_supervisor(&dir, CollectSink::new());
-        let port = free_port();
+        let port = port_claimed_across_test_processes();
 
         let mut svc = def("porty", &["/bin/sleep", "10"], dir.path());
         svc.ready = ReadyCheck::Port(port);
@@ -3402,7 +3406,7 @@ mod tests {
     async fn readiness_timeout_fails_the_attempt() {
         let dir = tempdir().unwrap();
         let sup = test_supervisor(&dir, CollectSink::new());
-        let port = free_port(); // never bound
+        let port = port_claimed_across_test_processes(); // never bound
 
         let mut svc = def("never-ready", &["/bin/sleep", "30"], dir.path());
         svc.ready = ReadyCheck::Port(port);
@@ -3649,7 +3653,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn boot_reconciliation_terminates_survivor_and_respawns_once() {
         let dir = tempdir().unwrap();
-        let port = free_port();
+        let port = port_claimed_across_test_processes();
         let binder = format!(
             "import socket,time\ns=socket.socket()\ns.bind((\"127.0.0.1\",{port}))\ns.listen()\ntime.sleep(30)"
         );
