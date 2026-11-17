@@ -265,7 +265,7 @@ const FAILED_ATTEMPTS_THAT_END_THE_WAIT: u32 = 2;
 pub(crate) struct InterruptedServices(Vec<UpService>);
 
 #[derive(Debug, PartialEq, Eq)]
-enum Recorded {
+pub(crate) enum Recorded {
     Services(InterruptedServices),
     NoAnswerInTime,
 }
@@ -306,15 +306,8 @@ impl UpService {
 }
 
 impl InterruptedServices {
-    pub(crate) async fn record() -> Self {
-        let recorded = Self::record_from(request).await;
-        for line in recorded.lines() {
-            eprintln!("{line}");
-        }
-        match recorded {
-            Recorded::Services(up) => up,
-            Recorded::NoAnswerInTime => Self(Vec::new()),
-        }
+    pub(crate) async fn record() -> Recorded {
+        Self::record_from(request).await
     }
 
     async fn record_from<F, Fut>(mut send: F) -> Recorded
@@ -464,6 +457,16 @@ impl InterruptedServices {
 }
 
 impl Recorded {
+    pub(crate) fn say_what_stops(self) -> InterruptedServices {
+        for line in self.lines() {
+            eprintln!("{line}");
+        }
+        match self {
+            Self::Services(up) => up,
+            Self::NoAnswerInTime => InterruptedServices(Vec::new()),
+        }
+    }
+
     fn lines(&self) -> Vec<String> {
         match self {
             Self::NoAnswerInTime => vec![
