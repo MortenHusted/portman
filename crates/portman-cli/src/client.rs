@@ -235,7 +235,7 @@ enum ModePoll {
 ///
 /// The new mode beside `waiting_for_docker` ends every wait, as that phase
 /// ends a wait for up in [`poll`]: the daemon starts the bridge in the new
-/// mode when an engine connects, and the command says so.
+/// mode when an engine connects.
 fn mode_poll(
     wanted: NetbridgeMode,
     wait_for_up: bool,

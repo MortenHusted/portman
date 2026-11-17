@@ -166,7 +166,6 @@ pub(crate) enum DnsForwarderStatus {
 }
 
 impl DnsForwarderStatus {
-    /// What the last `docker` call of the check learned.
     pub(crate) fn cli_answer(&self) -> CliAnswer<'_> {
         match self {
             DnsForwarderStatus::DockerUnavailable(error)
@@ -180,23 +179,10 @@ impl DnsForwarderStatus {
 /// its only resolver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ForwarderQuery {
-    NotSent {
-        why: String,
-    },
-    Answered {
-        name: String,
-        address: String,
-    },
-    /// The engine ran the lookup, or refused to, and no address came back.
-    Unanswered {
-        name: String,
-        detail: String,
-    },
-    /// The `docker` CLI gave nothing to read for the lookup.
-    NotRun {
-        name: String,
-        error: DockerCliError,
-    },
+    NotSent { why: String },
+    Answered { name: String, address: String },
+    Unanswered { name: String, detail: String },
+    NotRun { name: String, error: DockerCliError },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1148,8 +1134,6 @@ async fn run_docker(
     })
 }
 
-/// Whether a call that failed printed what the CLI prints when it reaches
-/// no engine.
 fn reached_no_engine(stderr: &str) -> bool {
     NO_ENGINE.iter().any(|phrase| stderr.contains(phrase))
 }

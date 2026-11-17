@@ -233,7 +233,6 @@ enum Modal {
         tls: bool,
     },
     ConfirmBridgeDisable,
-    /// What a disable removed besides the tunnel, until the user closes it.
     BridgeDisabled {
         note: String,
     },
@@ -785,11 +784,6 @@ fn apply_result(state: &mut State, res: Result<()>) {
     }
 }
 
-/// `done` says what the command did, in the words the CLI prints. The CLI's
-/// line shows only when it says more than `done`, since the status panel
-/// shows a bridge that is up or off.
-/// The modal that follows a disable. One that succeeded says what it removed
-/// besides the tunnel, in the words the CLI prints, where it removes anything.
 fn after_disable(res: &Result<Settled>) -> Modal {
     match (res, disable_note()) {
         (Ok(_), Some(note)) => Modal::BridgeDisabled { note },
@@ -797,6 +791,9 @@ fn after_disable(res: &Result<Settled>) -> Modal {
     }
 }
 
+/// `done` says what the command did, in the words the CLI prints. The CLI's
+/// line shows only when it says more than `done`, since the status panel
+/// shows a bridge that is up or off.
 fn apply_bridge_result(state: &mut State, res: Result<Settled>, done: &str) {
     let notice = match &res {
         Ok(Settled::WaitsForDocker) => Some(Settled::WaitsForDocker.line(done)),
@@ -1103,10 +1100,8 @@ fn render_status_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The bridge row of the status panel: the phase, the mode and the health.
-/// A row too narrow for all three leaves the mode out, then the health and
-/// not the mode, then both. A row too narrow for the phase shows `waiting`
-/// for a bridge that waits for Docker, which the engine row above names.
+/// A row too narrow for the phase shows `waiting` for a bridge that waits
+/// for Docker, which the engine row above names.
 fn bridge_row(status: &StatusSnapshot, width: u16) -> Line<'static> {
     let phase_style = Style::default()
         .fg(match status.bridge_phase {
@@ -2126,8 +2121,6 @@ fn render_bridge_disabled(f: &mut ratatui::Frame<'_>, area: Rect, note: &str) {
     render_text_modal(f, area, title, None, &removed, &["[Enter] close"]);
 }
 
-/// A modal that is as tall as its text. Paragraphs break between words and
-/// the key hints break between hints, so a narrow terminal cuts neither.
 fn render_text_modal(
     f: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -2169,8 +2162,6 @@ fn render_text_modal(
     f.render_widget(Paragraph::new(lines).block(block), modal);
 }
 
-/// `pieces` in rows of at most `width` columns, with `gap` between two
-/// pieces of a row. A piece longer than `width` gets a row of its own.
 fn pack<'a>(pieces: impl Iterator<Item = &'a str>, gap: &str, width: usize) -> Vec<String> {
     let mut rows: Vec<String> = Vec::new();
     for piece in pieces {
@@ -2554,8 +2545,6 @@ mod tests {
         }
     }
 
-    /// The words inside the border of the modal titled `title`, on a
-    /// terminal of `columns` columns, with one space between two words.
     fn modal_text(columns: u16, state: &State, title: &str) -> String {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(columns, 40)).unwrap();
         terminal.draw(|f| view(f, state)).unwrap();

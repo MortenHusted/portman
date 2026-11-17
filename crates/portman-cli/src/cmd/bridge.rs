@@ -109,9 +109,7 @@ fn bridge_command_lines(settled: Settled, desired_enabled: bool, verb: &str) -> 
     lines
 }
 
-/// What a disable removes besides the tunnel, in the words that the CLI and
-/// the TUI both show. Only a bridge on macOS has a DNS forwarder for a
-/// disable to remove.
+/// Only a bridge on macOS has a DNS forwarder for a disable to remove.
 pub(crate) fn disable_note() -> Option<String> {
     cfg!(target_os = "macos").then(|| {
         format!(
@@ -146,8 +144,6 @@ pub(crate) async fn cmd_bridge_mode(mode: Option<String>) -> Result<()> {
     }
 }
 
-/// What `portman bridge mode <mode>` prints when the daemon reports the
-/// mode. A bridge that waits for Docker has not started in it.
 fn bridge_mode_lines(settled: Settled, mode: NetbridgeMode) -> Vec<String> {
     let mut lines = vec![format!(
         "netbridge mode set to {}",

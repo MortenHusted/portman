@@ -10,13 +10,6 @@
 //!   3. Reduce to a single [`BridgeAssessment`] and publish it to the
 //!      [`Shared`] lock that the IPC Status handler reads.
 //!
-//! The check does not know the netbridge mode, and it reports
-//! `routes_missing` in `opt-in` mode for a labelled container that is not on
-//! the `portman` network. That report is true: `opt-in` routes the `portman`
-//! network only, the registry holds the container's address on another
-//! network, and the host has no route to that address. The container joins
-//! `portman`, or the mode becomes `docker`, to end it.
-//!
 //! This is the first daemon-side consumer of the Phase-A primitives. It
 //! deliberately doesn't depend on the Phase-A example code in
 //! `portman-netbridge`; those examples exist to prototype shapes before
@@ -166,11 +159,9 @@ async fn subnets_with_portman_containers(docker: &Docker) -> anyhow::Result<BTre
     Ok(out)
 }
 
-/// The names of the networks through which the host reaches the
-/// Portman-labelled containers of `containers`. A container on the `portman`
-/// network counts through that network only: the registry routes it to its
-/// address there, and the bridge routes that network in every mode. Any
-/// other labelled container counts through every network it is on.
+/// A container on the `portman` network counts through that network only:
+/// the registry routes it to its address there, and the bridge routes that
+/// network in every mode.
 fn networks_in_use(containers: &[ContainerSummary]) -> BTreeSet<String> {
     let mut networks_in_use: BTreeSet<String> = BTreeSet::new();
     for c in containers {
@@ -322,8 +313,6 @@ mod tests {
         assert_eq!(assess(&engine, &ifindex).await, BridgeAssessment::Offline);
     }
 
-    /// A running container on `networks`, each given as a name and an
-    /// address. `host` is its `dev.portman.host` label.
     fn container(host: Option<&str>, networks: &[(&str, &str)]) -> ContainerSummary {
         use bollard::models::{ContainerSummaryNetworkSettings, EndpointSettings};
         let endpoint = |address: &str| EndpointSettings {
@@ -346,7 +335,8 @@ mod tests {
     }
 
     #[test]
-    fn a_labelled_container_on_the_portman_network_counts_through_that_network_only() {
+    fn a_labelled_container_counts_through_portman_when_it_is_on_it_and_through_each_of_its_networks_otherwise(
+    ) {
         let web = Some("web.demo.test");
         let compose = ("demo_default", "172.18.0.2");
         let backend = ("acme_backend", "172.19.0.2");

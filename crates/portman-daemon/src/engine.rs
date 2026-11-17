@@ -265,9 +265,9 @@ async fn connect(
     Err(unreachable.unwrap_or_else(|| sockets.none_found()))
 }
 
-/// Why a probe got no version from the socket. bollard wraps the error of
-/// its HTTP client, and that error's own text names only the step of the
-/// client that failed. The cause at the end of the chain says what happened.
+/// bollard wraps the error of its HTTP client, and that error's own text
+/// names only the step of the client that failed. The cause at the end of
+/// the chain says what happened.
 fn unanswered(err: &bollard::errors::Error) -> String {
     let mut cause: &dyn std::error::Error = err;
     while let Some(deeper) = cause.source() {
