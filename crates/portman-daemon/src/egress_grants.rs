@@ -75,8 +75,10 @@ impl GrantStore {
     }
 
     fn observe(&self, _gate: &MutexGuard<'_, ()>, records: &mut Records) -> Result<u64> {
-        let now = self.clock.unix_secs();
+        // Monotonic before wall, the reverse of `started_at`. In this order
+        // the floor cannot pass `now` unless the wall clock went back.
         let since_start = self.clock.monotonic().duration_since(self.started_at.1);
+        let now = self.clock.unix_secs();
         let monotonic_floor = self.started_at.0.saturating_add(since_start.as_secs());
         let floor = records.observed_unix.max(monotonic_floor);
         if now < floor {
