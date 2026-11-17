@@ -2131,7 +2131,20 @@ destination: 172.18.0.0
     /// Runs the entrypoint of the setup image with a `dnsmasq` that prints
     /// its arguments, one on each line, and a VM that has `resolv_conf`.
     fn run_dns_mode(args: &[String], resolv_conf: &str) -> std::process::Output {
+        let prints_its_arguments = "#!/bin/sh\nprintf '%s\\n' \"$@\"\n";
+        run_dns_mode_with(prints_its_arguments, args, resolv_conf).1
+    }
+
+    /// Runs the entrypoint in its `dns` mode with `dnsmasq` as the program
+    /// of that name. Returns the process id of the entrypoint and what it
+    /// printed.
+    fn run_dns_mode_with(
+        dnsmasq: &str,
+        args: &[String],
+        resolv_conf: &str,
+    ) -> (u32, std::process::Output) {
         use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
 
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2140,12 +2153,12 @@ destination: 172.18.0.0
         let dir =
             std::env::temp_dir().join(format!("portman-dns-mode-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let dnsmasq = dir.join("dnsmasq");
-        std::fs::write(&dnsmasq, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
-        std::fs::set_permissions(&dnsmasq, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = dir.join("dnsmasq");
+        std::fs::write(&program, dnsmasq).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(dir.join("resolv.conf"), resolv_conf).unwrap();
 
-        let output = StdCommand::new("sh")
+        let entrypoint = StdCommand::new("sh")
             .arg(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/setup-image/entrypoint.sh"
@@ -2156,10 +2169,27 @@ destination: 172.18.0.0
                 format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()),
             )
             .env("RESOLV_CONF", dir.join("resolv.conf"))
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
+        let pid = entrypoint.id();
+        let output = entrypoint.wait_with_output().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
-        output
+        (pid, output)
+    }
+
+    #[test]
+    fn the_dns_mode_runs_dnsmasq_as_the_process_that_the_engine_started() {
+        let prints_its_process_id = "#!/bin/sh\necho $$\n";
+        let args = dns_forwarder_args(&tlds(&["test"]));
+
+        let (entrypoint, output) =
+            run_dns_mode_with(prints_its_process_id, &args, "nameserver 192.168.5.2\n");
+
+        assert!(output.status.success(), "{output:?}");
+        let dnsmasq = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(dnsmasq.trim(), entrypoint.to_string());
     }
 
     #[test]
@@ -2311,6 +2341,293 @@ destination: 172.18.0.0
         assert!(!image_has_dns_mode(Some(&labelled("0"))));
         assert!(!image_has_dns_mode(Some(&HashMap::new())));
         assert!(!image_has_dns_mode(None));
+    }
+
+    type Shared<T> = Arc<std::sync::Mutex<T>>;
+
+    /// A Docker engine inside the test, on a loopback port. It answers an
+    /// inspect with what it holds at the path and with 404 otherwise, drops
+    /// what a delete names, and takes any other request as done.
+    struct FakeEngine {
+        docker: Docker,
+        holds: Shared<HashMap<String, String>>,
+        /// The method and path of each request that is not an inspect, and
+        /// its body.
+        requests: Shared<Vec<(String, String)>>,
+    }
+
+    const IMAGE_INSPECT: &str = "/images/portman-netbridge/setup:local/json";
+    const IMAGE_WITH_DNS_MODE: &str = r#"{
+        "Id": "sha256:aaaa",
+        "Config": {"Labels": {"dev.portman.dns-forwarder": "1"}}
+    }"#;
+    const NETWORK_INSPECT: &str = "/networks/portman";
+    const OWN_NETWORK: &str = r#"{"Labels": {"dev.portman.managed": "1"}}"#;
+    const SETUP_INSPECT: &str = "/containers/portman-netbridge-setup/json";
+    const OWN_SETUP_CONTAINER: &str = r#"{
+        "Config": {"Labels": {"dev.portman.managed": "1", "dev.portman.role": "netbridge-setup"}},
+        "State": {"Running": true}
+    }"#;
+    const FORWARDER_INSPECT: &str = "/containers/portman-netbridge-dns/json";
+
+    impl FakeEngine {
+        /// An engine that holds the `portman` network and a setup image
+        /// with the `dns` mode.
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let holds = Shared::<HashMap<String, String>>::default();
+            let requests = Shared::<Vec<(String, String)>>::default();
+            let (held, asked) = (holds.clone(), requests.clone());
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(Self::answer(stream, held.clone(), asked.clone()));
+                }
+            });
+            let engine = Self {
+                docker: Docker::connect_with_http(&address, 5, bollard::API_DEFAULT_VERSION)
+                    .unwrap(),
+                holds,
+                requests,
+            };
+            engine.hold(IMAGE_INSPECT, IMAGE_WITH_DNS_MODE);
+            engine.hold(NETWORK_INSPECT, OWN_NETWORK);
+            engine
+        }
+
+        fn hold(&self, path: &str, json: &str) {
+            self.holds.lock().unwrap().insert(path.into(), json.into());
+        }
+
+        fn requests(&self) -> Vec<(String, String)> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        fn asked_for(&self) -> Vec<String> {
+            let requests = self.requests();
+            requests.into_iter().map(|(asked, _)| asked).collect()
+        }
+
+        /// A bridge on this engine, as far as the engine is concerned: it
+        /// holds a listen port and has no tunnel.
+        async fn bridge(&self) -> Runtime {
+            Runtime {
+                utun_name: "no-utun".to_string(),
+                setup_container_id: "aaaa1111".to_string(),
+                docker: self.docker.clone(),
+                listen_port: ListenPort::claim(0).await.unwrap(),
+                tasks: Vec::new(),
+            }
+        }
+
+        async fn answer(
+            mut stream: tokio::net::TcpStream,
+            holds: Shared<HashMap<String, String>>,
+            requests: Shared<Vec<(String, String)>>,
+        ) {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let Ok(byte) = stream.read_u8().await else {
+                    return;
+                };
+                head.push(byte);
+            }
+            let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .map_or(0, |length| length.trim().parse().unwrap());
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).await.unwrap();
+
+            let mut words = head.split(' ');
+            let (method, url) = (words.next().unwrap(), words.next().unwrap());
+            let path = url.split('?').next().unwrap();
+            let path = path
+                .strip_prefix("/v")
+                .map_or(path, |versioned| &versioned[versioned.find('/').unwrap()..]);
+            let (status, json) = match method {
+                "get" => match holds.lock().unwrap().get(path) {
+                    Some(json) => ("200 OK", json.clone()),
+                    None => ("404 Not Found", r#"{"message":"no such thing"}"#.into()),
+                },
+                _ => {
+                    let asked = format!("{} {path}", method.to_ascii_uppercase());
+                    let body = String::from_utf8(body).unwrap();
+                    requests.lock().unwrap().push((asked, body));
+                    match (method, path) {
+                        ("delete", _) => {
+                            let mut holds = holds.lock().unwrap();
+                            holds.remove(&format!("{path}/json"));
+                            holds.remove(path);
+                            ("204 No Content", String::new())
+                        }
+                        ("post", "/containers/create") => {
+                            ("201 Created", r#"{"Id":"eeee3333","Warnings":[]}"#.into())
+                        }
+                        _ => ("204 No Content", String::new()),
+                    }
+                }
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{json}",
+                json.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    }
+
+    /// The inspect of a forwarder container of portman's, from the image
+    /// that the fake engine holds.
+    fn held_forwarder(cmd: &[String], state: &str) -> String {
+        let cmd: Vec<String> = cmd.iter().map(|arg| format!("\"{arg}\"")).collect();
+        format!(
+            r#"{{
+                "Id": "dddd2222",
+                "Config": {{
+                    "Cmd": [{}],
+                    "Labels": {{
+                        "dev.portman.managed": "1",
+                        "dev.portman.role": "dns-forwarder",
+                        "dev.portman.setup-image": "sha256:aaaa"
+                    }}
+                }},
+                "State": {state}
+            }}"#,
+            cmd.join(", ")
+        )
+    }
+
+    const RUNNING: &str = r#"{"Running": true, "Restarting": false}"#;
+    const RESTARTING: &str = r#"{"Running": true, "Restarting": true}"#;
+
+    #[tokio::test]
+    async fn the_forwarder_is_created_on_the_host_network_and_restarts_with_the_vm() {
+        let engine = FakeEngine::start().await;
+        let managed = tlds(&["test"]);
+
+        let ensured = engine.bridge().await.ensure_dns_forwarder(&managed).await;
+
+        assert_eq!(ensured.unwrap(), DnsForwarder::InPlace);
+        let requests = engine.requests();
+        let asked: Vec<&str> = requests.iter().map(|(asked, _)| asked.as_str()).collect();
+        assert_eq!(
+            asked,
+            [
+                "POST /containers/create",
+                "POST /containers/portman-netbridge-dns/start"
+            ]
+        );
+        let created = &requests[0].1;
+        let cmd: Vec<String> = dns_forwarder_args(&managed)
+            .iter()
+            .map(|arg| format!("\"{arg}\""))
+            .collect();
+        for part in [
+            r#""Image":"portman-netbridge/setup:local""#.to_string(),
+            format!(r#""Cmd":[{}]"#, cmd.join(",")),
+            r#""NetworkMode":"host""#.to_string(),
+            r#""RestartPolicy":{"Name":"always"}"#.to_string(),
+            r#""dev.portman.managed":"1""#.to_string(),
+            r#""dev.portman.role":"dns-forwarder""#.to_string(),
+            r#""dev.portman.setup-image":"sha256:aaaa""#.to_string(),
+        ] {
+            assert!(created.contains(&part), "{part}\n{created}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_forwarder_is_removed_before_its_replacement_and_only_when_one_is_needed() {
+        let wanted = dns_forwarder_args(&tlds(&["test"]));
+        let for_another_tld_set = dns_forwarder_args(&tlds(&["acme"]));
+        let replaced = vec![
+            "DELETE /containers/dddd2222",
+            "POST /containers/create",
+            "POST /containers/portman-netbridge-dns/start",
+        ];
+        // the forwarder that the engine holds → (how the ensure ends, the requests)
+        let table = [
+            (
+                held_forwarder(&wanted, RUNNING),
+                Some(DnsForwarder::InPlace),
+                vec![],
+            ),
+            (
+                held_forwarder(&wanted, RESTARTING),
+                Some(DnsForwarder::Restarting),
+                vec![],
+            ),
+            (
+                held_forwarder(&for_another_tld_set, RUNNING),
+                Some(DnsForwarder::InPlace),
+                replaced.clone(),
+            ),
+            (
+                held_forwarder(&for_another_tld_set, RESTARTING),
+                Some(DnsForwarder::InPlace),
+                replaced.clone(),
+            ),
+            (
+                held_forwarder(&wanted, r#"{"Running": false}"#),
+                Some(DnsForwarder::InPlace),
+                replaced,
+            ),
+            (r#"{"Id": "dddd2222"}"#.to_string(), None, vec![]),
+        ];
+        for (forwarder, want, requests) in table {
+            let engine = FakeEngine::start().await;
+            engine.hold(FORWARDER_INSPECT, &forwarder);
+            let bridge = engine.bridge().await;
+
+            let ensured = bridge.ensure_dns_forwarder(&tlds(&["test"])).await;
+
+            assert_eq!(ensured.ok(), want, "{forwarder}");
+            assert_eq!(engine.asked_for(), requests, "{forwarder}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_image_without_the_dns_label_gets_no_forwarder() {
+        let engine = FakeEngine::start().await;
+        engine.hold(IMAGE_INSPECT, r#"{"Id": "sha256:aaaa", "Config": {}}"#);
+
+        let ensured = engine
+            .bridge()
+            .await
+            .ensure_dns_forwarder(&tlds(&["test"]))
+            .await;
+
+        assert_eq!(ensured.unwrap(), DnsForwarder::ImageWithoutDnsMode);
+        assert_eq!(engine.asked_for(), [] as [&str; 0]);
+    }
+
+    #[tokio::test]
+    async fn only_a_shutdown_for_a_disable_removes_the_forwarder_and_then_the_network() {
+        let wanted = dns_forwarder_args(&tlds(&["test"]));
+        let setup_container = [
+            "POST /containers/portman-netbridge-setup/stop",
+            "DELETE /containers/portman-netbridge-setup",
+        ];
+        let forwarder_then_network = ["DELETE /containers/dddd2222", "DELETE /networks/portman"];
+        // a disable → the requests of the shutdown
+        let table = [
+            (false, setup_container.to_vec()),
+            (true, [setup_container, forwarder_then_network].concat()),
+        ];
+        for (disable, requests) in table {
+            let engine = FakeEngine::start().await;
+            engine.hold(SETUP_INSPECT, OWN_SETUP_CONTAINER);
+            engine.hold(FORWARDER_INSPECT, &held_forwarder(&wanted, RUNNING));
+            let bridge = engine.bridge().await;
+
+            if disable {
+                bridge.shutdown_and_remove_network().await;
+            } else {
+                bridge.shutdown().await;
+            }
+
+            assert_eq!(engine.asked_for(), requests, "disable={disable}");
+        }
     }
 
     #[test]
