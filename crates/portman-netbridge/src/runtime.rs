@@ -2835,6 +2835,72 @@ destination: 172.18.0.0
         assert_eq!(logged.take_warnings(), [] as [&str; 0]);
     }
 
+    #[test]
+    fn a_route_pass_runs_no_command_for_a_utun_that_its_bridge_let_go_of() {
+        let utun = "utun-let-go-before-the-pass";
+        let pass = [
+            RouteCommand::add("192.0.2.0/24", utun),
+            RouteCommand::add("198.51.100.0/24", utun),
+        ];
+        let ran = std::cell::RefCell::new(Vec::new());
+        let route = |args: &[&str]| {
+            ran.borrow_mut().push(args.join(" "));
+            route_ended(0, "")
+        };
+
+        remember_own_utun(utun);
+        reconcile_routes(&route, &pass);
+        assert_eq!(
+            ran.take(),
+            [
+                "-n get 192.0.2.0",
+                "-n add -net 192.0.2.0/24 -interface utun-let-go-before-the-pass",
+                "-n get 198.51.100.0",
+                "-n add -net 198.51.100.0/24 -interface utun-let-go-before-the-pass",
+            ]
+        );
+
+        forget_own_utun(utun);
+        reconcile_routes(&route, &pass);
+        assert_eq!(ran.take(), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn a_bridge_lets_go_of_its_utun_only_after_the_route_command_that_runs_for_it() {
+        use std::sync::mpsc;
+
+        let utun = "utun-let-go-during-a-command";
+        remember_own_utun(utun);
+        let (started, command_runs) = mpsc::channel();
+        let (may_end, ends) = mpsc::channel::<()>();
+        let pass = std::thread::spawn(move || {
+            let route = |_: &[&str]| {
+                let _ = started.send(());
+                let _ = ends.recv();
+                route_ended(0, "")
+            };
+            reconcile_routes(&route, &[RouteCommand::add("192.0.2.0/24", utun)]);
+        });
+        command_runs.recv().unwrap();
+
+        let (let_go, lets_go) = mpsc::channel();
+        let bridge = std::thread::spawn(move || {
+            forget_own_utun(utun);
+            let_go.send(()).unwrap();
+        });
+
+        assert!(
+            lets_go.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the bridge let go of its utun while a route command for it ran"
+        );
+        drop(may_end);
+        lets_go
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the bridge lets go once the command has ended");
+        pass.join().unwrap();
+        bridge.join().unwrap();
+    }
+
     #[tokio::test]
     async fn a_shutdown_for_a_disable_asks_for_a_network_in_use_once_and_warns_once() {
         let engine = FakeEngine::start().await;
