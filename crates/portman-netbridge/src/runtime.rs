@@ -588,16 +588,19 @@ fn spawn_route_reconciler(docker: Docker, mode: NetbridgeMode, iface: String) ->
                 }
             };
             let cmds = startup_route_plan(&iface, &extra_route_cidrs);
-            let _ = tokio::task::spawn_blocking(move || {
-                for cmd in cmds {
-                    if let Err(err) = ensure_route_command(&cmd) {
-                        warn!(cidr = %cmd.cidr, iface = %cmd.iface, %err, "netbridge route reconcile failed");
-                    }
-                }
-            })
-            .await;
+            let _ = tokio::task::spawn_blocking(move || reconcile_routes(&cmds)).await;
         }
     })
+}
+
+/// One pass of the route reconciler. It runs on a blocking thread, and the
+/// abort of the reconciler task does not end it.
+fn reconcile_routes(cmds: &[RouteCommand]) {
+    for cmd in cmds {
+        if let Err(err) = ensure_route_command(cmd) {
+            warn!(cidr = %cmd.cidr, iface = %cmd.iface, %err, "netbridge route reconcile failed");
+        }
+    }
 }
 
 // ── Docker helpers ─────────────────────────────────────────────────
@@ -2786,6 +2789,30 @@ destination: 172.18.0.0
             let warnings = text.lines().filter(|line| line.contains(" WARN "));
             warnings.map(String::from).collect()
         }
+    }
+
+    /// On macOS only: the `route` of Linux takes these arguments for a
+    /// request for its usage text and exits with 0.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_route_that_fails_is_a_warning_only_while_the_bridge_holds_its_utun() {
+        // No interface has this name, so no route command for it succeeds.
+        let utun = "utun-of-no-bridge";
+        let pass = [RouteCommand::add("192.0.2.0/24", utun)];
+        let (logged, _capture) = Logged::capture();
+
+        remember_own_utun(utun);
+        reconcile_routes(&pass);
+        let warnings = logged.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("route reconcile failed"),
+            "{warnings:?}"
+        );
+
+        forget_own_utun(utun);
+        reconcile_routes(&pass);
+        assert_eq!(logged.warnings(), [] as [&str; 0]);
     }
 
     #[tokio::test]
