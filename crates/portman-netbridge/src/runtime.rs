@@ -1124,29 +1124,42 @@ async fn create_dns_forwarder(docker: &Docker, image: &str, cmd: Vec<String>) ->
 }
 
 /// Removes the forwarder container when it carries portman's labels, by the
-/// id that carried them. One that is absent is passed over.
+/// id that carried them. One that is absent is passed over, and so is a
+/// container of that name that something else owns.
 async fn remove_dns_forwarder(docker: &Docker, _held: &ListenPort) -> Result<()> {
     let Some(found) = dns_forwarder_snapshot(docker).await? else {
         return Ok(());
     };
     if !carries_portman_role(Some(&found.labels), DNS_ROLE_LABEL_VALUE) {
-        anyhow::bail!("docker container `{DNS_CONTAINER}` exists but is not managed by portman");
+        warn!(
+            container = DNS_CONTAINER,
+            "skipping dns forwarder removal because it is not marked as portman-managed"
+        );
+        return Ok(());
     }
     let opts = RemoveContainerOptionsBuilder::default().force(true).build();
     match docker.remove_container(&found.id, Some(opts)).await {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            info!(container = DNS_CONTAINER, "dns forwarder container removed");
+            Ok(())
+        }
         Err(err) if docker_not_found(&err) => Ok(()),
         Err(err) => Err(err).context("removing the dns forwarder container"),
     }
 }
 
-async fn best_effort_remove_dns_forwarder(docker: &Docker, held: &ListenPort) {
-    if let Err(err) = remove_dns_forwarder(docker, held).await {
-        warn!(
-            container = DNS_CONTAINER,
-            error = %err,
-            "could not remove the dns forwarder container"
-        );
+/// Whether the engine is left with no forwarder of portman's.
+async fn best_effort_remove_dns_forwarder(docker: &Docker, held: &ListenPort) -> bool {
+    match remove_dns_forwarder(docker, held).await {
+        Ok(()) => true,
+        Err(err) => {
+            warn!(
+                container = DNS_CONTAINER,
+                error = %err,
+                "could not remove the dns forwarder container"
+            );
+            false
+        }
     }
 }
 
@@ -1198,14 +1211,16 @@ pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Left
         }
     };
     let container_gone = best_effort_remove_setup_container(docker, &held).await;
-    let network = match leftovers {
-        Leftovers::SetupContainer => None,
+    let (forwarder_gone, network) = match leftovers {
+        Leftovers::SetupContainer => (true, None),
         Leftovers::SetupContainerAndNetwork => {
-            best_effort_remove_dns_forwarder(docker, &held).await;
-            Some(remove_portman_network_if_owned(docker, &held).await)
+            let forwarder_gone = best_effort_remove_dns_forwarder(docker, &held).await;
+            let network = remove_portman_network_if_owned(docker, &held).await;
+            (forwarder_gone, Some(network))
         }
     };
     match network {
+        _ if !forwarder_gone => Cleanup::Owed,
         Some(NetworkCleanup::InUse) => Cleanup::Complete,
         None | Some(NetworkCleanup::NoneLeft) if container_gone => Cleanup::Complete,
         None | Some(NetworkCleanup::NoneLeft | NetworkCleanup::Owed) => Cleanup::Owed,

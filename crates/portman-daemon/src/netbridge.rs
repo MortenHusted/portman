@@ -359,8 +359,8 @@ fn backoff(failures: u32) -> Duration {
 /// owes the setup container and no network.
 #[derive(Default)]
 struct Debt {
-    /// A `Disable` asked for the docker network to go, and no cleanup has
-    /// run to its end since.
+    /// A `Disable` asked for the DNS forwarder and the docker network to go,
+    /// and no cleanup has run to its end since.
     network: bool,
     /// The session that had its cleanup. Every other session is owed one.
     swept: Option<Session>,
@@ -2181,6 +2181,7 @@ mod tests {
         fake.hold(SETUP_CONTAINER, OWN_SETUP_CONTAINER);
         fake.hold(NETWORK, OWN_NETWORK);
         fake.hold(FORWARDER, OWN_FORWARDER);
+        fake.hold(&format!("{FORWARDER_BY_ID}/json"), OWN_FORWARDER);
         (engine, fake)
     }
 
@@ -2249,8 +2250,13 @@ mod tests {
             .await;
 
         let lines = logged.lines();
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        for (line, removed) in lines.iter().zip(["portman-netbridge-setup", "network"]) {
+        let removals = [
+            "portman-netbridge-setup",
+            "portman-netbridge-dns",
+            "network",
+        ];
+        assert_eq!(lines.len(), removals.len(), "{lines:?}");
+        for (line, removed) in lines.iter().zip(removals) {
             assert!(line.contains("INFO"), "{line}");
             assert!(line.contains("removed"), "{line}");
             assert!(line.contains(removed), "{line}");
@@ -2634,6 +2640,96 @@ mod tests {
             !calls
                 .iter()
                 .any(|call| call.starts_with("DELETE /containers")),
+            "{calls:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_a_forwarder_that_could_not_be_removed_keeps_a_cleanup_owed() {
+        let anothers_container = r#"{"Id": "dddd2222", "Config": {"Labels": {}}}"#;
+        let unreadable = "not an answer to an inspect";
+        let both = SetupContainerAndNetwork;
+        let network_in_use = Some((NETWORK, IN_USE));
+        let forwarder_stays = Some((FORWARDER_BY_ID, ENGINE_FAILED));
+        let (complete, owed) = (Cleanup::Complete, Cleanup::Owed);
+        // (forwarder, the removal that fails, asked for)
+        //     → (how the cleanup ends, the engine was asked to remove the forwarder)
+        let cases = [
+            (OWN_FORWARDER, None, both, complete, true),
+            (OWN_FORWARDER, network_in_use, both, complete, true),
+            (OWN_FORWARDER, forwarder_stays, both, owed, true),
+            (unreadable, None, both, owed, false),
+            (unreadable, network_in_use, both, owed, false),
+            (anothers_container, None, both, complete, false),
+            (unreadable, None, SetupContainer, complete, false),
+        ];
+        for (forwarder, fails, leftovers, want, asked) in cases {
+            let case = format!("{forwarder} {fails:?} {leftovers:?}");
+            let (engine, fake) = engine_with_leftovers(FREE_PORT);
+            fake.hold(FORWARDER, forwarder);
+            if let Some((path, answer)) = fails {
+                fake.fail_delete(path, Some(answer));
+            }
+
+            let cleanup = engine.remove_leftovers(Session(1), leftovers).await;
+
+            assert_eq!(cleanup, want, "{case}");
+            let calls = fake.calls();
+            let removal_of = |path: &str| {
+                calls
+                    .iter()
+                    .position(|call| call == &format!("DELETE {path}"))
+            };
+            assert_eq!(removal_of(FORWARDER_BY_ID).is_some(), asked, "{case}");
+            if let (Some(forwarder), Some(network)) =
+                (removal_of(FORWARDER_BY_ID), removal_of(NETWORK))
+            {
+                assert!(forwarder < network, "{case}\n{calls:?}");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_with_no_session_removes_the_forwarder_and_then_the_network_when_one_opens() {
+        let (engine, publisher) = crate::engine::channel();
+        let engine = LinkedEngine {
+            link: engine.watch(),
+            listen_port: FREE_PORT,
+        };
+        let (handle, rx, phase_tx) = handle_pair();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("netbridge.json");
+        let tlds = KnownTlds::default();
+        tokio::spawn(converge(
+            engine,
+            handle.clone(),
+            rx,
+            phase_tx,
+            state_path,
+            false,
+            tlds,
+        ));
+        handle.tx.send(Control::Disable).await.unwrap();
+        tokio::time::sleep(LONGEST_WAIT).await;
+
+        let fake = crate::engine::tests::connect(&publisher);
+        fake.hold(SETUP_CONTAINER, OWN_SETUP_CONTAINER);
+        fake.hold(NETWORK, OWN_NETWORK);
+        fake.hold(FORWARDER, OWN_FORWARDER);
+        tokio::time::sleep(LONGEST_WAIT).await;
+
+        let calls = fake.calls();
+        let removed: Vec<_> = calls
+            .iter()
+            .filter_map(|call| call.strip_prefix("DELETE "))
+            .collect();
+        assert_eq!(
+            removed,
+            [
+                "/containers/portman-netbridge-setup",
+                FORWARDER_BY_ID,
+                NETWORK
+            ],
             "{calls:?}"
         );
     }
