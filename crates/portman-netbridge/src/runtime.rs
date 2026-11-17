@@ -2231,6 +2231,16 @@ destination: 172.18.0.0
         assert!(said.contains("names no nameserver"), "{said}");
     }
 
+    #[test]
+    fn the_dns_mode_fails_and_says_why_when_no_dnsmasq_argument_follows() {
+        let output = run_dns_mode(&["dns".to_string()], "nameserver 192.168.5.2\n");
+
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(output.stdout, b"", "dnsmasq ran");
+        let said = String::from_utf8_lossy(&output.stderr);
+        assert!(said.contains("needs dnsmasq arguments"), "{said}");
+    }
+
     fn forwarder(
         labels: &[(&str, &str)],
         cmd: &[&str],
@@ -2538,6 +2548,7 @@ destination: 172.18.0.0
         ] {
             assert!(created.contains(&part), "{part}\n{created}");
         }
+        assert!(!created.contains("CapAdd"), "{created}");
     }
 
     #[tokio::test]
