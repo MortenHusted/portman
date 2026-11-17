@@ -321,7 +321,8 @@ fn reported_mode(intent: &NetbridgeState, running: Option<Built>) -> NetbridgeMo
 struct Attempts {
     host_kp: Keypair,
     failures: u32,
-    retry_after: Option<Duration>,
+    /// When the next attempt is due, while a failed one waits for it.
+    retry_at: Option<Instant>,
 }
 
 impl Attempts {
@@ -329,7 +330,7 @@ impl Attempts {
         Self {
             host_kp: Keypair::generate(),
             failures: 0,
-            retry_after: None,
+            retry_at: None,
         }
     }
 
@@ -351,7 +352,7 @@ impl Attempts {
                     retry_in_secs = retry_after.as_secs(),
                     "netbridge start failed"
                 );
-                self.retry_after = Some(retry_after);
+                self.retry_at = Some(Instant::now() + retry_after);
                 None
             }
         }
@@ -507,7 +508,7 @@ async fn converge<E: BridgeEngine>(
             running.as_ref(),
         )
         .await;
-        let may_start = attempts.retry_after.is_none();
+        let may_start = attempts.retry_at.is_none();
         let tlds = managed_tlds(&known_tlds);
         let now = Instant::now();
         let forwarded = running.as_ref().map(|r| r.forwarded.as_ref());
@@ -517,17 +518,17 @@ async fn converge<E: BridgeEngine>(
             Step::Keep => {
                 // A start waits only while no bridge runs, and a forwarder
                 // only while one does, so one timer serves both.
-                let forwarder_retry = forwarded
-                    .flatten()
-                    .and_then(|last| last.retry_at)
+                let forwarder_retry = forwarded.flatten().and_then(|last| last.retry_at);
+                let retry_after = attempts
+                    .retry_at
+                    .or(forwarder_retry)
                     .map(|at| at.saturating_duration_since(now));
-                let retry_after = attempts.retry_after.or(forwarder_retry);
                 let tlds_changed = &handle.tlds_changed;
                 match next_wake(&mut rx, &mut engine, tlds_changed, retry_after).await {
                     Wake::Control(msg) => {
                         take(msg, &mut wanted, &mut attempts, &mut debt, &state_path);
                     }
-                    Wake::RetryDue => attempts.retry_after = None,
+                    Wake::RetryDue => attempts.retry_at = None,
                     Wake::SessionChanged | Wake::TldsChanged => {}
                     Wake::Closed => return Ok(()),
                 }
@@ -1191,21 +1192,22 @@ mod tests {
         assert_eq!(backoff(u32::MAX), Duration::from_secs(60));
     }
 
-    #[test]
-    fn a_start_that_succeeds_ends_its_sequence() {
+    #[tokio::test(start_paused = true)]
+    async fn a_start_that_succeeds_ends_its_sequence() {
         let failed = || Err::<(), _>(anyhow::anyhow!("no container engine"));
+        let now = Instant::now();
         let mut attempts = Attempts::new();
         let first_key = attempts.host_kp.public_base64();
         attempts.settle(failed());
         attempts.settle(failed());
-        assert_eq!(attempts.retry_after, Some(Duration::from_secs(10)));
+        assert_eq!(attempts.retry_at, Some(now + Duration::from_secs(10)));
         assert_eq!(attempts.host_kp.public_base64(), first_key);
 
         assert_eq!(attempts.settle(Ok(())), Some(()));
 
         assert_ne!(attempts.host_kp.public_base64(), first_key);
         attempts.settle(failed());
-        assert_eq!(attempts.retry_after, Some(RETRY_BASE));
+        assert_eq!(attempts.retry_at, Some(now + RETRY_BASE));
     }
 
     struct Attempt {
