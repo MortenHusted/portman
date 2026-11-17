@@ -2975,7 +2975,7 @@ mod tests {
         let sup = test_supervisor(&dir, CollectSink::new());
         let port = port_claimed_across_test_processes();
 
-        let mut svc = def("porty", &["/bin/sleep", "10"], dir.path());
+        let mut svc = def("porty", &["/bin/sleep", "300"], dir.path());
         svc.ready = ReadyCheck::Port(port);
         svc.restart = RestartPolicy::Never;
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
@@ -3501,10 +3501,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let sup = test_supervisor(&dir, CollectSink::new());
 
-        let mut dep = def("dep", &["/bin/sleep", "10"], dir.path());
+        let mut dep = def("dep", &["/bin/sleep", "300"], dir.path());
         dep.ready = ReadyCheck::DelayMs(250);
         dep.restart = RestartPolicy::Always;
-        let mut top = def("top", &["/bin/sleep", "10"], dir.path());
+        let mut top = def("top", &["/bin/sleep", "300"], dir.path());
         top.depends = vec!["dep".to_string()];
         top.restart = RestartPolicy::Always;
         sup.sync(dir.path(), vec![dep, top], Map::new(), Map::new())
@@ -3536,10 +3536,10 @@ mod tests {
         let sup = test_supervisor(&dir, CollectSink::new());
 
         // `db` is a config error (missing env_file): Failed at once, no retry.
-        let mut db = def("db", &["/bin/sleep", "10"], dir.path());
+        let mut db = def("db", &["/bin/sleep", "300"], dir.path());
         db.restart = RestartPolicy::Always;
         db.env_files = vec![dir.path().join("gone.env")];
-        let mut web = def("web", &["/bin/sleep", "10"], dir.path());
+        let mut web = def("web", &["/bin/sleep", "300"], dir.path());
         web.depends = vec!["db".to_string()];
         web.restart = RestartPolicy::Always;
         sup.sync(dir.path(), vec![db.clone(), web], Map::new(), Map::new())
@@ -3561,7 +3561,7 @@ mod tests {
         // Fix the config: the re-sync restarts `db`, and `web` follows.
         db.env_files.clear();
         let web_def = {
-            let mut w = def("web", &["/bin/sleep", "10"], dir.path());
+            let mut w = def("web", &["/bin/sleep", "300"], dir.path());
             w.depends = vec!["db".to_string()];
             w.restart = RestartPolicy::Always;
             w
@@ -3583,9 +3583,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let sup = test_supervisor(&dir, CollectSink::new());
 
-        let mut a = def("a", &["/bin/sleep", "10"], dir.path());
+        let mut a = def("a", &["/bin/sleep", "300"], dir.path());
         a.restart = RestartPolicy::Always;
-        let mut b = def("b", &["/bin/sleep", "10"], dir.path());
+        let mut b = def("b", &["/bin/sleep", "300"], dir.path());
         b.depends = vec!["a".to_string()];
         b.restart = RestartPolicy::Always;
         sup.sync(dir.path(), vec![a, b], Map::new(), Map::new())
@@ -3602,7 +3602,7 @@ mod tests {
     async fn desired_state_persists_and_reloads() {
         let dir = tempdir().unwrap();
         let sup = test_supervisor(&dir, CollectSink::new());
-        let mut svc = def("keeper", &["/bin/sleep", "10"], dir.path());
+        let mut svc = def("keeper", &["/bin/sleep", "300"], dir.path());
         svc.restart = RestartPolicy::Always;
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
@@ -3628,7 +3628,7 @@ mod tests {
     async fn restore_without_autostart_keeps_services_down() {
         let dir = tempdir().unwrap();
         let sup = test_supervisor(&dir, CollectSink::new());
-        let mut svc = def("keeper", &["/bin/sleep", "10"], dir.path());
+        let mut svc = def("keeper", &["/bin/sleep", "300"], dir.path());
         svc.restart = RestartPolicy::Always;
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
@@ -3721,7 +3721,7 @@ mod tests {
         let mut child = dead;
         child.wait().unwrap();
 
-        let svc = def("ghost", &["/bin/sleep", "10"], dir.path());
+        let svc = def("ghost", &["/bin/sleep", "300"], dir.path());
         let persisted = Persisted {
             version: 1,
             services: Map::from([(
@@ -3734,7 +3734,7 @@ mod tests {
                         pid: dead_pid,
                         pgid: dead_pid as i32,
                         spawn_unix_ms: crate::now_unix_ms(),
-                        argv: vec!["/bin/sleep".into(), "10".into()],
+                        argv: vec!["/bin/sleep".into(), "300".into()],
                     }),
                 },
             )]),
@@ -3766,7 +3766,7 @@ mod tests {
             .unwrap()
             .as_raw();
 
-        let svc = def("imposter", &["/bin/sleep", "10"], dir.path());
+        let svc = def("imposter", &["/bin/sleep", "300"], dir.path());
         let persisted = Persisted {
             version: 1,
             services: Map::from([(
@@ -3803,9 +3803,9 @@ mod tests {
         let sink = CollectSink::new();
         let sup = test_supervisor(&dir, sink.clone());
 
-        let mut one = def("one", &["/bin/sh", "-c", "echo v1; sleep 10"], dir.path());
+        let mut one = def("one", &["/bin/sh", "-c", "echo v1; sleep 300"], dir.path());
         one.restart = RestartPolicy::Always;
-        let mut two = def("two", &["/bin/sleep", "10"], dir.path());
+        let mut two = def("two", &["/bin/sleep", "300"], dir.path());
         two.restart = RestartPolicy::Always;
         sup.sync(dir.path(), vec![one.clone(), two], Map::new(), Map::new())
             .await
@@ -3825,7 +3825,7 @@ mod tests {
 
         // Change `one`, drop `two`.
         let mut one_v2 = one.clone();
-        one_v2.run = vec!["/bin/sh".into(), "-c".into(), "echo v2; sleep 10".into()];
+        one_v2.run = vec!["/bin/sh".into(), "-c".into(), "echo v2; sleep 300".into()];
         let report = sup
             .sync(dir.path(), vec![one_v2], Map::new(), Map::new())
             .await
@@ -3853,9 +3853,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let sup = test_supervisor(&dir, CollectSink::new());
 
-        let mut one = def("one", &["/bin/sleep", "10"], dir.path());
+        let mut one = def("one", &["/bin/sleep", "300"], dir.path());
         one.restart = RestartPolicy::Always;
-        let mut two = def("two", &["/bin/sleep", "10"], dir.path());
+        let mut two = def("two", &["/bin/sleep", "300"], dir.path());
         two.restart = RestartPolicy::Always;
         sup.sync(dir.path(), vec![one, two], Map::new(), Map::new())
             .await
@@ -3904,8 +3904,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let sup = test_supervisor(&dir, CollectSink::new());
 
-        let db = def("db", &["/bin/sleep", "10"], dir.path());
-        let mut web = def("web", &["/bin/sleep", "10"], dir.path());
+        let db = def("db", &["/bin/sleep", "300"], dir.path());
+        let mut web = def("web", &["/bin/sleep", "300"], dir.path());
         web.depends = vec!["db".into()];
         sup.sync(dir.path(), vec![db, web], Map::new(), Map::new())
             .await
@@ -4242,7 +4242,7 @@ mod tests {
     }
 
     fn routed_def(name: &str, host: &str, port: u16, dir: &Path) -> ServiceDefinition {
-        let mut svc = def(name, &["/bin/sleep", "10"], dir);
+        let mut svc = def(name, &["/bin/sleep", "300"], dir);
         svc.host = Some(host.to_string());
         svc.port = Some(port);
         svc.ready = ReadyCheck::None;
@@ -4797,7 +4797,7 @@ mod tests {
         ]);
         let sup = secrets_supervisor(&dir, source, CollectSink::new());
 
-        let mut svc = def("flaky", &["/bin/sleep", "10"], dir.path());
+        let mut svc = def("flaky", &["/bin/sleep", "300"], dir.path());
         svc.restart = RestartPolicy::Always;
         svc.secrets = vec!["stub".to_string()];
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
@@ -4817,7 +4817,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let sup = test_supervisor(&dir, CollectSink::new());
 
-        let mut svc = def("envless", &["/bin/sleep", "10"], dir.path());
+        let mut svc = def("envless", &["/bin/sleep", "300"], dir.path());
         svc.restart = RestartPolicy::Always; // a config error must short-circuit this
         svc.env_files = vec![dir.path().join("gone.env")];
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
@@ -4837,7 +4837,7 @@ mod tests {
         let source = ScriptedSecrets::new(vec![Err(SecretsError::fatal("auth rejected"))]);
         let sup = secrets_supervisor(&dir, source, CollectSink::new());
 
-        let mut svc = def("rejected", &["/bin/sleep", "10"], dir.path());
+        let mut svc = def("rejected", &["/bin/sleep", "300"], dir.path());
         svc.restart = RestartPolicy::Always; // fatal must short-circuit this
         svc.secrets = vec!["stub".to_string()];
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
@@ -4857,7 +4857,7 @@ mod tests {
         let source = ScriptedSecrets::new(vec![Err(SecretsError::fatal("no identity stored"))]);
         let sup = secrets_supervisor(&dir, source, CollectSink::new());
 
-        let mut svc = def("fallback", &["/bin/sleep", "10"], dir.path());
+        let mut svc = def("fallback", &["/bin/sleep", "300"], dir.path());
         svc.restart = RestartPolicy::Always;
         svc.secrets = vec!["stub".to_string()];
         svc.secrets_optional = true;
@@ -4879,7 +4879,7 @@ mod tests {
     async fn shutdown_preserves_desired_state_for_boot_restore() {
         let dir = tempdir().unwrap();
         let sup = test_supervisor(&dir, CollectSink::new());
-        let mut svc = def("boots", &["/bin/sleep", "10"], dir.path());
+        let mut svc = def("boots", &["/bin/sleep", "300"], dir.path());
         svc.restart = RestartPolicy::Always;
         sup.sync(dir.path(), vec![svc], Map::new(), Map::new())
             .await
