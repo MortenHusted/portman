@@ -1610,11 +1610,17 @@ fn route_in_flight() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn remember_own_utun(name: &str) {
+/// The let-go of a utun runs in the `drop` of [`OwnHalf`], also while a pump
+/// unwinds from a panic, and a second panic there would abort the daemon. So
+/// a poisoned lock is read as it is.
+fn own_utuns() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
     OWN_UTUNS
         .lock()
-        .expect("own-utun lock poisoned")
-        .insert(name.to_string());
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn remember_own_utun(name: &str) {
+    own_utuns().insert(name.to_string());
 }
 
 /// Ends the claim on `name` and waits for the `route` command that runs at
@@ -1623,18 +1629,12 @@ fn remember_own_utun(name: &str) {
 /// one command: at most [`ROUTE_LIMIT`], and [`KILL_GRACE`] after it for a
 /// command that was killed.
 fn forget_own_utun(name: &str) {
-    OWN_UTUNS
-        .lock()
-        .expect("own-utun lock poisoned")
-        .remove(name);
+    own_utuns().remove(name);
     drop(route_in_flight());
 }
 
 fn is_own_utun(name: &str) -> bool {
-    OWN_UTUNS
-        .lock()
-        .expect("own-utun lock poisoned")
-        .contains(name)
+    own_utuns().contains(name)
 }
 
 /// Does `iface` still exist on the host?
@@ -3241,6 +3241,27 @@ destination: 172.18.0.0
                 "tasks_between={tasks_between}"
             );
         }
+    }
+
+    #[test]
+    fn a_pump_that_ends_lets_go_of_the_utun_through_a_poisoned_lock() {
+        let utun = "utun-under-a-poisoned-lock";
+        let poisons = std::thread::spawn(|| {
+            let _held = OWN_UTUNS.lock();
+            panic!("a panic under the lock of the utun names");
+        });
+        assert!(poisons.join().is_err());
+        assert!(OWN_UTUNS.is_poisoned());
+
+        remember_own_utun(utun);
+        assert!(is_own_utun(utun));
+        drop(OwnHalf {
+            utun: utun.to_string(),
+            half: (),
+        });
+        assert!(!is_own_utun(utun));
+
+        OWN_UTUNS.clear_poison();
     }
 
     #[tokio::test]
