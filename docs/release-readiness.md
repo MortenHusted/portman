@@ -59,9 +59,15 @@ installation is conservative while docker-mac-net-connect is still running:
 Portman leaves specific routes through foreign live `utun` interfaces in place
 and keeps reconciling. After the legacy bridge stops and the route
 disappears, Portman can claim the missing labelled-network route without
-mutating chipmk resources or Docker containers. While the native bridge is up,
-health reports `routes_missing` for routes through a different live interface;
-interface existence alone does not prove the route reaches Portman's bridge.
+mutating chipmk resources or Docker containers.
+
+Bridge health asks for a route to the `portman` network alone for a labelled
+container that the registry routes to its address on that network, and for a
+route to each network of any other labelled container. So a missing route to
+the second network of a container on `portman` leaves the health at `healthy`.
+While the native bridge is up, health reports `routes_missing` when one of the
+routes it asks for goes through a different live interface; interface existence
+alone does not prove the route reaches Portman's bridge.
 
 `portman doctor` is the default-driver check. It reports daemon
 reachability, bridge health/mode, setup-image status, docker-mac-net-connect

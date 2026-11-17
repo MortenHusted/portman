@@ -595,10 +595,14 @@ pub enum Response {
         #[serde(default = "default_empty_string")]
         cert_dir: String,
         /// Current macOS-host ↔ VM bridge health assessment.
-        /// `Healthy` — bridge observed routing all docker subnets that
-        /// currently have containers via a live utun; `RoutesMissing` —
-        /// docker reports containers on subnet X but host has no route to X
-        /// via any utun interface (i.e. the wrapped bridge has flapped);
+        /// It covers the subnets of the `portman` network for a labelled
+        /// container that the registry routes to its address there, and
+        /// the subnets of each network of any other labelled container.
+        /// `Healthy` — each of those subnets is routed via the bridge's
+        /// utun, or via any live utun while the native bridge is off;
+        /// `RoutesMissing` — the host has no such route to one of them, as
+        /// when the bridge mode does not route that network or a route is
+        /// gone;
         /// `TunnelDead` — a route exists but names a utun that no longer
         /// exists, so traffic is black-holed while the routing table looks
         /// correct; `Offline` — docker itself unreachable; `Unknown` —
