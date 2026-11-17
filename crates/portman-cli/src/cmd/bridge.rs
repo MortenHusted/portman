@@ -1,11 +1,10 @@
 //! Netbridge commands: status, enable/disable, mode, prepare, doctor.
 
-use crate::client::{bridge_enabled, wait_for_bridge_state};
+use crate::client::{bridge_status, wait_for_bridge_mode, wait_for_bridge_state, Settled};
 use crate::cmd::run_setup_image_build;
 use crate::doctor;
 use anyhow::{bail, Result};
-use portman_protocol::NetbridgeMode;
-use tokio::time::{sleep, Duration};
+use portman_protocol::{BridgeAssessment, BridgePhase, DockerStatus, NetbridgeMode};
 
 use crate::client::request;
 use portman_protocol::{Request, Response};
@@ -15,20 +14,20 @@ pub(crate) async fn cmd_bridge_status() -> Result<()> {
         Response::Status {
             bridge_assessment,
             bridge_enabled,
+            bridge_phase,
             bridge_mode,
+            docker,
             ..
         } => {
-            println!("bridge:    {bridge_assessment}");
-            println!(
-                "netbridge: {}",
-                if bridge_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
+            let routes = doctor::collect_docker_routes().await;
+            let lines = bridge_status_lines(
+                bridge_assessment,
+                bridge_phase.or_from_enabled(bridge_enabled),
+                bridge_mode,
+                docker.as_ref(),
+                &routes,
             );
-            println!("mode:      {}", NetbridgeMode::display_word(bridge_mode));
-            for line in doctor::render_docker_routes(&doctor::collect_docker_routes()) {
+            for line in lines {
                 println!("{line}");
             }
             Ok(())
@@ -37,52 +36,78 @@ pub(crate) async fn cmd_bridge_status() -> Result<()> {
     }
 }
 
+/// What `portman bridge status` prints. `routes` is what the `docker` CLI
+/// found. A daemon that reports no engine state gets no `docker` line.
+fn bridge_status_lines(
+    assessment: BridgeAssessment,
+    phase: BridgePhase,
+    mode: NetbridgeMode,
+    docker: Option<&DockerStatus>,
+    routes: &doctor::DockerRouteStatus,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!("bridge:    {assessment}"),
+        format!("netbridge: {}", phase.display_word()),
+        format!("mode:      {}", NetbridgeMode::display_word(mode)),
+    ];
+    lines.extend(docker.map(|docker| format!("docker:    {}", docker.summary())));
+    lines.extend(doctor::docker_cli_note(
+        docker,
+        &[routes.cli_answer()],
+        "labelled docker networks lines",
+    ));
+    lines.extend(doctor::render_docker_routes(routes));
+    lines
+}
+
 pub(crate) async fn cmd_doctor() -> Result<()> {
+    let daemon = doctor::DaemonSnapshot::from_status(request(Request::Status).await.ok());
+    let routes = match request(Request::ListEntries).await {
+        Ok(Response::Entries { entries }) => entries,
+        _ => Vec::new(),
+    };
+    let (setup_image, docker_routes, dns_forwarder) = tokio::join!(
+        doctor::inspect_setup_image(),
+        doctor::collect_docker_routes(),
+        doctor::inspect_dns_forwarder(daemon.bridge_phase, &routes),
+    );
     let report = doctor::DoctorReport {
-        daemon: daemon_snapshot().await,
-        setup_image: doctor::inspect_setup_image(),
+        daemon,
+        setup_image,
         legacy_bridge: doctor::detect_legacy_bridge(),
-        docker_routes: doctor::collect_docker_routes(),
+        docker_routes,
         container_facing: doctor::inspect_container_facing(),
+        dns_forwarder,
     };
     print!("{}", doctor::render_report(&report));
     Ok(())
 }
 
-pub(crate) async fn daemon_snapshot() -> doctor::DaemonSnapshot {
-    match request(Request::Status).await {
-        Ok(Response::Status {
-            version,
-            bridge_assessment,
-            bridge_enabled,
-            bridge_mode,
-            ..
-        }) => doctor::DaemonSnapshot {
-            reachable: true,
-            version: Some(version),
-            bridge_assessment: Some(bridge_assessment),
-            bridge_enabled: Some(bridge_enabled),
-            bridge_mode: Some(bridge_mode),
-        },
-        _ => doctor::DaemonSnapshot {
-            reachable: false,
-            version: None,
-            bridge_assessment: None,
-            bridge_enabled: None,
-            bridge_mode: None,
-        },
-    }
-}
-
 pub(crate) async fn cmd_bridge(req: Request, desired_enabled: bool, verb: &str) -> Result<()> {
     match request(req).await? {
         Response::Ok => {
-            wait_for_bridge_state(desired_enabled).await?;
-            println!("netbridge {verb}");
+            let settled = wait_for_bridge_state(desired_enabled).await?;
+            for line in bridge_command_lines(settled, desired_enabled, verb) {
+                println!("{line}");
+            }
             Ok(())
         }
         other => other.unexpected(),
     }
+}
+
+/// What `portman bridge enable` and `portman bridge disable` print when the
+/// bridge has settled. Only a bridge on macOS has a DNS forwarder for a
+/// disable to remove.
+fn bridge_command_lines(settled: Settled, desired_enabled: bool, verb: &str) -> Vec<String> {
+    let mut lines = vec![settled.line(&format!("netbridge {verb}"))];
+    if !desired_enabled && cfg!(target_os = "macos") {
+        lines.push(format!(
+            "portman removes the dns forwarder at {}; a container that lists it as its only resolver resolves no name until the bridge is enabled again",
+            doctor::DNS_FORWARDER_IP
+        ));
+    }
+    lines
 }
 
 pub(crate) async fn cmd_bridge_mode(mode: Option<String>) -> Result<()> {
@@ -97,17 +122,15 @@ pub(crate) async fn cmd_bridge_mode(mode: Option<String>) -> Result<()> {
     };
 
     let mode = parse_netbridge_mode(&raw_mode)?;
-    let was_enabled = bridge_enabled().await?;
+    let before = bridge_status().await?;
     match request(Request::BridgeSetMode { mode }).await? {
         Response::Ok => {
-            wait_for_bridge_mode(mode).await?;
-            if was_enabled {
-                wait_for_bridge_state(true).await?;
-            }
-            println!(
+            let settled = wait_for_bridge_mode(mode, before).await?;
+            let done = format!(
                 "netbridge mode set to {}",
                 NetbridgeMode::display_word(mode)
             );
+            println!("{}", settled.line(&done));
             Ok(())
         }
         other => other.unexpected(),
@@ -121,33 +144,128 @@ pub(crate) async fn cmd_bridge_prepare() -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn wait_for_bridge_mode(desired_mode: NetbridgeMode) -> Result<()> {
-    for attempt in 0..120 {
-        if bridge_mode().await? == desired_mode {
-            return Ok(());
-        }
-        if attempt < 119 {
-            sleep(Duration::from_millis(500)).await;
-        }
-    }
-    bail!(
-        "netbridge did not report mode {} after 60s",
-        NetbridgeMode::display_word(desired_mode)
-    );
-}
-
-pub(crate) async fn bridge_mode() -> Result<NetbridgeMode> {
-    match request(Request::Status).await? {
-        Response::Status { bridge_mode, .. } => Ok(bridge_mode),
-        other => other.unexpected(),
-    }
-}
-
 pub(crate) fn parse_netbridge_mode(raw: &str) -> Result<NetbridgeMode> {
     match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
         "opt-in" | "optin" => Ok(NetbridgeMode::OptIn),
         "docker" => Ok(NetbridgeMode::Docker),
         "all" => Ok(NetbridgeMode::All),
         other => bail!("unknown netbridge mode `{other}`; expected opt-in, docker, or all"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doctor::{DockerCliError, DockerRouteStatus};
+    use portman_protocol::DockerState;
+
+    fn docker(state: DockerState, reason: Option<&str>) -> DockerStatus {
+        DockerStatus {
+            state,
+            socket: Some("/run/demo/docker.sock".to_string()),
+            reason: reason.map(str::to_string),
+            ..DockerStatus::default()
+        }
+    }
+
+    fn lines(
+        phase: BridgePhase,
+        docker: Option<&DockerStatus>,
+        routes: &DockerRouteStatus,
+    ) -> Vec<String> {
+        bridge_status_lines(
+            BridgeAssessment::Offline,
+            phase,
+            NetbridgeMode::OptIn,
+            docker,
+            routes,
+        )
+    }
+
+    #[test]
+    fn bridge_status_prints_the_bridge_the_engine_and_the_labelled_networks_in_that_order() {
+        let no_containers = DockerRouteStatus::NoLabelledContainers;
+        let networks = "labelled docker networks: no running dev.portman.host containers";
+        let connected = docker(DockerState::Connected, None);
+
+        assert_eq!(
+            lines(BridgePhase::Up, Some(&connected), &no_containers),
+            [
+                "bridge:    offline",
+                "netbridge: up",
+                "mode:      opt-in",
+                "docker:    connected to /run/demo/docker.sock",
+                networks,
+            ]
+        );
+        assert_eq!(
+            lines(BridgePhase::Disabled, None, &no_containers),
+            [
+                "bridge:    offline",
+                "netbridge: disabled",
+                "mode:      opt-in",
+                networks,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_disable_says_that_the_dns_forwarder_goes_and_what_a_container_loses() {
+        let note = "portman removes the dns forwarder at 192.168.99.129; a container that \
+                    lists it as its only resolver resolves no name until the bridge is \
+                    enabled again";
+        let disabled = bridge_command_lines(Settled::Reached, false, "disabled");
+        if cfg!(target_os = "macos") {
+            assert_eq!(disabled, ["netbridge disabled", note]);
+        } else {
+            assert_eq!(disabled, ["netbridge disabled"]);
+        }
+
+        assert_eq!(
+            bridge_command_lines(Settled::Reached, true, "enabled"),
+            ["netbridge enabled"]
+        );
+        assert_eq!(
+            bridge_command_lines(Settled::WaitsForDocker, true, "enabled"),
+            ["netbridge enabled; the bridge starts when Docker connects"]
+        );
+    }
+
+    #[test]
+    fn bridge_status_puts_the_docker_cli_note_between_the_engine_and_the_networks() {
+        let no_socket = docker(DockerState::Disconnected, Some("no socket"));
+        let waiting = lines(
+            BridgePhase::WaitingForDocker,
+            Some(&no_socket),
+            &DockerRouteStatus::NoLabelledContainers,
+        );
+        assert_eq!(
+            waiting[1..],
+            [
+                "netbridge: waiting for docker",
+                "mode:      opt-in",
+                "docker:    disconnected, no socket at /run/demo/docker.sock",
+                "docker CLI: a check reached an engine, and the daemon is connected to none; \
+                 the labelled docker networks lines below come from the `docker` CLI",
+                "labelled docker networks: no running dev.portman.host containers",
+            ]
+        );
+
+        let silent = DockerCliError::NoAnswer("no answer in 3 s".to_string());
+        let connected = docker(DockerState::Connected, None);
+        let cli_silent = lines(
+            BridgePhase::Up,
+            Some(&connected),
+            &DockerRouteStatus::Unavailable(silent),
+        );
+        assert_eq!(
+            cli_silent[3..],
+            [
+                "docker:    connected to /run/demo/docker.sock",
+                "docker CLI: a check got no answer from an engine, and the daemon is connected \
+                 to one; the labelled docker networks lines below come from the `docker` CLI",
+                "labelled docker networks: unavailable (no answer in 3 s)",
+            ]
+        );
     }
 }

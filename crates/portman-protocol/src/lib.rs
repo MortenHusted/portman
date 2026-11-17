@@ -120,6 +120,136 @@ impl BridgeAssessment {
     }
 }
 
+/// What the in-process netbridge is doing. Same lossy-deserialize contract
+/// as [`ServiceState`]. `Unknown` is also what a daemon that predates the
+/// field yields; [`BridgePhase::or_from_enabled`] resolves it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case", from = "String")]
+pub enum BridgePhase {
+    Disabled,
+    /// The user wants a bridge and no container engine is reachable.
+    WaitingForDocker,
+    /// The user wants a bridge and none is up: a start is in flight or
+    /// waits for its retry.
+    Starting,
+    Up,
+    /// A bridge is being stopped, for a disable or a mode change.
+    Stopping,
+    #[default]
+    Unknown,
+}
+
+impl BridgePhase {
+    /// The words that the CLI, the TUI and doctor print for the phase. The
+    /// type has no `Display`, so that `{}` cannot print the wire name in
+    /// their place.
+    pub fn display_word(self) -> &'static str {
+        match self {
+            BridgePhase::Disabled => "disabled",
+            BridgePhase::WaitingForDocker => "waiting for docker",
+            BridgePhase::Starting => "starting",
+            BridgePhase::Up => "up",
+            BridgePhase::Stopping => "stopping",
+            BridgePhase::Unknown => "unknown",
+        }
+    }
+
+    /// The phase a client acts on. A daemon that sends no phase this client
+    /// knows still sends `bridge_enabled`, which is true only while a bridge
+    /// runs.
+    pub fn or_from_enabled(self, bridge_enabled: bool) -> Self {
+        match self {
+            BridgePhase::Unknown if bridge_enabled => BridgePhase::Up,
+            BridgePhase::Unknown => BridgePhase::Disabled,
+            known => known,
+        }
+    }
+}
+
+/// Whether the daemon holds a connection to a container engine. Same
+/// lossy-deserialize contract as [`ServiceState`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case", from = "String")]
+pub enum DockerState {
+    Connected,
+    Disconnected,
+    /// The daemon runs in managed-broker mode, which uses no engine.
+    Disabled,
+    #[default]
+    Unknown,
+}
+
+impl DockerState {
+    /// The word that every surface prints for the state. The type has no
+    /// `Display`, for the reason [`BridgePhase::display_word`] gives.
+    pub fn display_word(self) -> &'static str {
+        match self {
+            DockerState::Connected => "connected",
+            DockerState::Disconnected => "disconnected",
+            DockerState::Disabled => "disabled",
+            DockerState::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<String> for DockerState {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "connected" => DockerState::Connected,
+            "disconnected" => DockerState::Disconnected,
+            "disabled" => DockerState::Disabled,
+            _ => DockerState::Unknown,
+        }
+    }
+}
+
+/// The daemon's connection to the container engine, as status reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DockerStatus {
+    #[serde(default)]
+    pub state: DockerState,
+    /// The socket the engine answers on, or the one socket that did not
+    /// answer or does not exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
+    /// The engine's version, while connected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Why the state is not `connected`, in a few plain words that the
+    /// daemon chooses. A surface that prints them does not change them. The
+    /// status panel of the TUI leaves them out when its row is too narrow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// What the daemon knows beyond `reason`, such as the engine's error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl DockerStatus {
+    /// The state and everything known about it, as the one line that the
+    /// CLI, the TUI and doctor print.
+    pub fn summary(&self) -> String {
+        let mut line = self.state.display_word().to_string();
+        if let Some(reason) = &self.reason {
+            line.push_str(&format!(", {reason}"));
+        }
+        if let Some(socket) = &self.socket {
+            let link = match self.state {
+                DockerState::Connected => "to",
+                _ => "at",
+            };
+            line.push_str(&format!(" {link} {socket}"));
+        }
+        if let Some(version) = &self.version {
+            line.push_str(&format!(", engine {version}"));
+        }
+        if let Some(detail) = &self.detail {
+            line.push_str(&format!(": {detail}"));
+        }
+        line
+    }
+}
+
 impl std::fmt::Display for TlsMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -135,6 +265,19 @@ impl std::fmt::Display for ServiceState {
 impl std::fmt::Display for BridgeAssessment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl From<String> for BridgePhase {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "disabled" => BridgePhase::Disabled,
+            "waiting_for_docker" => BridgePhase::WaitingForDocker,
+            "starting" => BridgePhase::Starting,
+            "up" => BridgePhase::Up,
+            "stopping" => BridgePhase::Stopping,
+            _ => BridgePhase::Unknown,
+        }
     }
 }
 
@@ -450,19 +593,29 @@ pub enum Response {
         /// Default preserves backward compat with pre-Phase-A.3 daemons.
         #[serde(default)]
         bridge_assessment: BridgeAssessment,
-        /// Whether the v1 in-process netbridge is currently enabled
-        /// (i.e. owning the `portman` docker network + utun tunnel).
+        /// What a client that predates `bridge_phase` waits on. True while
+        /// the v1 in-process netbridge is up, and while it stops because
+        /// the user turned it off. False otherwise, also for a bridge that
+        /// still runs while a new one replaces it.
         /// Distinct from `bridge_assessment`, which describes health
         /// of whichever bridge is routing — including the wrapped
         /// chipmk bridge in v0.
         #[serde(default = "default_bridge_enabled")]
         bridge_enabled: bool,
-        /// Route ownership mode for the native netbridge.
+        /// What the in-process netbridge is doing.
+        #[serde(default)]
+        bridge_phase: BridgePhase,
+        /// Route ownership mode for the native netbridge: the mode of the
+        /// running bridge, or the mode the next one is built for.
         #[serde(default = "default_netbridge_mode")]
         bridge_mode: NetbridgeMode,
         /// TCP port the web dashboard binds to on 127.0.0.1.
         #[serde(default = "default_dashboard_port")]
         dashboard_port: u16,
+        /// The daemon's connection to the container engine. `None` from a
+        /// daemon that predates the field.
+        #[serde(default)]
+        docker: Option<DockerStatus>,
     },
     CertHealth {
         /// `true` if `mkcert` is on the daemon's `PATH`.
@@ -1209,12 +1362,16 @@ mod tests {
                 cert_dir,
                 bridge_assessment,
                 bridge_enabled,
+                bridge_phase,
                 bridge_mode,
                 dashboard_port,
                 managed_broker,
                 egress_grants_version,
                 inference_provisioning_version,
+                docker,
             } => {
+                assert_eq!(docker, None);
+                assert_eq!(bridge_phase, BridgePhase::Unknown);
                 assert!(!managed_broker);
                 assert_eq!(egress_grants_version, 0);
                 assert_eq!(inference_provisioning_version, 0);
@@ -1233,6 +1390,192 @@ mod tests {
             }
             other => panic!("expected status response, got {other:?}"),
         }
+    }
+
+    fn status_phase(json: &str) -> BridgePhase {
+        match serde_json::from_str(json).unwrap() {
+            Response::Status { bridge_phase, .. } => bridge_phase,
+            other => panic!("expected status response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bridge_phase_travels_as_a_snake_case_string() {
+        let wire = [
+            (BridgePhase::Disabled, "disabled"),
+            (BridgePhase::WaitingForDocker, "waiting_for_docker"),
+            (BridgePhase::Starting, "starting"),
+            (BridgePhase::Up, "up"),
+            (BridgePhase::Stopping, "stopping"),
+        ];
+        for (phase, word) in wire {
+            assert_eq!(serde_json::to_value(phase).unwrap(), word);
+            let json = format!(r#"{{"kind":"status","bridge_phase":"{word}"}}"#);
+            assert_eq!(status_phase(&json), phase);
+        }
+    }
+
+    #[test]
+    fn bridge_phase_reads_as_plain_words() {
+        let words = [
+            (BridgePhase::Disabled, "disabled"),
+            (BridgePhase::WaitingForDocker, "waiting for docker"),
+            (BridgePhase::Starting, "starting"),
+            (BridgePhase::Up, "up"),
+            (BridgePhase::Stopping, "stopping"),
+        ];
+        for (phase, word) in words {
+            assert_eq!(phase.display_word(), word);
+        }
+    }
+
+    #[test]
+    fn bridge_phase_from_a_newer_daemon_deserializes_as_unknown() {
+        let json = r#"{"kind":"status","bridge_phase":"hibernating","bridge_enabled":true}"#;
+        assert_eq!(status_phase(json), BridgePhase::Unknown);
+    }
+
+    fn status_docker(json: &str) -> Option<DockerStatus> {
+        match serde_json::from_str(json).unwrap() {
+            Response::Status { docker, .. } => docker,
+            other => panic!("expected status response, got {other:?}"),
+        }
+    }
+
+    fn docker(state: DockerState) -> DockerStatus {
+        DockerStatus {
+            state,
+            ..DockerStatus::default()
+        }
+    }
+
+    #[test]
+    fn docker_state_travels_as_a_snake_case_string() {
+        let wire = [
+            (DockerState::Connected, "connected"),
+            (DockerState::Disconnected, "disconnected"),
+            (DockerState::Disabled, "disabled"),
+        ];
+        for (state, word) in wire {
+            assert_eq!(serde_json::to_value(state).unwrap(), word);
+            let json = format!(r#"{{"kind":"status","docker":{{"state":"{word}"}}}}"#);
+            assert_eq!(status_docker(&json), Some(docker(state)));
+        }
+    }
+
+    #[test]
+    fn docker_status_travels_without_the_fields_it_does_not_have() {
+        let connected = DockerStatus {
+            socket: Some("/run/demo/docker.sock".into()),
+            version: Some("29.2.1".into()),
+            ..docker(DockerState::Connected)
+        };
+        assert_eq!(
+            serde_json::to_string(&connected).unwrap(),
+            r#"{"state":"connected","socket":"/run/demo/docker.sock","version":"29.2.1"}"#
+        );
+
+        let unreachable = DockerStatus {
+            socket: Some("/run/demo/docker.sock".into()),
+            reason: Some("unreachable".into()),
+            detail: Some("no answer in 3 s".into()),
+            ..docker(DockerState::Disconnected)
+        };
+        let json = r#"{"state":"disconnected","socket":"/run/demo/docker.sock","reason":"unreachable","detail":"no answer in 3 s"}"#;
+        assert_eq!(serde_json::to_string(&unreachable).unwrap(), json);
+        assert_eq!(
+            serde_json::from_str::<DockerStatus>(json).unwrap(),
+            unreachable
+        );
+    }
+
+    #[test]
+    fn docker_state_from_a_newer_daemon_deserializes_as_unknown_and_keeps_its_reason() {
+        let json = r#"{"kind":"status","docker":{"state":"paused","reason":"snapshot"}}"#;
+        assert_eq!(
+            status_docker(json),
+            Some(DockerStatus {
+                reason: Some("snapshot".into()),
+                ..docker(DockerState::Unknown)
+            })
+        );
+    }
+
+    #[test]
+    fn docker_status_reads_as_one_line_of_plain_words() {
+        let socket = || Some("/run/demo/docker.sock".to_string());
+        // status → the words after `docker:`
+        let table = [
+            (
+                DockerStatus {
+                    socket: socket(),
+                    version: Some("29.2.1".into()),
+                    ..docker(DockerState::Connected)
+                },
+                "connected to /run/demo/docker.sock, engine 29.2.1",
+            ),
+            (
+                DockerStatus {
+                    socket: socket(),
+                    ..docker(DockerState::Connected)
+                },
+                "connected to /run/demo/docker.sock",
+            ),
+            (
+                DockerStatus {
+                    socket: socket(),
+                    reason: Some("no socket".into()),
+                    ..docker(DockerState::Disconnected)
+                },
+                "disconnected, no socket at /run/demo/docker.sock",
+            ),
+            (
+                DockerStatus {
+                    reason: Some("no socket".into()),
+                    detail: Some("none of the known runtime paths exists".into()),
+                    ..docker(DockerState::Disconnected)
+                },
+                "disconnected, no socket: none of the known runtime paths exists",
+            ),
+            (
+                DockerStatus {
+                    socket: socket(),
+                    reason: Some("unreachable".into()),
+                    detail: Some("no answer in 3 s".into()),
+                    ..docker(DockerState::Disconnected)
+                },
+                "disconnected, unreachable at /run/demo/docker.sock: no answer in 3 s",
+            ),
+            (
+                DockerStatus {
+                    reason: Some("managed broker".into()),
+                    ..docker(DockerState::Disabled)
+                },
+                "disabled, managed broker",
+            ),
+            (docker(DockerState::Unknown), "unknown"),
+        ];
+        for (status, line) in table {
+            assert_eq!(status.summary(), line, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn a_client_reads_the_phase_of_an_older_daemon_from_bridge_enabled() {
+        assert_eq!(BridgePhase::Unknown.or_from_enabled(true), BridgePhase::Up);
+        assert_eq!(
+            BridgePhase::Unknown.or_from_enabled(false),
+            BridgePhase::Disabled
+        );
+        // A phase the daemon did send wins over the older field.
+        assert_eq!(
+            BridgePhase::Starting.or_from_enabled(false),
+            BridgePhase::Starting
+        );
+        assert_eq!(
+            BridgePhase::Stopping.or_from_enabled(true),
+            BridgePhase::Stopping
+        );
     }
 
     #[test]

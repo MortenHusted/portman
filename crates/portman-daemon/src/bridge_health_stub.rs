@@ -3,8 +3,6 @@
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use bollard::Docker;
-
 use portman_protocol::BridgeAssessment;
 
 pub(crate) type Shared = Arc<RwLock<BridgeAssessment>>;
@@ -15,7 +13,7 @@ pub(crate) fn new_shared() -> Shared {
 }
 
 pub(crate) async fn run(
-    _docker: Docker,
+    _engine: crate::engine::Engine,
     _shared: Shared,
     _bridge_ifindex: crate::upstream::BridgeIfIndex,
 ) -> anyhow::Result<()> {

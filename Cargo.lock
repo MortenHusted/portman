@@ -1889,6 +1889,8 @@ dependencies = [
  "hickory-proto",
  "hickory-server",
  "httparse",
+ "hyper",
+ "hyper-util",
  "mime_guess",
  "nix 0.29.0",
  "notify",

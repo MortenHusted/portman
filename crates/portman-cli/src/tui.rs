@@ -30,8 +30,8 @@ use crossterm::terminal::{
 };
 use futures_util::StreamExt;
 use portman_protocol::{
-    ContainerResourceUsage, Entry, LogLineInfo, Mode, NetbridgeMode, Request,
-    ResourceUsageSnapshot, Response, ServiceStatusInfo, Source, TldInfo,
+    BridgePhase, ContainerResourceUsage, DockerState, DockerStatus, Entry, LogLineInfo, Mode,
+    NetbridgeMode, Request, ResourceUsageSnapshot, Response, ServiceStatusInfo, Source, TldInfo,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -133,6 +133,10 @@ struct State {
     resource_usage: Option<ResourceUsageSnapshot>,
     resource_history: Vec<portman_protocol::ResourceSeries>,
     error: Option<(String, Instant)>,
+    /// What the last bridge command said beyond its success. The next
+    /// command clears it, and so does a refresh that finds the bridge no
+    /// longer waiting for Docker.
+    notice: Option<String>,
     entries_sel: ListState,
     tlds_sel: ListState,
     services: Vec<ServiceStatusInfo>,
@@ -151,6 +155,12 @@ impl State {
     fn scheme_of(&self, entry: &Entry) -> &'static str {
         self.schemes.get(&entry.host).copied().unwrap_or("http")
     }
+
+    fn waits_for_docker(&self) -> bool {
+        self.status
+            .as_ref()
+            .is_some_and(|status| status.bridge_phase == BridgePhase::WaitingForDocker)
+    }
 }
 
 #[derive(Clone)]
@@ -164,8 +174,15 @@ struct StatusSnapshot {
     data_dir: String,
     cert_dir: String,
     bridge_assessment: portman_protocol::BridgeAssessment,
-    bridge_enabled: bool,
+    bridge_phase: BridgePhase,
     bridge_mode: NetbridgeMode,
+    /// `None` from a daemon that predates the field.
+    docker: Option<DockerStatus>,
+}
+
+/// A bridge the user wants can be turned off whether or not it is up.
+fn bridge_toggle_disables(phase: BridgePhase) -> bool {
+    phase != BridgePhase::Disabled
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -324,6 +341,9 @@ fn apply_refresh(state: &mut State, outcome: RefreshOutcome) {
             state.services = data.services;
             state.schemes = compute_schemes(&state.entries, &state.tlds);
             state.daemon_online = true;
+            if !state.waits_for_docker() {
+                state.notice = None;
+            }
             clamp_selection(&mut state.entries_sel, state.entries.len());
             clamp_selection(&mut state.tlds_sel, state.tlds.len());
             clamp_selection(&mut state.services_sel, state.services.len());
@@ -441,7 +461,9 @@ async fn fetch_status() -> Result<StatusSnapshot> {
             cert_dir,
             bridge_assessment,
             bridge_enabled,
+            bridge_phase,
             bridge_mode,
+            docker,
             ..
         } => Ok(StatusSnapshot {
             version,
@@ -453,8 +475,9 @@ async fn fetch_status() -> Result<StatusSnapshot> {
             data_dir,
             cert_dir,
             bridge_assessment,
-            bridge_enabled,
+            bridge_phase: bridge_phase.or_from_enabled(bridge_enabled),
             bridge_mode,
+            docker,
         }),
         _ => anyhow::bail!("unexpected Status response"),
     }
@@ -469,7 +492,7 @@ async fn fetch_resource_usage() -> Result<ResourceUsageSnapshot> {
 }
 
 use crate::client::request as send;
-use crate::client::wait_for_bridge_state;
+use crate::client::{wait_for_bridge_state, Settled};
 use crate::fmt::{
     format_bytes as format_resource_bytes, format_rate as format_resource_rate, open_browser,
     truncate as truncate_for_tui,
@@ -551,7 +574,7 @@ async fn handle_key(
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                     state.modal = Modal::None;
                     let res = mutate_bridge(Request::BridgeDisable, false).await;
-                    apply_result(state, res);
+                    apply_bridge_result(state, res, "netbridge disabled");
                     refresh(state).await;
                 }
                 _ => {}
@@ -614,13 +637,12 @@ async fn handle_key(
             if state
                 .status
                 .as_ref()
-                .map(|status| status.bridge_enabled)
-                .unwrap_or(false)
+                .is_some_and(|status| bridge_toggle_disables(status.bridge_phase))
             {
                 state.modal = Modal::ConfirmBridgeDisable;
             } else {
                 let res = mutate_bridge(Request::BridgeEnable, true).await;
-                apply_result(state, res);
+                apply_bridge_result(state, res, "netbridge enabled");
                 refresh(state).await;
             }
         }
@@ -743,11 +765,24 @@ fn selected_service(state: &State) -> Option<&ServiceStatusInfo> {
 }
 
 fn apply_result(state: &mut State, res: Result<()>) {
+    state.notice = None;
     if let Err(e) = res {
         state.error = Some((format!("{e:#}"), Instant::now()));
     } else {
         state.error = None;
     }
+}
+
+/// `done` says what the command did, in the words the CLI prints. The CLI's
+/// line shows only when it says more than `done`, since the status panel
+/// shows a bridge that is up or off.
+fn apply_bridge_result(state: &mut State, res: Result<Settled>, done: &str) {
+    let notice = match &res {
+        Ok(Settled::WaitsForDocker) => Some(Settled::WaitsForDocker.line(done)),
+        _ => None,
+    };
+    apply_result(state, res.map(drop));
+    state.notice = notice;
 }
 
 // ---------------------------------------------------------------------------
@@ -787,7 +822,7 @@ async fn mutate_add_entry(host: &str, target: &str, mode: Mode) -> Result<()> {
 }
 
 /// Set the v1 netbridge state via IPC and wait for status to reflect it.
-async fn mutate_bridge(req: Request, desired: bool) -> Result<()> {
+async fn mutate_bridge(req: Request, desired: bool) -> Result<Settled> {
     match send(req).await? {
         Response::Ok => wait_for_bridge_state(desired).await,
         other => other.unexpected(),
@@ -997,6 +1032,20 @@ fn render_status_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
             "offline" => (Color::Yellow, "docker down"),
             _ => (Color::DarkGray, "unknown"),
         };
+        let ports = Line::from(vec![
+            Span::styled("  dns  ", Style::default().fg(Color::Gray)),
+            Span::styled(s.dns_port.to_string(), Style::default().bold()),
+            Span::styled("  http ", Style::default().fg(Color::Gray)),
+            Span::styled(format!(":{}", s.proxy_port), Style::default().bold()),
+            Span::styled("  tls ", Style::default().fg(Color::Gray)),
+            Span::styled(format!(":{}", s.tls_port), Style::default().bold()),
+        ]);
+        // The panel has six rows. The engine row takes the place of the
+        // empty one, and sits above the bridge row.
+        let (third, fourth) = match &s.docker {
+            Some(docker) => (ports, docker_row(docker, inner.width)),
+            None => (Line::from(""), ports),
+        };
         vec![
             Line::from(vec![
                 Span::styled("●", Style::default().fg(Color::Green)),
@@ -1008,24 +1057,17 @@ fn render_status_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
                 format!("  up {}", s.running_since),
                 Style::default().fg(Color::Gray),
             )),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  dns  ", Style::default().fg(Color::Gray)),
-                Span::styled(s.dns_port.to_string(), Style::default().bold()),
-                Span::styled("  http ", Style::default().fg(Color::Gray)),
-                Span::styled(format!(":{}", s.proxy_port), Style::default().bold()),
-                Span::styled("  tls ", Style::default().fg(Color::Gray)),
-                Span::styled(format!(":{}", s.tls_port), Style::default().bold()),
-            ]),
+            third,
+            fourth,
             Line::from(vec![
                 Span::styled("  netbridge ", Style::default().fg(Color::Gray)),
                 Span::styled(
-                    if s.bridge_enabled { "on" } else { "off" },
+                    s.bridge_phase.display_word(),
                     Style::default()
-                        .fg(if s.bridge_enabled {
-                            Color::Green
-                        } else {
-                            Color::Gray
+                        .fg(match s.bridge_phase {
+                            BridgePhase::Up => Color::Green,
+                            BridgePhase::Disabled => Color::Gray,
+                            _ => Color::Yellow,
                         })
                         .bold(),
                 ),
@@ -1034,15 +1076,15 @@ fn render_status_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
                     Style::default().fg(Color::Gray),
                 ),
                 Span::styled(bridge_word, Style::default().fg(bridge_color)),
-                Span::styled(
-                    if s.bridge_enabled {
-                        "  [b] disable..."
-                    } else {
-                        "  [b] enable"
-                    },
-                    Style::default().fg(Color::DarkGray),
-                ),
             ]),
+            Line::from(Span::styled(
+                if bridge_toggle_disables(s.bridge_phase) {
+                    "  [b] disable..."
+                } else {
+                    "  [b] enable"
+                },
+                Style::default().fg(Color::DarkGray),
+            )),
         ]
     } else {
         vec![
@@ -1062,6 +1104,30 @@ fn render_status_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
         ]
     };
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The engine row of the status panel. The engine version, or the reason
+/// for a state that is not `connected`, follows the state only when the
+/// row holds it whole.
+fn docker_row(docker: &DockerStatus, width: u16) -> Line<'static> {
+    let label = "  docker ";
+    let word = docker.state.display_word();
+    let color = match docker.state {
+        DockerState::Connected => Color::Green,
+        DockerState::Disconnected => Color::Yellow,
+        _ => Color::Gray,
+    };
+    let mut spans = vec![
+        Span::styled(label, Style::default().fg(Color::Gray)),
+        Span::styled(word, Style::default().fg(color).bold()),
+    ];
+    let more = docker.version.as_deref().or(docker.reason.as_deref());
+    if let Some(more) = more.map(|more| format!("  {more}")) {
+        if label.len() + word.len() + more.chars().count() <= usize::from(width) {
+            spans.push(Span::styled(more, Style::default().fg(Color::Gray)));
+        }
+    }
+    Line::from(spans)
 }
 
 fn render_entries_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
@@ -1538,7 +1604,7 @@ fn activity_container_line(row: &ContainerResourceUsage) -> Line<'static> {
 
 fn detail_status(state: &State) -> (&'static str, Vec<Line<'static>>) {
     let lines = if let Some(s) = &state.status {
-        vec![
+        let mut lines = vec![
             Line::from(""),
             Line::from(vec![
                 Span::styled("  portman ", Style::default().fg(Color::Yellow).bold()),
@@ -1561,15 +1627,17 @@ fn detail_status(state: &State) -> (&'static str, Vec<Line<'static>>) {
                 "  netbridge ",
                 format!(
                     "{} ({})",
-                    if s.bridge_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    },
+                    s.bridge_phase.display_word(),
                     NetbridgeMode::display_word(s.bridge_mode)
                 ),
             ),
-        ]
+        ];
+        lines.extend(
+            s.docker
+                .as_ref()
+                .map(|docker| kv("  docker    ", docker.summary())),
+        );
+        lines
     } else {
         vec![
             Line::from(""),
@@ -1835,6 +1903,9 @@ fn render_status_bar(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
         .to_string(),
         Style::default().fg(color),
     ));
+    if let Some(notice) = &state.notice {
+        spans.push(Span::raw(format!("  ·  {notice}")));
+    }
     if let Some(s) = &state.status {
         spans.push(Span::raw(format!(
             "  ·  dns :{}  ·  http :{}  ·  tls :{}",
@@ -2155,6 +2226,249 @@ mod tests {
         };
 
         assert_eq!(activity_container_label(&row), "dev/web");
+    }
+
+    fn status_state(phase: BridgePhase, docker: Option<DockerStatus>) -> State {
+        State {
+            status: Some(StatusSnapshot {
+                version: "0.1.5".to_string(),
+                running_since: "5s".to_string(),
+                dns_port: 5335,
+                proxy_port: 80,
+                tls_port: 443,
+                socket_path: String::new(),
+                data_dir: String::new(),
+                cert_dir: String::new(),
+                bridge_assessment: portman_protocol::BridgeAssessment::Healthy,
+                bridge_phase: phase,
+                bridge_mode: NetbridgeMode::OptIn,
+                docker,
+            }),
+            ..State::default()
+        }
+    }
+
+    /// The six rows inside the border of the status panel, on a terminal of
+    /// `columns` columns.
+    fn status_panel(columns: u16, state: &State) -> Vec<String> {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(columns, 40)).unwrap();
+        terminal.draw(|f| view(f, state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let border = (0..columns)
+            .find(|x| buffer[(*x, 0)].symbol() == "┐")
+            .expect("the status panel has a top right corner");
+        (1..7)
+            .map(|y| (1..border).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// The rows of the status panel at 120 columns, for a daemon that
+    /// reports no engine state.
+    fn status_rows(phase: BridgePhase) -> Vec<String> {
+        status_panel(120, &status_state(phase, None))
+    }
+
+    fn docker(state: DockerState, reason: Option<&str>) -> DockerStatus {
+        DockerStatus {
+            state,
+            reason: reason.map(str::to_string),
+            ..DockerStatus::default()
+        }
+    }
+
+    #[test]
+    fn the_status_panel_shows_the_engine_state_uncut_at_120_100_and_80_columns() {
+        let states = [
+            DockerStatus {
+                socket: Some("/run/demo/docker.sock".to_string()),
+                version: Some("29.2.1".to_string()),
+                ..docker(DockerState::Connected, None)
+            },
+            docker(DockerState::Disconnected, Some("no socket")),
+            docker(DockerState::Disconnected, Some("unreachable")),
+            docker(
+                DockerState::Disconnected,
+                Some("no connect attempt has ended yet"),
+            ),
+            docker(DockerState::Disabled, Some("managed broker")),
+        ];
+        let wide = [
+            "  docker connected  29.2.1",
+            "  docker disconnected  no socket",
+            "  docker disconnected  unreachable",
+            "  docker disconnected",
+            "  docker disabled  managed broker",
+        ];
+        let narrow = [
+            "  docker connected  29.2.1",
+            "  docker disconnected",
+            "  docker disconnected",
+            "  docker disconnected",
+            "  docker disabled",
+        ];
+        // (terminal columns, columns inside the panel, the docker row)
+        let table = [(120, 41, wide), (100, 34, wide), (80, 27, narrow)];
+        for (columns, inside, lines) in table {
+            for (docker, line) in states.iter().zip(lines) {
+                let state = status_state(BridgePhase::WaitingForDocker, Some(docker.clone()));
+                let rows = status_panel(columns, &state);
+                let at = format!("columns={columns} docker={docker:?}\n{rows:#?}");
+                assert_eq!(rows[3].chars().count(), inside, "{at}");
+                assert_eq!(rows[3].trim_end(), line, "{at}");
+                assert!(line.chars().count() <= inside, "{at}");
+                assert!(rows[2].starts_with("  dns  5335"), "{at}");
+                assert!(rows[4].starts_with("  netbridge waiting"), "{at}");
+                assert_eq!(rows[5].trim_end(), "  [b] disable...", "{at}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_engine_state_is_green_when_connected_and_yellow_when_disconnected() {
+        // state → the colour of its word
+        let table = [
+            (DockerState::Connected, Color::Green),
+            (DockerState::Disconnected, Color::Yellow),
+            (DockerState::Disabled, Color::Gray),
+            (DockerState::Unknown, Color::Gray),
+        ];
+        for (state, colour) in table {
+            let row = docker_row(&docker(state, None), 41);
+            assert_eq!(row.spans[1].content, state.display_word());
+            assert_eq!(row.spans[1].style.fg, Some(colour), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn the_status_panel_keeps_its_rows_for_a_daemon_that_reports_no_engine_state() {
+        let rows = status_rows(BridgePhase::Up);
+
+        assert_eq!(rows[2].trim_end(), "");
+        assert!(rows[3].starts_with("  dns  5335"), "{rows:#?}");
+        assert!(rows[4].starts_with("  netbridge up"), "{rows:#?}");
+        assert!(!rows.iter().any(|row| row.contains("docker ")), "{rows:#?}");
+    }
+
+    #[test]
+    fn the_status_detail_names_the_engine_state_in_full() {
+        let text = |state: &State| -> Vec<String> {
+            let (_, lines) = detail_status(state);
+            lines.iter().map(|line| line.to_string()).collect()
+        };
+        let unreachable = DockerStatus {
+            socket: Some("/run/demo/docker.sock".to_string()),
+            detail: Some("no answer in 3 s".to_string()),
+            ..docker(DockerState::Disconnected, Some("unreachable"))
+        };
+
+        let reported = text(&status_state(BridgePhase::Up, Some(unreachable)));
+        let line =
+            "  docker    disconnected, unreachable at /run/demo/docker.sock: no answer in 3 s";
+        assert!(reported.iter().any(|row| row == line), "{reported:#?}");
+
+        let older = text(&status_state(BridgePhase::Up, None));
+        assert!(
+            !older.iter().any(|row| row.contains("docker")),
+            "{older:#?}"
+        );
+    }
+
+    #[test]
+    fn the_status_panel_shows_the_whole_bridge_hint_in_every_phase_at_120_columns() {
+        // phase → hint
+        let table = [
+            (BridgePhase::Disabled, "  [b] enable  "),
+            (BridgePhase::WaitingForDocker, "  [b] disable...  "),
+            (BridgePhase::Starting, "  [b] disable...  "),
+            (BridgePhase::Up, "  [b] disable...  "),
+            (BridgePhase::Stopping, "  [b] disable...  "),
+        ];
+        for (phase, hint) in table {
+            let rows = status_rows(phase);
+            let bridge = format!("  netbridge {}  opt-in  ", phase.display_word());
+            assert!(
+                rows.iter().any(|row| row.contains(&bridge)),
+                "phase={phase:?}\n{rows:#?}"
+            );
+            assert!(
+                rows.iter().any(|row| row.contains(hint)),
+                "phase={phase:?}\n{rows:#?}"
+            );
+        }
+    }
+
+    /// The status bar, on a terminal of `columns` columns.
+    fn status_bar(columns: u16, state: &State) -> String {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(columns, 40)).unwrap();
+        terminal.draw(|f| view(f, state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let bar: String = (0..columns).map(|x| buffer[(x, 38)].symbol()).collect();
+        bar.trim_end().to_string()
+    }
+
+    /// What a refresh reads from a daemon whose bridge is in `phase`.
+    fn refreshed(phase: BridgePhase) -> RefreshOutcome {
+        Ok(RefreshData {
+            entries: Vec::new(),
+            tlds: Vec::new(),
+            status: status_state(phase, None).status.unwrap(),
+            resource_usage: None,
+            resource_history: Vec::new(),
+            services: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn an_enable_that_waits_for_docker_says_so_on_the_status_bar_until_the_bridge_stops_waiting() {
+        let said = "netbridge enabled; the bridge starts when Docker connects";
+        let mut state = status_state(BridgePhase::Disabled, None);
+
+        apply_bridge_result(&mut state, Ok(Settled::WaitsForDocker), "netbridge enabled");
+        apply_refresh(&mut state, refreshed(BridgePhase::WaitingForDocker));
+        for columns in [120, 80] {
+            let bar = status_bar(columns, &state);
+            assert!(bar.contains(said), "columns={columns} {bar:?}");
+            assert!(!bar.contains("error"), "columns={columns} {bar:?}");
+        }
+
+        apply_refresh(&mut state, refreshed(BridgePhase::Up));
+        let bar = status_bar(120, &state);
+        assert!(!bar.contains("netbridge"), "{bar:?}");
+    }
+
+    #[test]
+    fn a_bridge_command_that_reached_its_state_or_failed_says_nothing_about_docker() {
+        let mut state = status_state(BridgePhase::WaitingForDocker, None);
+        apply_bridge_result(&mut state, Ok(Settled::WaitsForDocker), "netbridge enabled");
+
+        apply_bridge_result(&mut state, Ok(Settled::Reached), "netbridge disabled");
+        let bar = status_bar(120, &state);
+        assert!(!bar.contains("netbridge"), "{bar:?}");
+
+        apply_bridge_result(&mut state, Ok(Settled::WaitsForDocker), "netbridge enabled");
+        let failed = Err(anyhow::anyhow!("netbridge was disabled before it came up"));
+        apply_bridge_result(&mut state, failed, "netbridge enabled");
+        let bar = status_bar(120, &state);
+        assert!(
+            bar.contains("error: netbridge was disabled before it came up"),
+            "{bar:?}"
+        );
+        assert!(!bar.contains("Docker connects"), "{bar:?}");
+    }
+
+    #[test]
+    fn bridge_toggle_enables_only_a_bridge_that_is_off() {
+        // phase → [b] disables
+        let table = [
+            (BridgePhase::Disabled, false),
+            (BridgePhase::WaitingForDocker, true),
+            (BridgePhase::Starting, true),
+            (BridgePhase::Up, true),
+            (BridgePhase::Stopping, true),
+        ];
+        for (phase, disables) in table {
+            assert_eq!(bridge_toggle_disables(phase), disables, "phase={phase:?}");
+        }
     }
 
     #[test]

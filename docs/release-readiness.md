@@ -30,7 +30,8 @@ Docker networks/containers, or build Docker images.
 The native netbridge is intentionally mode-gated:
 
 - `opt-in` is the default and only routes Portman's dedicated `portman` Docker
-  network (`192.168.99.0/24`). Existing compose default networks are untouched.
+  network (`192.168.99.128/25`, inside the routed `192.168.99.0/24`). Existing
+  compose default networks are untouched.
 - `docker` is the docker-mac-net-connect replacement path. It discovers running
   containers with `dev.portman.host`, finds their Docker bridge networks, and
   routes those bridge subnets through Portman's tunnel without requiring
@@ -62,11 +63,16 @@ mutating chipmk resources or Docker containers. While the native bridge is up,
 health reports `routes_missing` for routes through a different live interface;
 interface existence alone does not prove the route reaches Portman's bridge.
 
-`portman doctor` is the read-only default-driver check. It reports daemon
+`portman doctor` is the default-driver check. It reports daemon
 reachability, bridge health/mode, setup-image status, docker-mac-net-connect
 presence/service status, labelled Docker networks, route interfaces for their
 subnets, and explicit commands for stopping the legacy bridge. It does not stop
-or uninstall any legacy service.
+or uninstall any legacy service. On macOS it also reports the DNS forwarder. For a
+forwarder that runs while the bridge is up, it starts one short-lived
+container that looks a registered hostname up through `192.168.99.129`. The
+engine removes that container when the lookup ends. Doctor ends a lookup that
+takes longer than 8 s and removes the container by its name. Nothing else
+that doctor does changes Docker state.
 
 ## Container-Facing Host Access
 
@@ -87,6 +93,87 @@ for containers, so static host apps like `127.0.0.1:3070` flow through the
 container-facing proxy. Raw TCP callbacks to arbitrary host ports still use
 `host.docker.internal:<port>` until the reserved stable host-callback IP is
 implemented.
+
+The DNS listener on `192.168.99.1:53` answers `REFUSED` for a name that the
+registry does not hold, for every query type. Do not give it to a container as
+its resolver: the container's other lookups would fail. It is the first
+upstream of the forwarder below.
+
+## Container DNS Forwarder
+
+While the native bridge is up, the daemon keeps one container in the VM,
+`portman-netbridge-dns`, from the setup image. It runs `dnsmasq` on the VM's
+host network and listens on `192.168.99.129:53`, the gateway address of the
+`portman` Docker network. A container opts in with `--dns 192.168.99.129` or
+the compose line `dns: [192.168.99.129]`.
+
+- A name under a managed TLD goes to `192.168.99.1` first and to the VM's own
+  resolver second, in strict order.
+- `host.docker.internal` and every other name go to the VM's own resolver
+  only.
+- The daemon looks at the container at each bridge start, at each change of
+  the managed TLD set, and once more a minute after it started one. It replaces a container that does not run, runs
+  another command, or comes from another build of the setup image, and leaves
+  it as it is otherwise.
+- A container with the right command from the current image that the engine
+  starts again and again is also left as it is. The daemon log says so once
+  and names `docker logs portman-netbridge-dns`.
+- The forwarder keeps no negative answer, so a denial from the VM's resolver
+  does not hide a name that portman registers afterwards.
+- A daemon stop, a lost Docker session, and a bridge mode change leave the
+  container running. `portman bridge disable` removes it before it removes the
+  `portman` network, also when the engine then keeps a network that is in
+  use. A forwarder that could not be removed beside such a network stays
+  until the next disable. With no engine reachable at the disable, the daemon
+  removes both in the next Docker session, unless the daemon restarts first.
+- A setup image without the label `dev.portman.dns-forwarder=1` cannot run the
+  forwarder. The bridge then works as before, the daemon log and `portman
+  doctor` name `portman bridge prepare` as the fix, and the daemon looks at
+  the image again every minute while the bridge is up.
+
+Manual gates, on an installed build with the bridge up and a registered HTTP
+route `web.demo.test` and a TCP route `db.demo.test` to a container on the
+`portman` network:
+
+1. Start a container with no `dns` option, before and after the upgrade.
+   Confirm that `example.com` resolves in both and that `/etc/resolv.conf` in
+   the container is the same in both.
+2. Start a container on a compose network with `--dns 192.168.99.129`.
+   Confirm that `web.demo.test` resolves and `curl http://web.demo.test`
+   returns 200. Confirm that `db.demo.test` resolves and that a TCP connection
+   to it fails. Attach the container to the `portman` network too, and confirm
+   that the connection opens.
+3. In the same container, confirm that `example.com` and
+   `host.docker.internal` each resolve in under 1 s, to the answers that a
+   container without the option gets.
+4. Repeat gates 2 and 3 on the default `bridge` network with an Alpine image
+   and with a Debian or Ubuntu image. With a managed TLD that also holds names
+   portman does not own, look one such name up and confirm the answer that a
+   container without the option gets.
+5. Run `portman tld add` for another TLD and add a static rule under it.
+   Confirm that the new hostname resolves through the forwarder within 10 s.
+6. Stop the daemon. Confirm that `example.com` and `host.docker.internal`
+   still resolve in under 1 s and that only `web.demo.test` fails.
+7. Restart the VM. Confirm that `portman-netbridge-dns` runs again with no
+   portman command, and that `example.com` resolves through it before the
+   bridge reports healthy.
+8. Save `scutil --dns`, `/etc/resolv.conf`, the file list of `/etc/resolver`,
+   and `netstat -rn` before the upgrade and after gates 2 to 7. Confirm that
+   the only differences are routes on portman's own `utun`.
+9. Run `portman bridge disable`. Confirm that `portman-netbridge-dns` is gone
+   and that `portman doctor` prints `dns forwarder: absent`. Run `portman
+   bridge enable`. Confirm that the container runs and that doctor prints
+   `dns forwarder: running at 192.168.99.129`.
+10. Build `portman-netbridge/setup:local` from the `setup-image` folder of
+    the release before this feature, and enable the bridge. Confirm that the
+    bridge comes up and that doctor prints `dns forwarder: unavailable`. Run
+    `portman bridge prepare`. Confirm that `portman-netbridge-dns` runs within
+    a minute.
+11. From a container with `--dns 192.168.99.129`, look `late.demo.test` up
+    before it is registered. Register it, and confirm that the next lookup
+    resolves it.
+12. Stop the VM, run `portman bridge disable`, and start the VM. Confirm that
+    `portman-netbridge-dns` and the `portman` network are gone.
 
 ## Current Evidence
 
@@ -164,7 +251,8 @@ or require a running local workload for useful comparison.
 | Bridge enable/disable | Netbridge route/network/setup ownership tests; daemon status polling tests; setup env excludes VM private key | `portman bridge enable`, inspect status/setup container/chip0, then disable and verify cleanup | Partial: enable/restart/data-plane verified; disable cleanup still manual |
 | Docker bridge replacement | Mode persistence tests; Docker route-planning tests; health scope excludes unrelated networks; CLI doctor fixture tests for setup image, legacy bridge guidance, route parsing, and labelled-network rendering | `portman bridge mode docker`, `portman doctor`, stop docker-mac-net-connect, verify labelled containers on compose/default bridge networks resolve and connect | Partial: labelled TCP cutover verified on `dev_default`; broader disposable matrix still manual |
 | Container resources | Protocol defaults tests; daemon CPU/memory/network/block-IO calculation tests; per-second counter-rate test; Swift release build | `portman resources`, open Swift Resources pane, compare top rows with `docker stats --no-stream` and confirm network/block IO display as rates rather than lifetime totals | Manual comparison gate |
-| Container-facing DNS/proxy | DNS loopback rewrite test; host-facing service bind-plan test for `192.168.99.1:53/:80/:443`; host-facing retry test | Run disposable container on a routed network, query `@192.168.99.1`, then `curl http://<managed-host>` and `curl https://<managed-host>` where TLS is enabled | Manual gate |
+| Container-facing DNS/proxy | DNS loopback rewrite test; response-code test of both DNS listeners for held and unheld names; host-facing service bind-plan test for `192.168.99.1:53/:80/:443`; host-facing retry test | Run disposable container on a routed network, query `@192.168.99.1`, then `curl http://<managed-host>` and `curl https://<managed-host>` where TLS is enabled | Manual gate |
+| Container DNS forwarder | Forwarder argument tests; entrypoint `dns` mode tests with a stand-in `dnsmasq`; replace-or-keep decision tests; removal tests against a fake engine; control-loop tests under paused time; doctor line tests | The twelve gates under "Container DNS Forwarder" | Manual gate |
 | Setup image | Shell syntax check; runtime ownership tests | Docker build/run in a disposable context, inspect `wg show chip0` and `ip addr show chip0` | Manual gate |
 | Web dashboard | `portman dashboard`; dashboard Host/Origin tests; protected registry-entry test | Open `http://portman.localhost`, verify status, entries, static add/remove, TLD list, resource usage | Manual gate |
 

@@ -1644,6 +1644,7 @@ function renderStatus(status) {
     el('version').textContent = '';
     el('daemon-ports').textContent = '';
     el('bridge-pill').hidden = true;
+    el('docker-pill').hidden = true;
     return;
   }
   el('version').textContent = 'v' + status.version;
@@ -1655,13 +1656,27 @@ function renderStatus(status) {
   const pill = el('bridge-pill');
   const assessment = status.bridge_assessment || 'unknown';
   pill.hidden = false;
-  el('bridge-label').textContent = `bridge ${assessment.replace('_', ' ')}`;
+  const phase = String(status.bridge_phase).replace(/_/g, ' ');
+  const wantedNotUp = phase !== 'up' && phase !== 'disabled';
+  el('bridge-label').textContent = `bridge ${assessment.replace('_', ' ')}`
+    + (wantedNotUp ? ` · netbridge ${phase}` : '');
   if (assessment !== 'healthy' && assessment !== 'unknown') {
     pushAlert(
       `Bridge ${assessment.replace('_', ' ')}`,
-      `<div class="alert-body">mode=${esc(status.bridge_mode)} · enabled=${esc(status.bridge_enabled)}</div>`,
+      `<div class="alert-body">mode=${esc(status.bridge_mode)} · netbridge=${esc(phase)}</div>`,
       assessment === 'tunnel_dead'
     );
+  }
+
+  // An older daemon sends no `docker`. A connected engine gets no pill, and
+  // neither does managed-broker mode, which uses none.
+  const docker = status.docker;
+  const dockerPill = el('docker-pill');
+  dockerPill.hidden = !docker || docker.state === 'connected' || docker.state === 'disabled';
+  if (!dockerPill.hidden) {
+    el('docker-label').textContent = `docker ${String(docker.state).replace(/_/g, ' ')}`
+      + (docker.reason ? ` · ${docker.reason}` : '');
+    dockerPill.title = [docker.socket, docker.detail].filter(Boolean).join(' · ');
   }
 }
 

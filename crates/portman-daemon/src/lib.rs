@@ -1,17 +1,14 @@
 //! portman daemon entry point.
-//!
-//! Phase 3: in-memory registry fed by (1) docker events, (2) a one-shot scan
-//! of already-running containers at boot, and (3) persisted static rules.
-//! IPC server answers list/status/add/remove.
 
 mod certs;
 mod dashboard;
 mod dashboard_auth;
+mod discovery;
 mod dns;
-mod docker_events;
 mod egress;
 mod egress_client;
 mod egress_grants;
+mod engine;
 mod env_compose;
 mod handlers;
 mod ipc_server;
@@ -51,7 +48,6 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use bollard::Docker;
 use clap::Parser;
 use portman_core::paths::{cert_dir, static_rules_path, tls_settings_path, user_home};
 use portman_core::tld::{host_is_routable, scan_managed_tlds};
@@ -143,7 +139,9 @@ struct Args {
 /// `Status` response). Cheap to clone.
 #[derive(Clone)]
 pub(crate) struct DaemonState {
-    pub docker: Docker,
+    /// The link to the container engine. A caller borrows the Docker
+    /// handle for one call.
+    pub engine: engine::Engine,
     pub registry: Registry,
     pub static_store: Arc<StaticStore>,
     pub tls_store: Arc<TlsStore>,
@@ -152,13 +150,16 @@ pub(crate) struct DaemonState {
     /// to answer `TldList` and to gate registration (hosts with unregistered
     /// TLDs are rejected with a warning).
     pub known_tlds: Arc<RwLock<HashSet<String>>>,
+    /// Wakes the container reconcile when a TLD is added or the registry
+    /// releases a hostname, because no Docker event reports either.
+    pub container_resync: Arc<tokio::sync::Notify>,
     /// Current host↔VM bridge health assessment, updated every 5s by the
     /// `bridge_health` task. Surfaced via IPC `Status` so the menubar can
     /// tint the sailboat icon green/yellow/red.
     pub bridge_health: bridge_health::Shared,
     /// Handle the IPC server uses to send Enable/Disable to the
-    /// netbridge task. Also carries a shared `enabled` flag for
-    /// synchronous status reads.
+    /// netbridge task. Also carries the bridge phase for synchronous
+    /// status reads.
     pub netbridge: netbridge::Handle,
     /// Previous Docker CPU samples, keyed by full container id. Docker stats
     /// reports monotonic counters; this lets IPC snapshots compute a delta
@@ -220,6 +221,7 @@ impl DaemonState {
             .write()
             .expect("known_tlds lock poisoned")
             .insert(tld);
+        self.netbridge.tlds_changed.notify_one();
     }
 
     pub(crate) fn tld_remove(&self, tld: &str) {
@@ -227,6 +229,7 @@ impl DaemonState {
             .write()
             .expect("known_tlds lock poisoned")
             .remove(tld);
+        self.netbridge.tlds_changed.notify_one();
     }
 }
 
@@ -240,7 +243,7 @@ pub async fn daemon_main() -> Result<()> {
 
     ensure_data_dir_owned_by_login_user().context("preparing data dir")?;
 
-    let registry = Registry::new();
+    let (registry, container_resync) = engine::registry_with_resync();
     // Shared host → loopback-address map: the DNS server answers TCP hosts with
     // their front, and the forwarder binds a listener there. Same handle, so
     // they always agree on the address.
@@ -264,7 +267,7 @@ pub async fn daemon_main() -> Result<()> {
     let cert_manager = CertManager::new(cert_dir()?, caroot);
 
     let bridge_health_shared = bridge_health::new_shared();
-    let (netbridge_handle, netbridge_rx, netbridge_state_tx) = netbridge::handle_pair();
+    let (netbridge_handle, netbridge_rx, netbridge_phase_tx) = netbridge::handle_pair();
     let resource_samples = resources::new_shared_samples();
     let service_sampler = resources::new_shared_system();
     let resource_history = resources::new_shared_history();
@@ -291,15 +294,7 @@ pub async fn daemon_main() -> Result<()> {
         .context("initializing supervisor")?;
 
     supervisor.configure_managed_broker(args.managed_broker)?;
-    let docker = connect_docker(&args).context("connecting to docker")?;
-    if !args.managed_broker {
-        let version = docker.version().await.context("docker ping/version")?;
-        info!(
-            api_version = version.api_version.as_deref().unwrap_or("?"),
-            server_version = version.version.as_deref().unwrap_or("?"),
-            "connected to docker"
-        );
-    }
+    let (engine, engine_publisher) = engine::channel();
 
     if args.managed_broker {
         anyhow::ensure!(
@@ -313,7 +308,7 @@ pub async fn daemon_main() -> Result<()> {
     }
 
     let runner = runner::Runner::new(
-        docker.clone(),
+        engine.clone(),
         static_store.clone(),
         registry.clone(),
         supervisor.clone(),
@@ -330,7 +325,7 @@ pub async fn daemon_main() -> Result<()> {
     };
 
     let state = DaemonState {
-        docker: docker.clone(),
+        engine: engine.clone(),
         registry: registry.clone(),
         static_store: static_store.clone(),
         runner,
@@ -340,6 +335,7 @@ pub async fn daemon_main() -> Result<()> {
         tls_store: tls_store.clone(),
         cert_manager: cert_manager.clone(),
         known_tlds: known_tlds.clone(),
+        container_resync,
         bridge_health: bridge_health_shared.clone(),
         netbridge: netbridge_handle.clone(),
         resource_samples,
@@ -355,9 +351,6 @@ pub async fn daemon_main() -> Result<()> {
 
     seed_builtin_routes(&state);
     seed_from_static_store(&state);
-    if !args.managed_broker {
-        seed_from_running_containers(&docker, &state).await;
-    }
 
     // Provision certs for any already-registered entries under TLS-enabled TLDs.
     provision_certs_for_existing(&state);
@@ -391,10 +384,8 @@ pub async fn daemon_main() -> Result<()> {
     });
     let ipc = tokio::spawn(ipc_server::run(state.clone()));
     let dashboard = tokio::spawn(dashboard::run(state.clone(), args.dashboard_port));
-    // Hand bridge_health a clone of the Docker handle before docker_events
-    // takes ownership; bollard::Docker is a cheap Arc internally.
     let bridge_health_task = bridge_health::run(
-        docker.clone(),
+        engine.clone(),
         bridge_health_shared,
         netbridge_handle.ifindex.clone(),
     );
@@ -410,15 +401,14 @@ pub async fn daemon_main() -> Result<()> {
     // runtime via `Request::BridgeEnable` / `BridgeDisable`, which
     // forward through `netbridge_handle` as `Control` messages.
     let netbridge_state_path = portman_core::paths::netbridge_state_path()?;
-    // Subscribe a state receiver *before* spawning the netbridge task
-    // so the very first state publish isn't missed.
-    let host_facing_rx = netbridge_handle.state_rx.clone();
+    let host_facing_rx = netbridge_handle.phase.clone();
     let netbridge_task = netbridge::run(
-        docker.clone(),
+        engine,
         netbridge_handle,
         netbridge_rx,
-        netbridge_state_tx,
+        netbridge_phase_tx,
         netbridge_state_path,
+        known_tlds.clone(),
     );
     let netbridge_task = tokio::spawn(async move {
         if managed_broker {
@@ -426,12 +416,21 @@ pub async fn daemon_main() -> Result<()> {
         }
         netbridge_task.await
     });
-    let events = docker_events::run(docker, state.clone());
-    let events = tokio::spawn(async move {
+    let sockets = match args.docker_socket {
+        Some(path) => engine::Sockets::Configured(path.into()),
+        None => engine::Sockets::Detected(portman_core::paths::docker_socket_candidates()),
+    };
+    let engine_task = engine::run(
+        engine_publisher,
+        sockets,
+        engine::open_socket,
+        state.clone(),
+    );
+    let engine_task = tokio::spawn(async move {
         if managed_broker {
             std::future::pending::<()>().await;
         }
-        events.await
+        engine_task.await
     });
     let dns = tokio::spawn(dns::run(
         state.registry.clone(),
@@ -517,7 +516,10 @@ pub async fn daemon_main() -> Result<()> {
         .context("installing SIGTERM handler")?;
 
     let outcome = tokio::select! {
-        result = events => result.context("docker events task panicked").and_then(|r| r),
+        result = engine_task => match result {
+            Ok(never) => match never {},
+            Err(panic) => Err(panic).context("docker engine task panicked"),
+        },
         result = ipc => result.context("ipc server task panicked").and_then(|r| r),
         result = dashboard => result.context("dashboard task panicked").and_then(|r| r),
         result = dns => result.context("dns task panicked").and_then(|r| r),
@@ -567,9 +569,9 @@ fn seed_builtin_routes(state: &DaemonState) {
     });
 }
 
-pub(crate) async fn rehydrate_registry_for_managed_tlds(state: &DaemonState) {
+pub(crate) fn rehydrate_registry_for_managed_tlds(state: &DaemonState) {
     seed_from_static_store(state);
-    seed_from_running_containers(&state.docker, state).await;
+    state.container_resync.notify_one();
 }
 
 fn init_tracing() {
@@ -612,51 +614,6 @@ fn raise_fd_limit() {
             "cannot raise RLIMIT_NOFILE; keeping the inherited limit"
         ),
     }
-}
-
-fn connect_docker(args: &Args) -> Result<Docker> {
-    if args.managed_broker {
-        // Keep the shared state shape, with no capability to reach an engine.
-        return Ok(Docker::connect_with_socket(
-            "/dev/null",
-            1,
-            bollard::API_DEFAULT_VERSION,
-        )?);
-    }
-    if let Some(path) = args.docker_socket.as_deref() {
-        info!(socket = path, "using configured docker socket");
-        return Ok(Docker::connect_with_socket(
-            path,
-            120,
-            bollard::API_DEFAULT_VERSION,
-        )?);
-    }
-
-    // Auto-detect: honor DOCKER_HOST first, then try common macOS runtime
-    // socket locations relative to the invoking user's home (SUDO_USER-aware
-    // so this works under `sudo -E` where $HOME is rewritten to /var/root).
-    // Candidate list is defined in portman_core so the netbridge crate and
-    // any future auxiliary binaries use exactly the same resolution order.
-    for path in portman_core::paths::docker_socket_candidates() {
-        if path.exists() {
-            info!(socket = %path.display(), "auto-detected docker socket");
-            let Some(s) = path.to_str() else {
-                continue;
-            };
-            return Ok(Docker::connect_with_socket(
-                s,
-                120,
-                bollard::API_DEFAULT_VERSION,
-            )?);
-        }
-    }
-
-    anyhow::bail!(
-        "no docker socket found. Tried DOCKER_HOST, ~/.colima/default/docker.sock, \
-         ~/.config/colima/default/docker.sock, ~/.orbstack/run/docker.sock, \
-         ~/.docker/run/docker.sock, /var/run/docker.sock. \
-         Set PORTMAN_DOCKER_SOCKET or start a runtime (e.g. `colima start`)."
-    )
 }
 
 /// The daemon runs as root under launchd/systemd, but the data dir must be
@@ -731,135 +688,6 @@ fn seed_from_static_store(state: &DaemonState) {
     if skipped > 0 {
         warn!(count = skipped, "static rules skipped (unmanaged TLD)");
     }
-}
-
-async fn seed_from_running_containers(docker: &Docker, state: &DaemonState) {
-    use bollard::query_parameters::{InspectContainerOptions, ListContainersOptionsBuilder};
-
-    let opts = ListContainersOptionsBuilder::default().build();
-    let summaries = match docker.list_containers(Some(opts)).await {
-        Ok(list) => list,
-        Err(err) => {
-            warn!(error = %err, "initial container scan failed");
-            return;
-        }
-    };
-
-    let mut seeded = 0_usize;
-    let mut skipped = 0_usize;
-    for summary in summaries {
-        let Some(labels) = summary.labels.as_ref() else {
-            continue;
-        };
-        let Some(raw_host) = labels.get("dev.portman.host").filter(|v| !v.is_empty()) else {
-            continue;
-        };
-        let host = match docker_events::normalize_host_label(raw_host) {
-            Ok(host) => host,
-            Err(err) => {
-                warn!(
-                    host = %raw_host,
-                    error = %err,
-                    "skipping container: invalid dev.portman.host label"
-                );
-                skipped += 1;
-                continue;
-            }
-        };
-        if host == portman_core::registry::DASHBOARD_HOST {
-            warn!(%host, "skipping container: hostname is reserved for portman's dashboard");
-            skipped += 1;
-            continue;
-        }
-        if !state.host_is_routable(&host) {
-            warn!(%host, "skipping container: TLD is not managed; run `portman tld add <tld>` first");
-            skipped += 1;
-            continue;
-        }
-        let mode = Mode::parse_label(labels.get("dev.portman.mode").map(String::as_str));
-        if mode == Mode::Tcp && portman_core::tld::host_is_localhost(&host) {
-            warn!(%host, "skipping container: .localhost is HTTP-only because the operating system fixes it to loopback");
-            skipped += 1;
-            continue;
-        }
-        let Some(port) = labels
-            .get("dev.portman.port")
-            .cloned()
-            .filter(|v| !v.is_empty())
-            .or_else(|| match mode {
-                Mode::Http | Mode::Egress | Mode::Unknown => Some("80".into()),
-                Mode::Tcp => None,
-            })
-        else {
-            warn!(
-                %host,
-                "skipping container: dev.portman.mode=tcp requires dev.portman.port"
-            );
-            skipped += 1;
-            continue;
-        };
-        let Some(id) = summary.id.as_deref() else {
-            continue;
-        };
-
-        match docker
-            .inspect_container(id, None::<InspectContainerOptions>)
-            .await
-        {
-            Ok(inspect) => {
-                if let Some(target) = pick_ip(&inspect).map(|ip| format!("{ip}:{port}")) {
-                    state.registry.upsert(Entry {
-                        host: host.clone(),
-                        target,
-                        source: Source::Container,
-                        mode,
-                        container_id: Some(short(id).to_string()),
-                        egress: None,
-                        project: inspect
-                            .config
-                            .as_ref()
-                            .and_then(|c| c.labels.as_ref())
-                            .and_then(|l| l.get("dev.portman.project"))
-                            .cloned(),
-                    });
-                    seeded += 1;
-                }
-            }
-            Err(err) => warn!(error = %err, id = short(id), "initial scan: inspect failed"),
-        }
-    }
-    if seeded > 0 {
-        info!(
-            count = seeded,
-            "seeded registry with already-running containers"
-        );
-    }
-    if skipped > 0 {
-        warn!(count = skipped, "containers skipped (unmanaged TLD)");
-    }
-}
-
-fn pick_ip(inspect: &bollard::models::ContainerInspectResponse) -> Option<String> {
-    let settings = inspect.network_settings.as_ref()?;
-    if let Some(ip) = settings.ip_address.as_deref() {
-        if !ip.is_empty() {
-            return Some(ip.to_string());
-        }
-    }
-    if let Some(networks) = settings.networks.as_ref() {
-        for net in networks.values() {
-            if let Some(ip) = net.ip_address.as_deref() {
-                if !ip.is_empty() {
-                    return Some(ip.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-fn short(id: &str) -> &str {
-    &id[..id.len().min(12)]
 }
 
 #[cfg(test)]

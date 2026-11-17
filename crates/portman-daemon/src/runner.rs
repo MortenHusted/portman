@@ -22,7 +22,6 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use bollard::query_parameters::{RestartContainerOptions, StartContainerOptions};
-use bollard::Docker;
 use portman_core::static_store::validate_service;
 use portman_core::{Registry, StaticStore};
 use tracing::{info, warn};
@@ -45,7 +44,7 @@ pub(crate) trait Starter: Send + Sync {
 
 #[derive(Clone)]
 pub(crate) struct Runner {
-    docker: Docker,
+    engine: crate::engine::Engine,
     static_store: Arc<StaticStore>,
     registry: Registry,
     supervisor: crate::supervisor::Supervisor,
@@ -53,13 +52,13 @@ pub(crate) struct Runner {
 
 impl Runner {
     pub(crate) fn new(
-        docker: Docker,
+        engine: crate::engine::Engine,
         static_store: Arc<StaticStore>,
         registry: Registry,
         supervisor: crate::supervisor::Supervisor,
     ) -> Self {
         Self {
-            docker,
+            engine,
             static_store,
             registry,
             supervisor,
@@ -67,17 +66,18 @@ impl Runner {
     }
 
     async fn start_container(&self, id: &str, running: bool) -> Result<String> {
+        let docker = self.engine.docker()?;
         if running {
             // Registry entry exists → container is up but its app refused the
             // connection. Restart is the actionable remedy.
-            self.docker
+            docker
                 .restart_container(id, None::<RestartContainerOptions>)
                 .await
                 .with_context(|| format!("restarting container {id}"))?;
             info!(container = id, "restarted container");
             Ok(format!("restarted container {id}"))
         } else {
-            self.docker
+            docker
                 .start_container(id, None::<StartContainerOptions>)
                 .await
                 .with_context(|| format!("starting container {id}"))?;
@@ -91,7 +91,8 @@ impl Runner {
         use bollard::query_parameters::ListContainersOptionsBuilder;
         let opts = ListContainersOptionsBuilder::default().all(true).build();
         let summaries = self
-            .docker
+            .engine
+            .docker()?
             .list_containers(Some(opts))
             .await
             .context("listing containers")?;
@@ -111,7 +112,7 @@ impl Starter for Runner {
             return false;
         }
         self.supervisor.service_for_host(host).is_some()
-            || container_id.is_some()
+            || (container_id.is_some() && self.engine.session().is_some())
             || self.static_store.service_for(host).is_some()
     }
 
@@ -290,13 +291,8 @@ mod tests {
             )
             .unwrap();
 
-        let sock = dir.path().join("docker.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        let docker =
-            Docker::connect_with_socket(sock.to_str().unwrap(), 5, bollard::API_DEFAULT_VERSION)
-                .unwrap();
         let runner = Runner::new(
-            docker,
+            crate::engine::channel().0,
             static_store,
             portman_core::Registry::new(),
             supervisor.clone(),
@@ -310,6 +306,34 @@ mod tests {
         );
 
         supervisor.down(&["native-web".to_string()]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_container_path_needs_a_connected_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::handlers::tests::test_state(&dir);
+        let runner = |engine| {
+            Runner::new(
+                engine,
+                state.static_store.clone(),
+                state.registry.clone(),
+                state.supervisor.clone(),
+            )
+        };
+        let absent = runner(crate::engine::channel().0);
+        let connected = runner(crate::engine::tests::connected().0);
+        let container = Some("aaaaaaaaaaaa");
+
+        assert!(connected.can_start("web.demo.test", container));
+        assert!(!connected.can_start("web.demo.test", None));
+        assert!(!absent.can_start("web.demo.test", container));
+
+        let refused = absent.start("web.demo.test").await.unwrap_err();
+        assert_eq!(
+            refused.downcast_ref(),
+            Some(&crate::engine::Absent::Idle),
+            "{refused:#}"
+        );
     }
 
     struct DiscardSink;

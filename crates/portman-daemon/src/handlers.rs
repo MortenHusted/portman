@@ -2,8 +2,9 @@
 
 use portman_core::paths::{cert_dir as cert_dir_path, socket_path};
 use portman_core::{Mode, NetbridgeMode, Request, Response, VERSION};
-use portman_protocol::TldInfo;
+use portman_protocol::{BridgePhase, DockerState, DockerStatus, TldInfo};
 
+use crate::engine::{Absent, Link};
 use crate::DaemonState;
 
 pub(crate) async fn dispatch(request: Request, state: &DaemonState) -> Response {
@@ -93,7 +94,7 @@ pub(crate) async fn dispatch(request: Request, state: &DaemonState) -> Response 
         Request::TldList => Response::Tlds {
             tlds: build_tld_infos(state),
         },
-        Request::TldAdd { tld, tls_mode } => handle_tld_add(state, tld, tls_mode).await,
+        Request::TldAdd { tld, tls_mode } => handle_tld_add(state, tld, tls_mode),
         Request::TldRemove { tld } => handle_tld_remove(state, tld),
         Request::CertHealth => handle_cert_health(state),
         Request::ResourceUsage => handle_resource_usage(state),
@@ -464,8 +465,10 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
         .read()
         .map(|g| *g)
         .unwrap_or(portman_protocol::BridgeAssessment::Unknown);
-    let bridge_enabled = *state.netbridge.enabled.read().await;
+    // Mode first, phase second. `netbridge::publish` writes the phase first,
+    // so the phase read here is never older than the mode. It can be newer.
     let bridge_mode = *state.netbridge.mode.read().await;
+    let published_phase = *state.netbridge.phase.borrow();
     Response::Status {
         managed_broker: state.supervisor.managed_broker(),
         egress_grants_version: 1,
@@ -479,9 +482,53 @@ pub(crate) async fn handle_status(state: &DaemonState) -> Response {
         data_dir,
         cert_dir: certs,
         bridge_assessment,
-        bridge_enabled,
+        bridge_enabled: published_phase.reads_as_enabled(),
+        bridge_phase: BridgePhase::from(published_phase),
         bridge_mode,
         dashboard_port: state.dashboard_port,
+        docker: Some(docker_status(
+            &state.engine.link(),
+            state.supervisor.managed_broker(),
+        )),
+    }
+}
+
+/// The engine link as status reports it. In managed-broker mode nothing
+/// polls the engine task, so the link says nothing and the mode decides.
+fn docker_status(link: &Link, managed_broker: bool) -> DockerStatus {
+    let path = |socket: &std::path::Path| Some(socket.display().to_string());
+    let because = |state, reason: &str| DockerStatus {
+        state,
+        reason: Some(reason.into()),
+        ..DockerStatus::default()
+    };
+    if managed_broker {
+        return because(DockerState::Disabled, "managed broker");
+    }
+    let disconnected = |reason| because(DockerState::Disconnected, reason);
+    match link {
+        Link::Connected {
+            socket, version, ..
+        } => DockerStatus {
+            state: DockerState::Connected,
+            socket: path(socket),
+            version: version.clone(),
+            ..DockerStatus::default()
+        },
+        Link::Absent(Absent::Idle) => disconnected("no connect attempt has ended yet"),
+        Link::Absent(Absent::NoSocket) => DockerStatus {
+            detail: Some("none of the known runtime paths exists".into()),
+            ..disconnected("no socket")
+        },
+        Link::Absent(Absent::NoSocketAt(socket)) => DockerStatus {
+            socket: path(socket),
+            ..disconnected("no socket")
+        },
+        Link::Absent(Absent::Unreachable { socket, error }) => DockerStatus {
+            socket: path(socket),
+            detail: Some(error.clone()),
+            ..disconnected("unreachable")
+        },
     }
 }
 
@@ -677,7 +724,7 @@ fn handle_remove(state: &DaemonState, host: String) -> Response {
     Response::Ok
 }
 
-async fn handle_tld_add(
+fn handle_tld_add(
     state: &DaemonState,
     tld: String,
     tls_mode: Option<portman_core::TlsMode>,
@@ -708,7 +755,7 @@ async fn handle_tld_add(
     }
 
     state.tld_add(tld.clone());
-    crate::rehydrate_registry_for_managed_tlds(state).await;
+    crate::rehydrate_registry_for_managed_tlds(state);
 
     if state.tls_store.mode_for(&tld).requires_tls() {
         provision_certs_under(state, &tld);
@@ -781,29 +828,15 @@ fn format_duration(d: std::time::Duration) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    /// A DaemonState over temp stores and a lazy (never-connected) Docker
-    /// handle — enough to exercise dispatch arms that don't touch Docker.
-    fn test_state(dir: &TempDir) -> DaemonState {
-        let docker = {
-            // bollard checks the socket path exists at construction; give it
-            // a real (never-accepting) socket.
-            let sock = dir.path().join("docker.sock");
-            let _listener = Box::leak(Box::new(
-                std::os::unix::net::UnixListener::bind(&sock).unwrap(),
-            ));
-            bollard::Docker::connect_with_socket(
-                sock.to_str().unwrap(),
-                5,
-                bollard::API_DEFAULT_VERSION,
-            )
-            .expect("lazy docker handle")
-        };
-        let registry = portman_core::Registry::new();
+    /// A DaemonState over temp stores, with no container engine.
+    pub(crate) fn test_state(dir: &TempDir) -> DaemonState {
+        let (engine, _) = crate::engine::channel();
+        let (registry, container_resync) = crate::engine::registry_with_resync();
         let static_store =
             Arc::new(portman_core::StaticStore::load(dir.path().join("static.json")).unwrap());
         let tls_store =
@@ -828,19 +861,20 @@ mod tests {
             Arc::new(crate::supervisor::NoRoutes),
         );
         let runner = crate::runner::Runner::new(
-            docker.clone(),
+            engine.clone(),
             static_store.clone(),
             registry.clone(),
             supervisor.clone(),
         );
-        let (netbridge_handle, _rx, _state_tx) = crate::netbridge::handle_pair();
+        let (netbridge_handle, _rx, _phase_tx) = crate::netbridge::handle_pair();
         DaemonState {
-            docker,
+            engine,
             registry,
             static_store,
             tls_store,
             cert_manager: crate::certs::CertManager::new(dir.path().join("certs"), None),
             known_tlds: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+            container_resync,
             bridge_health: crate::bridge_health::new_shared(),
             netbridge: netbridge_handle,
             resource_samples: crate::resources::new_shared_samples(),
@@ -1209,6 +1243,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_static_rule_wakes_the_container_reconcile() {
+        use futures_util::FutureExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        state.known_tlds.write().unwrap().insert("test".to_string());
+
+        let added = dispatch(
+            Request::AddStatic {
+                host: "api.demo.test".into(),
+                target: "127.0.0.1:3070".into(),
+                mode: Mode::Http,
+                service: None,
+                project: None,
+            },
+            &state,
+        )
+        .await;
+        assert!(matches!(added, Response::Ok), "{added:?}");
+        assert!(state.container_resync.notified().now_or_never().is_none());
+
+        let removed = dispatch(
+            Request::RemoveStatic {
+                host: "api.demo.test".into(),
+            },
+            &state,
+        )
+        .await;
+        assert!(matches!(removed, Response::Ok), "{removed:?}");
+        assert!(state.container_resync.notified().now_or_never().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn wildcard_hosts_are_refused_in_tcp_mode() {
         // TCP entries get a dedicated loopback front per hostname, which a
         // pattern can't provide — better to say so than half-work.
@@ -1258,6 +1325,34 @@ mod tests {
             "127.0.0.1:3000"
         );
         assert!(state.known_tlds.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_tld_add_and_a_tld_remove_each_wake_the_netbridge() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        let woken = || async {
+            let wake = state.netbridge.tlds_changed.notified();
+            tokio::time::timeout(std::time::Duration::ZERO, wake)
+                .await
+                .is_ok()
+        };
+        assert!(!woken().await);
+
+        let tld = || "test".to_string();
+        for request in [
+            Request::TldAdd {
+                tld: tld(),
+                tls_mode: None,
+            },
+            Request::TldRemove { tld: tld() },
+        ] {
+            let response = dispatch(request, &state).await;
+
+            assert!(matches!(response, Response::Ok), "{response:?}");
+            assert!(woken().await);
+            assert!(!woken().await, "one change woke the netbridge twice");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1341,7 +1436,10 @@ mod tests {
         assert!(matches!(response, Response::Err { .. }));
     }
 
-    fn sleeper(name: &str, dir: &std::path::Path) -> portman_protocol::ServiceDefinition {
+    pub(crate) fn sleeper(
+        name: &str,
+        dir: &std::path::Path,
+    ) -> portman_protocol::ServiceDefinition {
         portman_protocol::ServiceDefinition {
             name: name.into(),
             run: vec!["/bin/sleep".into(), "300".into()],
@@ -1367,7 +1465,7 @@ mod tests {
 
     /// Each service's desired state and pid, once every desired-up service
     /// reports a running pid.
-    async fn settled_services(state: &DaemonState) -> Vec<(String, bool, Option<u32>)> {
+    pub(crate) async fn settled_services(state: &DaemonState) -> Vec<(String, bool, Option<u32>)> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             let services: Vec<_> = state
@@ -1795,6 +1893,149 @@ mod tests {
             }
         ));
     }
+    fn status_docker(response: Response) -> DockerStatus {
+        match response {
+            Response::Status { docker, .. } => docker.expect("the daemon reports the engine"),
+            other => panic!("expected status response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_says_why_no_engine_is_connected() {
+        let socket = || Some("/run/demo/docker.sock".to_string());
+        let disconnected = |reason: &str| DockerStatus {
+            state: DockerState::Disconnected,
+            reason: Some(reason.into()),
+            ..DockerStatus::default()
+        };
+        // (why the link is absent, managed broker) → what status reports
+        let table = [
+            (
+                Absent::Idle,
+                false,
+                disconnected("no connect attempt has ended yet"),
+            ),
+            (
+                Absent::NoSocketAt("/run/demo/docker.sock".into()),
+                false,
+                DockerStatus {
+                    socket: socket(),
+                    ..disconnected("no socket")
+                },
+            ),
+            (
+                Absent::NoSocket,
+                false,
+                DockerStatus {
+                    detail: Some("none of the known runtime paths exists".into()),
+                    ..disconnected("no socket")
+                },
+            ),
+            (
+                Absent::Unreachable {
+                    socket: "/run/demo/docker.sock".into(),
+                    error: "no answer in 3 s".into(),
+                },
+                false,
+                DockerStatus {
+                    socket: socket(),
+                    detail: Some("no answer in 3 s".into()),
+                    ..disconnected("unreachable")
+                },
+            ),
+            (
+                Absent::Idle,
+                true,
+                DockerStatus {
+                    state: DockerState::Disabled,
+                    reason: Some("managed broker".into()),
+                    ..DockerStatus::default()
+                },
+            ),
+        ];
+        for (absent, managed_broker, want) in table {
+            let link = Link::Absent(absent.clone());
+            assert_eq!(
+                docker_status(&link, managed_broker),
+                want,
+                "absent={absent:?} managed_broker={managed_broker}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_engine_link_of_the_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(&dir);
+        assert_eq!(
+            status_docker(handle_status(&state).await).summary(),
+            "disconnected, no connect attempt has ended yet"
+        );
+
+        let (engine, _fake) = crate::engine::tests::connected();
+        state.engine = engine;
+        assert_eq!(
+            status_docker(handle_status(&state).await),
+            DockerStatus {
+                state: DockerState::Connected,
+                socket: Some("/run/demo/docker.sock".into()),
+                version: Some("29.2.1".into()),
+                ..DockerStatus::default()
+            }
+        );
+
+        state.supervisor.set_managed_broker();
+        assert_eq!(
+            status_docker(handle_status(&state).await).state,
+            DockerState::Disabled
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn status_reports_the_bridge_phase_and_bridge_enabled_for_older_clients() {
+        use crate::netbridge::BridgePhase as Published;
+        use portman_protocol::BridgePhase as Wire;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(&dir);
+        let (handle, _rx, phase_tx) = crate::netbridge::handle_pair();
+        state.netbridge = handle;
+
+        // published phase → (phase on the wire, bridge_enabled)
+        let table = [
+            (Published::Disabled, Wire::Disabled, false),
+            (Published::WaitingForDocker, Wire::WaitingForDocker, false),
+            (Published::Starting, Wire::Starting, false),
+            (Published::Up { epoch: 3 }, Wire::Up, true),
+            (
+                Published::Stopping { turned_off: true },
+                Wire::Stopping,
+                true,
+            ),
+            (
+                Published::Stopping { turned_off: false },
+                Wire::Stopping,
+                false,
+            ),
+        ];
+        for (published, want_phase, want_enabled) in table {
+            phase_tx.send_replace(published);
+            match handle_status(&state).await {
+                Response::Status {
+                    bridge_phase,
+                    bridge_enabled,
+                    ..
+                } => assert_eq!(
+                    (bridge_phase, bridge_enabled),
+                    (want_phase, want_enabled),
+                    "published={published:?}"
+                ),
+                other => panic!("expected status response, got {other:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn issue_requires_selected_route_revision_and_inventory_omits_secret_locators() {
         let dir = tempfile::tempdir().unwrap();

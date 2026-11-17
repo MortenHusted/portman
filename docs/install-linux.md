@@ -39,7 +39,7 @@ systemctl is-active portman-daemon   # active
 portman status                       # daemon version, ports, socket
 ```
 
-The daemon needs Docker reachable at startup if you plan to use container routing; without Docker it exits, so install Docker first or check `journalctl -u portman-daemon` if the unit flaps.
+The daemon starts without Docker and connects when a Docker socket appears. Container routes exist only while Docker is connected.
 
 ## 3. Register a TLD
 
@@ -104,5 +104,5 @@ rm -rf ~/.local/share/portman  # optional: state, logs, certs
 
 - **`portman status` says permission denied on the socket** — the daemon chowns its data dir (`~/.local/share/portman`) to your login user at startup; if you installed as root without `SUDO_USER` set, check the unit file's `Environment=SUDO_USER=` line matches your user, then `sudo systemctl restart portman-daemon`.
 - **Names don't resolve after `tld add`** — check `resolvectl status`; the Global section should list `127.0.0.1:5335`. If not, `sudo systemctl restart systemd-resolved`.
-- **The unit won't stay up** — `journalctl -u portman-daemon --no-pager | tail -50`. The most common cause is Docker not running at daemon startup.
+- **The unit won't stay up** — `journalctl -u portman-daemon --no-pager | tail -50`. The last lines name the cause. A stopped Docker is not one: the daemon runs without Docker and connects when it starts.
 - **Port 80/443 already taken** — another proxy (nginx, traefik, caddy) owns them; stop it or expect the daemon to fail its bind.

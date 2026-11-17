@@ -7,7 +7,8 @@
 //! Thread-safety: wrapped in an `Arc<RwLock<...>>` under the hood. Readers
 //! take a shared lock, writers an exclusive one. Keyed by hostname.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::{Arc, RwLock};
 
 use portman_protocol::Entry;
@@ -16,15 +17,47 @@ use portman_protocol::Entry;
 /// resolved by the operating system, so this route needs no managed TLD.
 pub const DASHBOARD_HOST: &str = "portman.localhost";
 
+/// What [`Registry::replace_container_entries`] did with the desired entries.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ContainerDiff {
+    /// Entries written, either to a host that had no entry or over a container
+    /// entry that differed.
+    pub added: Vec<Entry>,
+    /// Container entries dropped because their host is no longer desired.
+    pub removed: Vec<Entry>,
+    /// Desired entries left out because an entry from another source holds
+    /// the host, each with that source.
+    pub shadowed: Vec<(Entry, portman_protocol::Source)>,
+}
+
 /// Cloneable handle to the shared registry — all clones point at the same data.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Registry {
     inner: Arc<RwLock<HashMap<String, Entry>>>,
+    on_release: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl fmt::Debug for Registry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Registry")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Registry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A registry that calls `on_release` after each [`Registry::remove`] that
+    /// takes an entry out. A container can carry the freed hostname as a
+    /// label, and nothing else reports that the hostname is free.
+    pub fn with_release_hook(on_release: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Arc::default(),
+            on_release: Some(Arc::new(on_release)),
+        }
     }
 
     /// Insert or replace the entry for `entry.host`. Returns the previous entry, if any.
@@ -44,30 +77,54 @@ impl Registry {
     /// Remove and return the entry for `host`, if present.
     pub fn remove(&self, host: &str) -> Option<Entry> {
         let key = host.to_ascii_lowercase();
-        let mut guard = self.inner.write().expect("registry lock poisoned");
-        if guard
-            .get(&key)
-            .is_some_and(|entry| entry.source == portman_protocol::Source::Builtin)
-        {
-            return None;
+        let removed = {
+            let mut guard = self.inner.write().expect("registry lock poisoned");
+            if guard
+                .get(&key)
+                .is_some_and(|entry| entry.source == portman_protocol::Source::Builtin)
+            {
+                return None;
+            }
+            guard.remove(&key)
+        };
+        if let (Some(_), Some(on_release)) = (&removed, &self.on_release) {
+            on_release();
         }
-        guard.remove(&key)
+        removed
     }
 
-    /// Remove any entries whose `container_id` matches. Used on container
-    /// stop/die events where we know the id but not the host the user mapped.
-    /// Returns the removed entries.
-    pub fn remove_by_container_id(&self, id: &str) -> Vec<Entry> {
+    /// Make the set of container-sourced entries equal `desired`, under one
+    /// write lock. A host that an entry from any other source holds keeps that
+    /// entry, because an explicit route outranks a container label. A second
+    /// call with the same `desired` adds and removes nothing.
+    pub fn replace_container_entries(&self, mut desired: Vec<Entry>) -> ContainerDiff {
+        for entry in &mut desired {
+            entry.host = entry.host.to_ascii_lowercase();
+        }
+        let wanted: HashSet<&str> = desired.iter().map(|e| e.host.as_str()).collect();
+        let mut diff = ContainerDiff::default();
         let mut guard = self.inner.write().expect("registry lock poisoned");
-        let victims: Vec<String> = guard
-            .iter()
-            .filter(|(_, e)| e.container_id.as_deref() == Some(id))
-            .map(|(k, _)| k.clone())
-            .collect();
-        victims
-            .into_iter()
-            .filter_map(|k| guard.remove(&k))
-            .collect()
+        guard.retain(|host, entry| {
+            let stale = entry.source == portman_protocol::Source::Container
+                && !wanted.contains(host.as_str());
+            if stale {
+                diff.removed.push(entry.clone());
+            }
+            !stale
+        });
+        for entry in desired {
+            match guard.get(&entry.host) {
+                Some(holder) if holder.source != portman_protocol::Source::Container => {
+                    diff.shadowed.push((entry, holder.source));
+                }
+                Some(current) if *current == entry => {}
+                _ => {
+                    guard.insert(entry.host.clone(), entry.clone());
+                    diff.added.push(entry);
+                }
+            }
+        }
+        diff
     }
 
     /// Snapshot of all entries as a `Vec`. The order is not stable across calls.
@@ -219,16 +276,166 @@ mod tests {
         assert_eq!(r.get("a.test").unwrap().container_id.unwrap(), "new");
     }
 
+    fn service(host: &str) -> Entry {
+        Entry {
+            source: Source::Service,
+            ..at(host, "127.0.0.1:8123")
+        }
+    }
+
+    fn hosts(entries: &[Entry]) -> Vec<&str> {
+        let mut hosts: Vec<&str> = entries.iter().map(|e| e.host.as_str()).collect();
+        hosts.sort_unstable();
+        hosts
+    }
+
     #[test]
-    fn remove_by_container_id_removes_all_matching() {
+    fn replace_container_entries_is_idempotent() {
         let r = Registry::new();
-        r.upsert(container("a.test", "abc"));
-        r.upsert(container("b.test", "xyz"));
-        r.upsert(container("c.test", "abc")); // edge: same id, two hosts
-        let removed = r.remove_by_container_id("abc");
-        assert_eq!(removed.len(), 2);
-        assert_eq!(r.len(), 1);
+        let desired = vec![container("a.test", "aaa"), container("B.Test", "bbb")];
+
+        let first = r.replace_container_entries(desired.clone());
+        assert_eq!(hosts(&first.added), vec!["a.test", "b.test"]);
+        assert!(first.removed.is_empty());
+
+        assert_eq!(
+            r.replace_container_entries(desired),
+            ContainerDiff::default()
+        );
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn replace_container_entries_removes_stale_container_entries() {
+        let r = Registry::new();
+        r.replace_container_entries(vec![container("a.test", "aaa"), container("b.test", "bbb")]);
+
+        let diff = r.replace_container_entries(vec![container("b.test", "bbb")]);
+
+        assert!(diff.added.is_empty());
+        assert_eq!(hosts(&diff.removed), vec!["a.test"]);
+        assert!(r.get("a.test").is_none());
         assert!(r.get("b.test").is_some());
+
+        let emptied = r.replace_container_entries(Vec::new());
+        assert_eq!(hosts(&emptied.removed), vec!["b.test"]);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn replace_container_entries_writes_a_changed_target() {
+        let r = Registry::new();
+        r.replace_container_entries(vec![container("a.test", "aaa")]);
+        let moved = Entry {
+            target: "192.168.99.130:80".into(),
+            ..container("a.test", "aaa")
+        };
+
+        let diff = r.replace_container_entries(vec![moved.clone()]);
+
+        assert_eq!(diff.added, vec![moved.clone()]);
+        assert!(diff.removed.is_empty());
+        assert_eq!(r.get("a.test"), Some(moved));
+    }
+
+    #[test]
+    fn replace_container_entries_never_touches_other_sources() {
+        let r = Registry::new();
+        r.upsert(at("static.test", "127.0.0.1:3070"));
+        r.upsert(service("service.test"));
+        r.upsert(Entry {
+            source: Source::Egress,
+            ..at("egress.test", "api.acme.example:443")
+        });
+        r.upsert(builtin(DASHBOARD_HOST));
+        let explicit = [
+            r.get("static.test").unwrap(),
+            r.get("service.test").unwrap(),
+            r.get("egress.test").unwrap(),
+            r.get(DASHBOARD_HOST).unwrap(),
+        ];
+
+        let contested = r.replace_container_entries(vec![
+            container("static.test", "aaa"),
+            container("service.test", "bbb"),
+            container("egress.test", "eee"),
+            container(DASHBOARD_HOST, "ccc"),
+            container("free.test", "ddd"),
+        ]);
+        assert_eq!(hosts(&contested.added), vec!["free.test"]);
+        assert!(contested.removed.is_empty());
+        let mut shadowed: Vec<(&str, Source)> = contested
+            .shadowed
+            .iter()
+            .map(|(entry, holder)| (entry.host.as_str(), *holder))
+            .collect();
+        shadowed.sort_unstable_by_key(|&(host, _)| host);
+        assert_eq!(
+            shadowed,
+            vec![
+                ("egress.test", Source::Egress),
+                (DASHBOARD_HOST, Source::Builtin),
+                ("service.test", Source::Service),
+                ("static.test", Source::Static),
+            ]
+        );
+
+        let emptied = r.replace_container_entries(Vec::new());
+        assert_eq!(hosts(&emptied.removed), vec!["free.test"]);
+        assert!(emptied.shadowed.is_empty());
+
+        for entry in explicit {
+            assert_eq!(r.get(&entry.host), Some(entry));
+        }
+        assert_eq!(r.len(), 4);
+    }
+
+    #[test]
+    fn container_entry_returns_after_its_static_rule_is_removed() {
+        let r = Registry::new();
+        let desired = vec![container("api.test", "aaa")];
+        r.replace_container_entries(desired.clone());
+
+        r.upsert(at("api.test", "127.0.0.1:3070"));
+        assert_eq!(
+            r.replace_container_entries(desired.clone()),
+            ContainerDiff {
+                shadowed: vec![(desired[0].clone(), Source::Static)],
+                ..ContainerDiff::default()
+            }
+        );
+        assert_eq!(r.get("api.test").unwrap().source, Source::Static);
+
+        r.remove("api.test");
+        let diff = r.replace_container_entries(desired.clone());
+
+        assert_eq!(diff.added, desired);
+        assert!(diff.shadowed.is_empty());
+        assert_eq!(r.get("api.test").unwrap().source, Source::Container);
+    }
+
+    #[test]
+    fn release_hook_runs_once_for_each_entry_removed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let releases = Arc::new(AtomicUsize::new(0));
+        let counter = releases.clone();
+        let r = Registry::with_release_hook(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let seen_by_clone = r.clone();
+        r.upsert(at("api.test", "127.0.0.1:3070"));
+        r.upsert(builtin(DASHBOARD_HOST));
+        r.replace_container_entries(vec![container("web.test", "aaa")]);
+        r.replace_container_entries(Vec::new());
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+
+        assert!(seen_by_clone.remove("api.test").is_some());
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+
+        assert!(r.remove("api.test").is_none());
+        assert!(r.remove(DASHBOARD_HOST).is_none());
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 
     #[test]

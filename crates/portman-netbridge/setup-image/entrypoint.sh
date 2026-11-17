@@ -7,6 +7,46 @@
 
 set -eu
 
+# `dns` mode: run the split DNS forwarder in the foreground. It does not
+# reach the WireGuard setup below. The arguments after `dns` are dnsmasq's.
+# An argument that ends in VM_RESOLVER is written once for each nameserver
+# in /etc/resolv.conf, in the order of that file. On the host network that
+# file is the VM's own, so dnsmasq also takes its default upstreams from it.
+# RESOLV_CONF names another file to read the nameservers from, for a test.
+VM_RESOLVER="@vm-resolver@"
+
+run_dns_forwarder() {
+    if [ "$#" -eq 0 ]; then
+        echo "portman-netbridge-dns: the dns mode needs dnsmasq arguments" >&2
+        exit 2
+    fi
+    resolv_conf="${RESOLV_CONF:-/etc/resolv.conf}"
+    nameservers="$(awk '$1 == "nameserver" { print $2 }' "$resolv_conf")"
+    if [ -z "$nameservers" ]; then
+        echo "portman-netbridge-dns: $resolv_conf names no nameserver" >&2
+        exit 2
+    fi
+    for arg in "$@"; do
+        shift
+        case "$arg" in
+            *"$VM_RESOLVER")
+                for nameserver in $nameservers; do
+                    set -- "$@" "${arg%"$VM_RESOLVER"}$nameserver"
+                done
+                ;;
+            *)
+                set -- "$@" "$arg"
+                ;;
+        esac
+    done
+    exec dnsmasq "$@"
+}
+
+if [ "${1:-}" = "dns" ]; then
+    shift
+    run_dns_forwarder "$@"
+fi
+
 PRIVKEY_FILE=""
 RULE_COMMENT="portman-netbridge"
 

@@ -99,14 +99,12 @@ longer exists.
 portman-netbridge creates a docker network named `portman` with:
 
 - Driver `bridge` (standard Linux bridge inside colima's VM).
-- Subnet `192.168.99.0/24`, gateway `192.168.99.2` (the chip0 interface
-  inside the VM).
-- Options that support the c2c/c2h hooks in the next section: DNS servers
-  field reserved but initially pointing at Docker's embedded DNS
-  (127.0.0.11) as a passthrough; `com.docker.network.driver.mtu=1420` for
-  WireGuard overhead.
+- Subnet `192.168.99.128/25`, gateway `192.168.99.129`. It is the upper
+  half of `192.168.99.0/24`. The lower half holds the tunnel's two ends,
+  the host at `.1` and the chip0 interface inside the VM at `.2`.
+- Option `com.docker.network.driver.mtu=1420` for WireGuard overhead.
 - Reserved IPs inside the subnet: `192.168.99.254` is never allocated to
-  containers (reserved for the host-facing virtual IP — see c2c/c2h
+  containers (reserved for the host-facing virtual IP — see the c2h
   hooks).
 
 ### B.3 — adoption without migration
@@ -227,44 +225,25 @@ one project, not the whole stack.
   bridges, reports what's on each subnet, flags drift. Optional — Phase
   C's menubar BridgeHealth already covers the UI side.
 
-## Design hooks reserved for c2c DNS + c2h routing (Phase E candidates)
+## Design hooks reserved for c2h routing (Phase E candidates)
 
-Container-to-container DNS (CLAUDE.md "third hard part", deferred past
-v0) and richer container-to-host routing are explicit post-v1 work. But
-Phase B's design decisions must not paint us into a corner. Three slots
-are reserved in the `portman` docker network config so these can land
-later without a rewrite.
+Richer container-to-host routing is explicit post-v1 work. But Phase B's
+design decisions must not paint us into a corner. Two slots are reserved
+in the `portman` docker network config so it can land later without a
+rewrite. A third slot, for container DNS, is not used.
 
-### Hook 1 — DNS injection
+### Hook 1 — DNS injection (not used)
 
-**What it enables:** container on portman-net resolves
-`pg.acme.internal` → real container IP (or host IP for static rules),
-without the user configuring per-container DNS. Makes portman hostnames
-first-class from inside containers, not just from the host.
+Container DNS (CLAUDE.md "third hard part") shipped without this hook.
+The plan here was a DNS setting on the `portman` network that a sidecar
+on that network would take over, so that every container on the network
+got portman's DNS with no setting of its own.
 
-**Reserved slot:** the `portman` docker network created in B.2 exposes a
-`--dns <ip>` parameter. In Phase B we default it to Docker's embedded
-`127.0.0.11` (effective no-op; containers still resolve peer service
-names, and portman hostnames return NXDOMAIN as today). When the
-c2c-DNS feature lands:
-
-- portman-netbridge spawns a long-lived sidecar container
-  `portman-dns-forwarder` inside colima's VM, attached to the portman
-  network.
-- The sidecar runs `hickory-server` (already a workspace dep), same
-  crate as the daemon's DNS.
-- It forwards `*.internal`, `*.acme`, `*.acme`, etc. (portman's
-  managed TLDs) to the daemon's DNS through the WireGuard tunnel back
-  to the macOS host. Everything else falls through to Docker's embedded
-  DNS or 1.1.1.1.
-- Network's default DNS flips from `127.0.0.11` to the sidecar's
-  container IP.
-- Containers attaching to portman-net inherit that DNS automatically.
-
-**Why the slot works:** we don't have to wait for Phase E to wire this.
-The network config field is already there. The flip from "passthrough"
-to "sidecar-forwarded" is a runtime configuration change, not a
-re-architecture.
+What shipped is a `dnsmasq` forwarder container, `portman-netbridge-dns`,
+on the VM's host network at `192.168.99.129`. A container opts in with a
+`dns` line, on any network. The `portman` network has no DNS setting, and
+a container without the line resolves as before. See "Containers
+resolving portman names" in the README and `setup-image/README.md`.
 
 ### Hook 2 — host-facing virtual IP
 
@@ -322,18 +301,18 @@ route is pure optimization, not correctness.
 
 | Slot | Reserved in Phase B as | Implemented in Phase E as |
 |---|---|---|
-| Hook 1 | `--dns` parameter on network create, defaulting to 127.0.0.11 | Sidecar DNS forwarder container swaps the value |
+| Hook 1 | Nothing | Not used. Container DNS shipped as the opt-in forwarder at `192.168.99.129` |
 | Hook 2 | `192.168.99.254` excluded from container IP pool | Virtual IP + SNAT in VM routing config |
 | Hook 3 | Comment block in VM setup script | Peering routes added in-VM |
 
 Each hook is an additive change in a future session. None requires
 re-architecting Phase B.
 
-## Phase E — c2c DNS, c2h virtual IP, cross-bridge peering
+## Phase E — c2h virtual IP, cross-bridge peering
 
-Implements the three reserved hooks above. Order is user-driven based on
-which pain point bites first after Phase B ships. Each hook is
-independently shippable.
+Implements hooks 2 and 3 above. Order is user-driven based on which pain
+point bites first after Phase B ships. Each hook is independently
+shippable.
 
 ## Phase F — Linux port, privileged-helper installer
 

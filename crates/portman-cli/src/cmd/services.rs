@@ -26,11 +26,13 @@ pub(crate) async fn cmd_status(repo: bool) -> Result<()> {
             cert_dir,
             bridge_assessment: _bridge_assessment,
             bridge_enabled: _bridge_enabled,
+            bridge_phase: _bridge_phase,
             bridge_mode: _bridge_mode,
             dashboard_port: _,
             managed_broker,
             egress_grants_version,
             inference_provisioning_version,
+            docker,
         } => {
             println!("daemon version:  {version}");
             println!("managed broker:  {managed_broker} (egress grants v{egress_grants_version}, inference provisioning v{inference_provisioning_version})");
@@ -52,16 +54,17 @@ pub(crate) async fn cmd_status(repo: bool) -> Result<()> {
             println!("socket:          {socket_path}");
             println!("data dir:        {data_dir}");
             println!("cert dir:        {cert_dir}");
+            if let Some(line) = docker_line(docker.as_ref()) {
+                println!("{line}");
+            }
             #[cfg(target_os = "macos")]
             {
                 println!("bridge:          {_bridge_assessment}");
                 println!(
                     "netbridge:       {}",
-                    if _bridge_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
+                    _bridge_phase
+                        .or_from_enabled(_bridge_enabled)
+                        .display_word()
                 );
                 println!(
                     "netbridge mode:  {}",
@@ -84,6 +87,12 @@ pub(crate) async fn cmd_status(repo: bool) -> Result<()> {
         print_service_statuses(&services);
     }
     Ok(())
+}
+
+/// The `docker` line of `portman status`. A daemon that predates the field
+/// reports no engine state, and status then prints no line.
+fn docker_line(docker: Option<&portman_protocol::DockerStatus>) -> Option<String> {
+    docker.map(|docker| format!("docker:          {}", docker.summary()))
 }
 
 /// Load and validate this repo's service config (walking up from the cwd).
@@ -418,6 +427,27 @@ pub(crate) fn print_service_statuses(services: &[portman_protocol::ServiceStatus
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_prints_a_docker_line_only_when_the_daemon_reports_the_engine() {
+        let line = |json: &str| match serde_json::from_str(json).unwrap() {
+            Response::Status { docker, .. } => docker_line(docker.as_ref()),
+            other => panic!("expected status response, got {other:?}"),
+        };
+
+        assert_eq!(line(r#"{"kind":"status","version":"0.1.5"}"#), None);
+        assert_eq!(
+            line(
+                r#"{"kind":"status","docker":{"state":"disconnected","socket":"/run/demo/docker.sock","reason":"no socket"}}"#
+            )
+            .as_deref(),
+            Some("docker:          disconnected, no socket at /run/demo/docker.sock")
+        );
+        assert_eq!(
+            line(r#"{"kind":"status","docker":{"state":"paused"}}"#).as_deref(),
+            Some("docker:          unknown")
+        );
+    }
 
     #[test]
     fn readiness_timeout_names_unsettled_services() {
