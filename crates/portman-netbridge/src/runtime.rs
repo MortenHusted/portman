@@ -599,8 +599,8 @@ fn spawn_route_reconciler(docker: Docker, mode: NetbridgeMode, iface: String) ->
 /// One pass of the route reconciler. It runs on a blocking thread, and the
 /// abort of the reconciler task does not end it. A bridge lets go of its
 /// utun before the interface goes, and the routes go with the interface. So
-/// a command that fails for a utun that the bridge let go of is no failure,
-/// and the pass ends there.
+/// a command that fails or is refused for a utun that the bridge let go of
+/// is no failure, and the pass ends there.
 fn reconcile_routes(route: &RunRoute, cmds: &[RouteCommand]) {
     for cmd in cmds {
         let Err(err) = ensure_route_command(route, cmd) else {
@@ -1642,7 +1642,28 @@ fn classify_existing_route(cidr: &str, existing_iface: &str, wanted_iface: &str)
     }
 }
 
+/// Runs `route` while the bridge holds `iface`, and refuses once the bridge
+/// let go of it. `route` takes an interface by its name, and the kernel
+/// gives the name of a utun that is gone to the next one, which can belong
+/// to a VPN. The claim is held for the whole command, so
+/// [`forget_own_utun`] waits for a command in flight. A bridge lets go
+/// before it closes the device, so no command names a utun that its bridge
+/// has closed.
+fn route_while_own(
+    route: &RunRoute,
+    iface: &str,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
+    let own = OWN_UTUNS.lock().expect("own-utun lock poisoned");
+    if !own.contains(iface) {
+        let refused = format!("the bridge let go of {iface}");
+        return Err(std::io::Error::other(refused));
+    }
+    route(args)
+}
+
 fn ensure_route_command(route: &RunRoute, cmd: &RouteCommand) -> Result<()> {
+    let route: &RunRoute = &|args| route_while_own(route, &cmd.iface, args);
     if cmd.verb == "add" {
         if let Some(existing) = specific_route_utun_interface(route, &cmd.cidr) {
             match classify_existing_route(&cmd.cidr, &existing, &cmd.iface) {
