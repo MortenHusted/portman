@@ -3661,6 +3661,23 @@ destination: 172.18.0.0
     }
 
     #[test]
+    fn the_setup_image_ships_a_dnsmasq_that_falls_through_for_a_query_with_edns_options() {
+        let dockerfile = include_str!("../setup-image/Dockerfile");
+        let base = dockerfile
+            .lines()
+            .find_map(|line| line.strip_prefix("FROM alpine:"))
+            .expect("the setup image is built on alpine");
+        let mut numbers = base.split('.').map(|number| number.parse::<u32>().unwrap());
+        let release = (numbers.next().unwrap(), numbers.next().unwrap());
+
+        assert!(
+            release >= (3, 22),
+            "alpine {base} ships dnsmasq 2.90 or older, which answers REFUSED to a query \
+             with EDNS options and does not ask the VM's resolver"
+        );
+    }
+
+    #[test]
     fn vm_public_key_is_parsed_from_setup_logs() {
         let key = Keypair::generate();
         let logs = format!(
