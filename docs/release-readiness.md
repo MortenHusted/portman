@@ -67,7 +67,7 @@ interface existence alone does not prove the route reaches Portman's bridge.
 reachability, bridge health/mode, setup-image status, docker-mac-net-connect
 presence/service status, labelled Docker networks, route interfaces for their
 subnets, and explicit commands for stopping the legacy bridge. It does not stop
-or uninstall any legacy service. It also reports the DNS forwarder. For a
+or uninstall any legacy service. On macOS it also reports the DNS forwarder. For a
 forwarder that runs while the bridge is up, it starts one short-lived
 container that looks a registered hostname up through `192.168.99.129`. The
 engine removes that container when the lookup ends. Doctor ends a lookup that
@@ -111,8 +111,8 @@ the compose line `dns: [192.168.99.129]`.
   resolver second, in strict order.
 - `host.docker.internal` and every other name go to the VM's own resolver
   only.
-- The daemon looks at the container at each bridge start and at each change
-  of the managed TLD set. It replaces a container that does not run, runs
+- The daemon looks at the container at each bridge start, at each change of
+  the managed TLD set, and once more a minute after it started one. It replaces a container that does not run, runs
   another command, or comes from another build of the setup image, and leaves
   it as it is otherwise.
 - A container with the right command from the current image that the engine
