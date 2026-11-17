@@ -32,7 +32,8 @@
 //!     stopped container of the user can still refer to it. That removal
 //!     stays owed until a cleanup has done it: with no session it waits for
 //!     one, and a cleanup that was skipped or that failed is tried again on
-//!     the next session. A network that the engine refuses to remove
+//!     the next session. The stop of a bridge that the user turned off is
+//!     such a cleanup, so no second one follows it on its session. A network that the engine refuses to remove
 //!     because it is in use is not owed. It stays until the next `Disable`,
 //!     so that no later session removes it under containers that have
 //!     stopped. The debt is not saved, so a daemon restart ends it. Each
@@ -582,7 +583,9 @@ async fn converge<E: BridgeEngine>(
             }
             Step::Teardown => {
                 if let Some(old) = running.take() {
-                    old.bridge.shutdown_and_remove_network().await;
+                    let cleanup = old.bridge.shutdown_and_remove_network().await;
+                    let asked_for = Leftovers::SetupContainerAndNetwork;
+                    debt.settle(old.built.session, asked_for, cleanup);
                 }
             }
             Step::Sweep(session, leftovers) => {
@@ -783,8 +786,9 @@ pub(crate) trait Bridge {
     /// Stops the bridge and keeps the docker network and the DNS forwarder.
     async fn shutdown(self);
     /// Stops the bridge and removes the DNS forwarder and the docker
-    /// network.
-    async fn shutdown_and_remove_network(self);
+    /// network. Says whether any of them is still owed, as
+    /// [`BridgeEngine::remove_leftovers`] does.
+    async fn shutdown_and_remove_network(self) -> Cleanup;
 }
 
 /// The engine behind the daemon's link. Its bridges listen on UDP port
@@ -887,8 +891,8 @@ impl Bridge for Runtime {
         Runtime::shutdown(self).await;
     }
 
-    async fn shutdown_and_remove_network(self) {
-        Runtime::shutdown_and_remove_network(self).await;
+    async fn shutdown_and_remove_network(self) -> Cleanup {
+        Runtime::shutdown_and_remove_network(self).await
     }
 }
 
@@ -1267,6 +1271,8 @@ mod tests {
         /// Whether a bridge holds the listen port. A start fails while one
         /// does.
         port_held: Arc<AtomicBool>,
+        /// How the removals of a stop for a disable end.
+        cleanups_end: Arc<Mutex<Cleanup>>,
     }
 
     struct Forwarding {
@@ -1433,9 +1439,10 @@ mod tests {
             self.free_port();
         }
 
-        async fn shutdown_and_remove_network(mut self) {
+        async fn shutdown_and_remove_network(mut self) -> Cleanup {
             self.probe.clone().stop(Stop::RemovesNetwork).await;
             self.free_port();
+            *self.probe.cleanups_end.lock().unwrap()
         }
     }
 
@@ -1518,6 +1525,7 @@ mod tests {
                     forwards: forward_seen,
                     ensure: ensure.clone(),
                     port_held: Arc::default(),
+                    cleanups_end: cleanups_end.clone(),
                 }),
             };
             tokio::spawn(converge(
@@ -1862,6 +1870,23 @@ mod tests {
 
         assert_eq!(rig.next_stop().await, Stop::RemovesNetwork);
         rig.no_sweep_follows().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_that_left_the_network_owed_is_followed_up_at_the_next_session() {
+        let mut rig = Rig::up().await;
+        rig.cleanups_end(Cleanup::Owed);
+
+        rig.send(Control::Disable).await;
+
+        assert_eq!(rig.next_stop().await, Stop::RemovesNetwork);
+        rig.no_sweep_follows().await;
+
+        rig.engine_session(S2);
+        assert_eq!(
+            rig.next_sweep().await,
+            (Session(2), SetupContainerAndNetwork)
+        );
     }
 
     #[tokio::test(start_paused = true)]

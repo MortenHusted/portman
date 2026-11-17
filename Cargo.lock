@@ -1933,6 +1933,7 @@ dependencies = [
  "rand 0.8.6",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "tun",
 ]
 

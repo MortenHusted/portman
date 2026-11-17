@@ -299,7 +299,8 @@ impl Runtime {
     /// `portman bridge disable` (user intent) still wants the network
     /// gone; call [`Runtime::shutdown_and_remove_network`] for that.
     pub async fn shutdown(mut self) {
-        self.stop().await;
+        self.end_tasks().await;
+        best_effort_remove_setup_container(&self.docker, &self.listen_port).await;
         info!(utun = %self.utun_name, "netbridge shut down (network retained)");
     }
 
@@ -309,12 +310,14 @@ impl Runtime {
     /// not on daemon restart. Docker refuses the removal of the network
     /// only while a running container is attached, and that is logged. A
     /// stopped container that refers to the network fails to start
-    /// afterwards.
-    pub async fn shutdown_and_remove_network(mut self) {
-        self.stop().await;
-        best_effort_remove_dns_forwarder(&self.docker, &self.listen_port).await;
-        remove_portman_network_if_owned(&self.docker, &self.listen_port).await;
+    /// afterwards. The return value says whether a later cleanup has
+    /// anything left to try, as [`remove_leftovers`] does.
+    pub async fn shutdown_and_remove_network(mut self) -> Cleanup {
+        self.end_tasks().await;
+        let everything = Leftovers::SetupContainerAndNetwork;
+        let cleanup = remove_with_port_held(&self.docker, &self.listen_port, everything).await;
         info!(utun = %self.utun_name, "netbridge shut down");
+        cleanup
     }
 
     /// Ends the bridge and asks the engine nothing, for a bridge whose
@@ -323,11 +326,6 @@ impl Runtime {
     /// finds the port free, which it does not after a drop.
     pub async fn abandon(mut self) {
         self.end_tasks().await;
-    }
-
-    async fn stop(&mut self) {
-        self.end_tasks().await;
-        best_effort_remove_setup_container(&self.docker, &self.listen_port).await;
     }
 
     async fn end_tasks(&mut self) {
@@ -1266,12 +1264,20 @@ pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Left
             return Cleanup::Owed;
         }
     };
-    let container_gone = best_effort_remove_setup_container(docker, &held).await;
+    remove_with_port_held(docker, &held, leftovers).await
+}
+
+async fn remove_with_port_held(
+    docker: &Docker,
+    held: &ListenPort,
+    leftovers: Leftovers,
+) -> Cleanup {
+    let container_gone = best_effort_remove_setup_container(docker, held).await;
     let (forwarder_gone, network) = match leftovers {
         Leftovers::SetupContainer => (true, None),
         Leftovers::SetupContainerAndNetwork => {
-            let forwarder_gone = best_effort_remove_dns_forwarder(docker, &held).await;
-            let network = remove_portman_network_if_owned(docker, &held).await;
+            let forwarder_gone = best_effort_remove_dns_forwarder(docker, held).await;
+            let network = remove_portman_network_if_owned(docker, held).await;
             (forwarder_gone, Some(network))
         }
     };
@@ -2383,7 +2389,20 @@ destination: 172.18.0.0
         /// The method and path of each request that is not an inspect, and
         /// its body.
         requests: Shared<Vec<(String, String)>>,
+        /// The removals that the engine refuses: the path, and the status
+        /// line and message of its answer.
+        refusals: Shared<HashMap<String, Refusal>>,
     }
+
+    type Refusal = (&'static str, &'static str);
+
+    /// How the engine answers the removal of a network that a running
+    /// container is attached to.
+    const IN_USE: Refusal = (
+        "403 Forbidden",
+        "error while removing network: network portman has active endpoints",
+    );
+    const ENGINE_FAILED: Refusal = ("500 Internal Server Error", "the engine is shutting down");
 
     const IMAGE_INSPECT: &str = "/images/portman-netbridge/setup:local/json";
     const IMAGE_WITH_DNS_MODE: &str = r#"{
@@ -2407,10 +2426,12 @@ destination: 172.18.0.0
             let address = listener.local_addr().unwrap().to_string();
             let holds = Shared::<HashMap<String, String>>::default();
             let requests = Shared::<Vec<(String, String)>>::default();
-            let (held, asked) = (holds.clone(), requests.clone());
+            let refusals = Shared::<HashMap<String, Refusal>>::default();
+            let (held, asked, refused) = (holds.clone(), requests.clone(), refusals.clone());
             tokio::spawn(async move {
                 while let Ok((stream, _)) = listener.accept().await {
-                    tokio::spawn(Self::answer(stream, held.clone(), asked.clone()));
+                    let (held, asked, refused) = (held.clone(), asked.clone(), refused.clone());
+                    tokio::spawn(Self::answer(stream, held, asked, refused));
                 }
             });
             let engine = Self {
@@ -2418,6 +2439,7 @@ destination: 172.18.0.0
                     .unwrap(),
                 holds,
                 requests,
+                refusals,
             };
             engine.hold(IMAGE_INSPECT, IMAGE_WITH_DNS_MODE);
             engine.hold(NETWORK_INSPECT, OWN_NETWORK);
@@ -2426,6 +2448,12 @@ destination: 172.18.0.0
 
         fn hold(&self, path: &str, json: &str) {
             self.holds.lock().unwrap().insert(path.into(), json.into());
+        }
+
+        /// Makes the engine refuse a removal of `path` and keep what it
+        /// holds there.
+        fn refuse_delete(&self, path: &str, refusal: Refusal) {
+            self.refusals.lock().unwrap().insert(path.into(), refusal);
         }
 
         fn requests(&self) -> Vec<(String, String)> {
@@ -2473,6 +2501,7 @@ destination: 172.18.0.0
             mut stream: tokio::net::TcpStream,
             holds: Shared<HashMap<String, String>>,
             requests: Shared<Vec<(String, String)>>,
+            refusals: Shared<HashMap<String, Refusal>>,
         ) {
             let mut head = Vec::new();
             while !head.ends_with(b"\r\n\r\n") {
@@ -2504,14 +2533,18 @@ destination: 172.18.0.0
                     let asked = format!("{} {path}", method.to_ascii_uppercase());
                     let body = String::from_utf8(body).unwrap();
                     requests.lock().unwrap().push((asked, body));
-                    match (method, path) {
-                        ("delete", _) => {
+                    let refusal = refusals.lock().unwrap().get(path).copied();
+                    match (method, path, refusal) {
+                        ("delete", _, Some((status, message))) => {
+                            (status, format!(r#"{{"message":"{message}"}}"#))
+                        }
+                        ("delete", _, None) => {
                             let mut holds = holds.lock().unwrap();
                             holds.remove(&format!("{path}/json"));
                             holds.remove(path);
                             ("204 No Content", String::new())
                         }
-                        ("post", "/containers/create") => {
+                        ("post", "/containers/create", _) => {
                             ("201 Created", r#"{"Id":"eeee3333","Warnings":[]}"#.into())
                         }
                         _ => ("204 No Content", String::new()),
@@ -2706,6 +2739,96 @@ destination: 172.18.0.0
 
         assert_eq!(socket.strong_count(), 0, "the listen port has a holder");
         assert_eq!(engine.asked_for(), [] as [&str; 0]);
+    }
+
+    /// What this thread logs at info and above while a [`Capture`] lives.
+    #[derive(Clone, Default)]
+    struct Logged(Shared<Vec<u8>>);
+
+    /// While one subscriber exists, tracing takes a callsite's interest
+    /// from the thread that reaches it first, and that can be a test that
+    /// has no subscriber. With a second subscriber it asks each of them.
+    struct Capture {
+        _on_this_thread: tracing::subscriber::DefaultGuard,
+        _second_subscriber: tracing::Dispatch,
+    }
+
+    impl std::io::Write for Logged {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Logged {
+        fn capture() -> (Self, Capture) {
+            let logged = Self::default();
+            let writer = logged.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let capture = Capture {
+                _on_this_thread: tracing::subscriber::set_default(subscriber),
+                _second_subscriber: tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new()),
+            };
+            (logged, capture)
+        }
+
+        /// Takes the warnings that were logged since the last call.
+        fn warnings(&self) -> Vec<String> {
+            let bytes = std::mem::take(&mut *self.0.lock().unwrap());
+            let text = String::from_utf8(bytes).unwrap();
+            let warnings = text.lines().filter(|line| line.contains(" WARN "));
+            warnings.map(String::from).collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_for_a_disable_asks_for_a_network_in_use_once_and_warns_once() {
+        let engine = FakeEngine::start().await;
+        engine.hold(SETUP_INSPECT, OWN_SETUP_CONTAINER);
+        engine.refuse_delete(NETWORK_INSPECT, IN_USE);
+        let bridge = engine.bridge().await;
+        let (logged, _capture) = Logged::capture();
+
+        let cleanup = bridge.shutdown_and_remove_network().await;
+
+        assert_eq!(cleanup, Cleanup::Complete);
+        let mut asked = engine.asked_for();
+        asked.retain(|asked| asked.ends_with(NETWORK_INSPECT));
+        assert_eq!(asked, ["DELETE /networks/portman"]);
+        let warnings = logged.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("has active endpoints"), "{warnings:?}");
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_for_a_disable_says_whether_a_later_cleanup_has_anything_left_to_try() {
+        let forwarder = dns_forwarder_args(&tlds(&["test"]));
+        // the removal that fails, and how → how the shutdown ends
+        let cases = [
+            (None, Cleanup::Complete),
+            (Some((NETWORK_INSPECT, IN_USE)), Cleanup::Complete),
+            (Some((NETWORK_INSPECT, ENGINE_FAILED)), Cleanup::Owed),
+            (Some(("/containers/dddd2222", ENGINE_FAILED)), Cleanup::Owed),
+        ];
+        for (fails, want) in cases {
+            let engine = FakeEngine::start().await;
+            engine.hold(SETUP_INSPECT, OWN_SETUP_CONTAINER);
+            engine.hold(FORWARDER_INSPECT, &held_forwarder(&forwarder, RUNNING));
+            if let Some((path, refusal)) = fails {
+                engine.refuse_delete(path, refusal);
+            }
+
+            let cleanup = engine.bridge().await.shutdown_and_remove_network().await;
+
+            assert_eq!(cleanup, want, "{fails:?}");
+        }
     }
 
     #[test]
