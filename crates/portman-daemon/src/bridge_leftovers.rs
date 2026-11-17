@@ -165,14 +165,18 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_uninstall_that_finds_no_engine_names_the_socket_it_tried() {
-        let sockets = Sockets::Configured(SOCKET.into());
+    async fn an_uninstall_that_finds_no_engine_says_where_it_looked_and_names_no_daemon_setting() {
+        let table = [
+            (
+                Sockets::Configured(SOCKET.into()),
+                "no docker socket at /run/demo/docker.sock",
+            ),
+            (Sockets::Detected(vec![]), "no docker socket found"),
+        ];
+        for (sockets, why) in table {
+            let ended = remove_from(&sockets, &|_| None, FREE_PORT).await;
 
-        let ended = remove_from(&sockets, &|_| None, FREE_PORT).await;
-
-        let BridgeLeftovers::NoEngine { reason } = ended else {
-            panic!("{ended:?}");
-        };
-        assert!(reason.contains(SOCKET), "{reason}");
+            assert_eq!(ended, BridgeLeftovers::NoEngine { reason: why.into() });
+        }
     }
 }
