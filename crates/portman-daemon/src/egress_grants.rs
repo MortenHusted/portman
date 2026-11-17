@@ -75,8 +75,9 @@ impl GrantStore {
     }
 
     fn observe(&self, _gate: &MutexGuard<'_, ()>, records: &mut Records) -> Result<u64> {
-        // Monotonic before wall, the reverse of `started_at`. In this order
-        // the floor cannot pass `now` unless the wall clock went back.
+        // Monotonic before wall, the reverse of `started_at`, so that time
+        // passing between the two readings cannot lift the floor above `now`.
+        // A monotonic clock that runs ahead of the wall clock still can.
         let since_start = self.clock.monotonic().duration_since(self.started_at.1);
         let now = self.clock.unix_secs();
         let monotonic_floor = self.started_at.0.saturating_add(since_start.as_secs());
