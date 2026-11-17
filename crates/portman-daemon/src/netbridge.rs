@@ -9,11 +9,11 @@
 //! Control flow:
 //!
 //!   - a `Control` message from the IPC server changes the intent. The
-//!     intent is persisted before anything acts on it, so an enable issued
-//!     while the engine is unreachable is still an enable after a restart.
-//!     A write that fails is made again each time the loop wakes. Until one
-//!     succeeds the file holds the older state, and a daemon that restarts
-//!     acts on that.
+//!     loop writes the intent to `netbridge.json` before it acts on it, so
+//!     an enable issued while the engine is unreachable is still an enable
+//!     after a restart. A write that fails does not hold the loop: it acts
+//!     on the intent that it has, and makes the write again each time it
+//!     wakes. A daemon that restarts before that boots on the older file.
 //!   - [`plan`] compares the intent and the engine session with the running
 //!     bridge and names the next step. The loop applies steps until none is
 //!     left, then waits for a control message, a change of engine session,
@@ -608,11 +608,10 @@ impl Swept {
 /// cleanup, so that the debt is saved in the same write as the flag.
 struct Wanted {
     saved: NetbridgeState,
+    /// What a daemon that boots on `netbridge.json` now would load. It
+    /// differs from `saved` after a write that failed.
+    on_disk: NetbridgeState,
     forced_on: bool,
-    /// The last write of `saved` failed, so `netbridge.json` holds an older
-    /// state. A daemon that restarts now boots on that one: it can owe a
-    /// debt that has ended, or lack an intent that the user gave.
-    unsaved: bool,
 }
 
 impl Wanted {
@@ -623,14 +622,11 @@ impl Wanted {
         }
     }
 
-    /// Writes `saved` to `netbridge.json`. A write that fails is logged,
-    /// and the loop makes it again each time it wakes.
     fn save(&mut self, state_path: &Path) {
-        let written = netbridge_state::save(state_path, &self.saved);
-        if let Err(err) = &written {
-            warn!(%err, "persisting netbridge state");
+        match netbridge_state::save(state_path, &self.saved) {
+            Ok(()) => self.on_disk = self.saved.clone(),
+            Err(err) => warn!(%err, "persisting netbridge state"),
         }
-        self.unsaved = written.is_err();
     }
 
     fn apply(&mut self, msg: Control) {
@@ -682,10 +678,11 @@ async fn converge<E: BridgeEngine>(
     forced_on: bool,
     known_tlds: KnownTlds,
 ) -> Result<()> {
+    let saved = netbridge_state::load(&state_path);
     let mut wanted = Wanted {
-        saved: netbridge_state::load(&state_path),
+        on_disk: saved.clone(),
+        saved,
         forced_on,
-        unsaved: false,
     };
     info!(
         persisted_enabled = wanted.saved.enabled,
@@ -705,7 +702,7 @@ async fn converge<E: BridgeEngine>(
         while let Ok(msg) = rx.try_recv() {
             take(msg, &mut wanted, &mut attempts, &mut debt, &state_path);
         }
-        if wanted.unsaved {
+        if wanted.saved != wanted.on_disk {
             wanted.save(&state_path);
         }
         // A start sequence serves one session, as it serves one intent.

@@ -14,7 +14,7 @@ use anyhow::Result;
 use portman_protocol::NetbridgeMode;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetbridgeState {
     /// User-requested on/off. Missing file / parse error treated as
     /// `false` (off) — the netbridge is opt-in.
