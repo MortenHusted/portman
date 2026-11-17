@@ -440,7 +440,7 @@ The forwarder keeps running when the daemon stops or the bridge is down. Its res
 
 ### Check the forwarder
 
-`portman doctor` prints one `dns forwarder` line. For a forwarder that runs, it starts a short-lived container that looks one registered hostname up through `192.168.99.129`, and prints the answer.
+`portman doctor` prints one `dns forwarder` line. For a forwarder that runs while the bridge is up, it starts a short-lived container that looks one registered hostname up through `192.168.99.129`, and prints the answer.
 
 The forwarder needs a setup image that has `dnsmasq`. An install from before this feature has an older image. The bridge then works as before, and `portman doctor` reports the forwarder as unavailable. Run `portman bridge prepare` to build the current image. A bridge that is up gets the forwarder within a minute.
 
