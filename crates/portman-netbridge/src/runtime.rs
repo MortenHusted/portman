@@ -704,9 +704,7 @@ async fn remove_existing_setup_container(docker: &Docker, _held: &ListenPort) ->
         return Ok(());
     };
     if !setup_container_is_portman_managed(Some(&labels)) {
-        anyhow::bail!(
-            "docker container `{SETUP_CONTAINER}` already exists but is not managed by portman"
-        );
+        return Err(ForeignSetupContainer.into());
     }
     if running {
         let opts = StopContainerOptionsBuilder::default()
@@ -763,11 +761,34 @@ async fn wait_for_setup_container_gone(docker: &Docker) -> Result<()> {
     }
 }
 
-/// Whether the removal ran to its end. It does not for a container of that
-/// name that is not portman's.
+/// A container has the setup container's name and not portman's labels.
+#[derive(Debug)]
+struct ForeignSetupContainer;
+
+impl std::fmt::Display for ForeignSetupContainer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "docker container `{SETUP_CONTAINER}` already exists but is not managed by portman"
+        )
+    }
+}
+
+impl std::error::Error for ForeignSetupContainer {}
+
+/// Whether the engine is left with no setup container of portman's. A
+/// container of that name that something else owns is not portman's to
+/// remove.
 async fn best_effort_remove_setup_container(docker: &Docker, held: &ListenPort) -> bool {
     match remove_existing_setup_container(docker, held).await {
         Ok(()) => true,
+        Err(err) if err.is::<ForeignSetupContainer>() => {
+            warn!(
+                container = SETUP_CONTAINER,
+                "skipping netbridge setup container removal because it is not marked as portman-managed"
+            );
+            true
+        }
         Err(err) => {
             warn!(
                 container = SETUP_CONTAINER,

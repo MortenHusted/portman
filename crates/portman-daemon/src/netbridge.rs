@@ -1906,7 +1906,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_cleanup_is_owed_when_a_removal_it_was_asked_for_did_not_happen() {
+    async fn a_cleanup_owes_only_what_can_still_be_portmans_in_the_engine() {
         let anothers_container = r#"{"Config": {"Labels": {}}, "State": {"Running": false}}"#;
         let anothers_network = r#"{"Labels": {}}"#;
         let unreadable = "not an answer to an inspect";
@@ -1932,7 +1932,7 @@ mod tests {
                 Some(anothers_container),
                 Some(OWN_NETWORK),
                 both,
-                Cleanup::Owed,
+                Cleanup::Complete,
             ),
         ];
         for (container, network, leftovers, want) in cases {
@@ -2091,6 +2091,32 @@ mod tests {
         daemon.disable().await;
 
         assert_eq!(daemon.network_calls(), [refused.clone(), refused].concat());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_setup_container_that_is_not_portmans_does_not_keep_the_network_owed() {
+        let anothers_container = r#"{"Config": {"Labels": {}}, "State": {"Running": false}}"#;
+        let held = [
+            (SETUP_CONTAINER, anothers_container),
+            (NETWORK, OWN_NETWORK),
+        ];
+        let daemon = OnFakeEngine::start(&held).await;
+        let removed = [format!("GET {NETWORK}"), format!("DELETE {NETWORK}")];
+
+        daemon.disable().await;
+
+        assert_eq!(daemon.network_calls(), removed);
+
+        daemon.open_session(2).await;
+
+        assert_eq!(daemon.network_calls(), removed, "the network stayed owed");
+        let calls = daemon.fake.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("DELETE /containers")),
+            "{calls:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
