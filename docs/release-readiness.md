@@ -148,6 +148,10 @@ the compose line `dns: [192.168.99.129]`.
   use. A forwarder that could not be removed beside such a network stays
   until the next disable. With no engine reachable at the disable, the daemon
   removes both in the next Docker session, unless the daemon restarts first.
+- `portman uninstall` removes the setup container, the forwarder and the
+  network by the same rules once the daemon is gone, and leaves the saved
+  bridge state as it is. With no engine reachable it prints the commands
+  that remove the forwarder and the network, and completes.
 - A setup image without the label `dev.portman.dns-forwarder=1` cannot run the
   forwarder. The bridge then works as before, the daemon log and `portman
   doctor` name `portman bridge prepare` as the fix, and the daemon looks at

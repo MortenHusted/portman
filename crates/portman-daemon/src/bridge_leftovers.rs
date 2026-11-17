@@ -12,7 +12,9 @@
 use std::path::{Path, PathBuf};
 
 use bollard::Docker;
-use portman_netbridge::runtime::{DNS_CONTAINER, PORTMAN_NETWORK};
+use portman_netbridge::runtime::{
+    remove_leftovers, Cleanup, Leftovers, DNS_CONTAINER, PORTMAN_NETWORK,
+};
 use portman_netbridge::tunnel::HOST_WG_LISTEN_PORT;
 
 use crate::engine::{self, Sockets};
@@ -58,15 +60,26 @@ pub async fn remove_bridge_leftovers(engine_socket: Option<PathBuf>) -> BridgeLe
 async fn remove_from(
     sockets: &Sockets,
     open: &impl Fn(&Path) -> Option<Docker>,
-    _listen_port: u16,
+    listen_port: u16,
 ) -> BridgeLeftovers {
-    match engine::connect(sockets, open).await {
-        Ok(found) => BridgeLeftovers::Owed {
-            socket: found.socket,
-        },
-        Err(reason) => BridgeLeftovers::NoEngine {
-            reason: reason.to_string(),
-        },
+    let found = match engine::connect(sockets, open).await {
+        Ok(found) => found,
+        Err(reason) => {
+            return BridgeLeftovers::NoEngine {
+                reason: reason.to_string(),
+            }
+        }
+    };
+    let socket = found.socket;
+    match remove_leftovers(
+        &found.docker,
+        listen_port,
+        Leftovers::SetupContainerAndNetwork,
+    )
+    .await
+    {
+        Cleanup::Complete => BridgeLeftovers::NoneLeft { socket },
+        Cleanup::Owed => BridgeLeftovers::Owed { socket },
     }
 }
 

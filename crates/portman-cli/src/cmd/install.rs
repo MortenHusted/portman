@@ -1,8 +1,14 @@
 //! Install/uninstall: release build as the invoking user, binary placement,
 //! launchd/systemd unit management, and straggler sweeps.
 
+#[cfg(target_os = "macos")]
+use crate::client::request;
 use crate::cmd::{locate_repo_root, run, run_sudo, sudo_write};
 use anyhow::{bail, Context, Result};
+#[cfg(target_os = "macos")]
+use portman_daemon::BridgeLeftovers;
+#[cfg(target_os = "macos")]
+use portman_protocol::{DockerState, DockerStatus, Request, Response};
 use std::process::Command as StdCommand;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
@@ -193,6 +199,8 @@ pub(crate) async fn cmd_uninstall() -> Result<()> {
 pub(crate) async fn cmd_uninstall_macos() -> Result<()> {
     use portman_core::launchd::{DAEMON_LABEL, DAEMON_PLIST_PATH};
 
+    let engine_socket = daemon_engine_socket(request(Request::Status)).await;
+
     eprintln!("tearing down launchd service…");
     let _ = StdCommand::new("sudo")
         .args(["launchctl", "bootout", &format!("system/{DAEMON_LABEL}")])
@@ -201,12 +209,79 @@ pub(crate) async fn cmd_uninstall_macos() -> Result<()> {
     sweep_stragglers();
     remove_legacy_menubar();
 
+    if !old_daemon_exited() {
+        eprintln!("previous daemon still running after 30s");
+    }
+    eprintln!("removing what the bridge left in Docker…");
+    let leftovers = portman_daemon::remove_bridge_leftovers(engine_socket).await;
+    for line in bridge_leftover_lines(&leftovers) {
+        eprintln!("{line}");
+    }
+
     eprintln!("removing system plist (sudo required)");
     let _ = run_sudo(&["rm", "-f", DAEMON_PLIST_PATH]);
 
     remove_installed_binaries();
     println!("portman uninstalled.");
     Ok(())
+}
+
+/// How long the daemon has to say which engine it is connected to. An
+/// uninstall also has to remove a daemon that no longer answers.
+#[cfg(target_os = "macos")]
+const STATUS_BUDGET: Duration = Duration::from_secs(3);
+
+/// The socket of the engine that the daemon is connected to, from the
+/// daemon's answer to a status request. `None` when no daemon answers in
+/// time or the daemon is connected to no engine.
+#[cfg(target_os = "macos")]
+async fn daemon_engine_socket(
+    status: impl std::future::Future<Output = Result<Response>>,
+) -> Option<std::path::PathBuf> {
+    match tokio::time::timeout(STATUS_BUDGET, status).await {
+        Ok(Ok(Response::Status {
+            docker:
+                Some(DockerStatus {
+                    state: DockerState::Connected,
+                    socket: Some(socket),
+                    ..
+                }),
+            ..
+        })) => Some(socket.into()),
+        _ => None,
+    }
+}
+
+/// What `portman uninstall` prints about the setup container, the DNS
+/// forwarder and the docker network that a bridge leaves in the engine.
+#[cfg(target_os = "macos")]
+fn bridge_leftover_lines(leftovers: &BridgeLeftovers) -> Vec<String> {
+    let by_hand = portman_daemon::manual_removal_commands().map(|command| format!("    {command}"));
+    match leftovers {
+        BridgeLeftovers::NoneLeft { socket } => vec![format!(
+            "bridge: Docker at {} holds nothing of the bridge now; a `portman` network that a running container uses stays",
+            socket.display()
+        )],
+        BridgeLeftovers::Owed { socket } => [
+            vec![
+                format!(
+                    "bridge: Docker at {} may still hold the dns forwarder. Another process holds the bridge's UDP port, or Docker refused a removal",
+                    socket.display()
+                ),
+                "bridge: to remove the forwarder and its network by hand, run:".to_string(),
+            ],
+            by_hand.to_vec(),
+        ]
+        .concat(),
+        BridgeLeftovers::NoEngine { reason } => [
+            vec![
+                format!("bridge: {reason}"),
+                "bridge: the Docker VM may still hold the dns forwarder. When Docker runs again, remove the forwarder and its network with:".to_string(),
+            ],
+            by_hand.to_vec(),
+        ]
+        .concat(),
+    }
 }
 
 /// One-time cleanup for machines that ran the retired menu-bar app (a user
@@ -434,6 +509,15 @@ pub(crate) fn sweep_stragglers() {
 /// on a wedged daemon would be worse.
 #[cfg(target_os = "macos")]
 pub(crate) fn wait_for_old_daemon_exit() {
+    if !old_daemon_exited() {
+        eprintln!("previous daemon still running after 30s; attempting bootstrap anyway");
+    }
+}
+
+/// Whether the installed `portman-daemon` process is gone, after a wait of
+/// at most 30s for it.
+#[cfg(target_os = "macos")]
+fn old_daemon_exited() -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut waited = false;
     loop {
@@ -446,11 +530,10 @@ pub(crate) fn wait_for_old_daemon_exit() {
             if waited {
                 eprintln!("previous daemon exited");
             }
-            return;
+            return true;
         }
         if std::time::Instant::now() >= deadline {
-            eprintln!("previous daemon still running after 30s; attempting bootstrap anyway");
-            return;
+            return false;
         }
         if !waited {
             eprintln!("waiting for the previous daemon to exit…");
@@ -575,6 +658,88 @@ mod tests {
         assert_eq!(uid_from_env(Some("0")), None, "uid 0 has no GUI domain");
         assert_eq!(uid_from_env(Some("nope")), None);
         assert_eq!(uid_from_env(None), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn status(docker: &str) -> Result<Response> {
+        let json = format!(r#"{{"kind":"status","docker":{docker}}}"#);
+        Ok(serde_json::from_str(&json).unwrap())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn an_uninstall_asks_the_engine_that_the_daemon_is_connected_to() {
+        let connected = r#"{"state":"connected","socket":"/run/demo/docker.sock"}"#;
+        let no_socket = r#"{"state":"disconnected","socket":"/run/demo/docker.sock"}"#;
+        // the daemon's answer → the socket of the engine to ask
+        let table = [
+            (status(connected), Some("/run/demo/docker.sock")),
+            (status(no_socket), None),
+            (status("null"), None),
+            (Ok(Response::Ok), None),
+            (Err(anyhow::anyhow!("no daemon answers")), None),
+        ];
+        for (answer, socket) in table {
+            let said = format!("{answer:?}");
+            assert_eq!(
+                daemon_engine_socket(async { answer }).await,
+                socket.map(std::path::PathBuf::from),
+                "{said}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(start_paused = true)]
+    async fn a_daemon_that_does_not_answer_does_not_hold_an_uninstall_up() {
+        let began = tokio::time::Instant::now();
+
+        let socket = daemon_engine_socket(std::future::pending()).await;
+
+        assert_eq!(socket, None);
+        assert_eq!(began.elapsed(), STATUS_BUDGET);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_uninstall_says_what_is_left_of_the_bridge_and_how_to_remove_it_by_hand() {
+        let socket = std::path::PathBuf::from("/run/demo/docker.sock");
+        let by_hand = [
+            "    docker rm -f portman-netbridge-dns",
+            "    docker network rm portman",
+        ];
+
+        assert_eq!(
+            bridge_leftover_lines(&BridgeLeftovers::NoneLeft {
+                socket: socket.clone()
+            }),
+            [
+                "bridge: Docker at /run/demo/docker.sock holds nothing of the bridge now; \
+              a `portman` network that a running container uses stays"
+            ]
+        );
+        assert_eq!(
+            bridge_leftover_lines(&BridgeLeftovers::Owed { socket }),
+            [
+                "bridge: Docker at /run/demo/docker.sock may still hold the dns forwarder. \
+                 Another process holds the bridge's UDP port, or Docker refused a removal",
+                "bridge: to remove the forwarder and its network by hand, run:",
+                by_hand[0],
+                by_hand[1],
+            ]
+        );
+        assert_eq!(
+            bridge_leftover_lines(&BridgeLeftovers::NoEngine {
+                reason: "docker is not connected: no docker socket found".into()
+            }),
+            [
+                "bridge: docker is not connected: no docker socket found",
+                "bridge: the Docker VM may still hold the dns forwarder. When Docker runs \
+                 again, remove the forwarder and its network with:",
+                by_hand[0],
+                by_hand[1],
+            ]
+        );
     }
 
     #[test]
