@@ -864,22 +864,33 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_service_that_stays_in_backoff_is_named_after_the_wait() {
-        let mut daemon = NewDaemon::holding(&["web"]);
+    async fn a_service_whose_first_start_fails_is_named_at_once_while_the_daemon_keeps_trying() {
+        let mut daemon = NewDaemon::holding(&["jobs", "web"]);
         daemon.ends.insert(
             "web".into(),
-            (ServiceState::Backoff, "port 3000 is taken".into()),
+            (
+                ServiceState::Backoff,
+                "port 3000 is taken; restarting in 1000ms".into(),
+            ),
         );
+        let began = Instant::now();
 
-        let report = restore(InterruptedServices(vec![up("web")]), &mut daemon).await;
+        let report = restore(
+            InterruptedServices(vec![up("web"), up("jobs")]),
+            &mut daemon,
+        )
+        .await;
 
         assert_eq!(
             report.lines(),
             [
-                "could not start web again: still backoff after 120s (port 3000 is taken). \
-              Run `portman up web` in /Users/dev/acme/web."
+                "started again: jobs",
+                "could not start web again yet: backoff (port 3000 is taken; restarting in \
+                 1000ms). The daemon keeps trying. See `portman logs web`, or stop it with \
+                 `portman down web`.",
             ]
         );
+        assert!(began.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test(start_paused = true)]
