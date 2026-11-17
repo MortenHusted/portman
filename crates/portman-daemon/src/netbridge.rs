@@ -2713,7 +2713,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn only_a_forwarder_that_could_not_be_removed_keeps_a_cleanup_owed() {
+    async fn a_forwarder_that_was_not_removed_keeps_a_cleanup_owed_unless_the_network_is_in_use() {
         let anothers_container = r#"{"Id": "dddd2222", "Config": {"Labels": {}}}"#;
         let unreadable = "not an answer to an inspect";
         let both = SetupContainerAndNetwork;
@@ -2727,7 +2727,7 @@ mod tests {
             (OWN_FORWARDER, network_in_use, both, complete, true),
             (OWN_FORWARDER, forwarder_stays, both, owed, true),
             (unreadable, None, both, owed, false),
-            (unreadable, network_in_use, both, owed, false),
+            (unreadable, network_in_use, both, complete, false),
             (anothers_container, None, both, complete, false),
             (unreadable, None, SetupContainer, complete, false),
         ];

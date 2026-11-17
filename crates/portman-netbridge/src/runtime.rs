@@ -1221,7 +1221,10 @@ pub enum Leftovers {
 pub enum Cleanup {
     /// Nothing is left for a later cleanup to try. What was asked for is
     /// gone or is not portman's, or the engine refused to remove the network
-    /// because it is in use, and that network stays.
+    /// because it is in use, and that network stays. A cleanup that asked
+    /// again would take it from under containers that have stopped since,
+    /// so this also holds when the DNS forwarder could not be removed. That
+    /// forwarder stays until the next request to turn the bridge off.
     Complete,
     /// The cleanup was skipped, or a removal failed for a reason that says
     /// nothing about what it was to remove. What was asked for can still be
@@ -1261,8 +1264,8 @@ pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Left
         }
     };
     match network {
-        _ if !forwarder_gone => Cleanup::Owed,
         Some(NetworkCleanup::InUse) => Cleanup::Complete,
+        _ if !forwarder_gone => Cleanup::Owed,
         None | Some(NetworkCleanup::NoneLeft) if container_gone => Cleanup::Complete,
         None | Some(NetworkCleanup::NoneLeft | NetworkCleanup::Owed) => Cleanup::Owed,
     }
