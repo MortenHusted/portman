@@ -211,10 +211,25 @@ trait Uninstall {
     fn wait_for_daemon_exit(&self);
     async fn remove_bridge_leftovers(&self, engine_socket: Option<PathBuf>) -> BridgeLeftovers;
     fn remove_service_files(&self);
-    fn bridge_is_enabled(&self) -> bool;
+    fn saved_bridge_state(&self) -> SavedBridge;
     fn say(&self, line: &str);
 }
 
+/// What the saved state file says about the bridge. It is not what a bridge
+/// does now: the daemon is stopped when the uninstall reads it.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SavedBridge {
+    On,
+    /// Also a file that is absent or cannot be read as JSON.
+    Off,
+    /// The path of the file could not be built.
+    Unknown,
+}
+
+/// The plist goes before the engine is asked. An uninstall that is
+/// interrupted while it waits for the engine then leaves no plist that
+/// starts the daemon again at the next boot.
 #[cfg(target_os = "macos")]
 async fn uninstall(mac: &impl Uninstall) {
     let engine_socket = daemon_engine_socket(mac.daemon_status()).await;
@@ -223,7 +238,9 @@ async fn uninstall(mac: &impl Uninstall) {
     mac.wait_for_daemon_exit();
     let removal = mac.remove_bridge_leftovers(engine_socket);
     let lines = match tokio::time::timeout(REMOVAL_BUDGET, removal).await {
-        Ok(BridgeLeftovers::NoEngine { .. }) if !mac.bridge_is_enabled() => vec![],
+        Ok(BridgeLeftovers::NoEngine { .. }) if mac.saved_bridge_state() == SavedBridge::Off => {
+            vec![]
+        }
         Ok(leftovers) => bridge_leftover_lines(&leftovers),
         Err(_) => stalled_removal_lines(),
     };
@@ -234,7 +251,9 @@ async fn uninstall(mac: &impl Uninstall) {
 
 /// The engine's client bounds only the wait for the head of each response,
 /// so an engine that stalls after the connect probe would hold the
-/// uninstall for minutes.
+/// uninstall for minutes. The budget must exceed the 3 s of the connect
+/// probe plus the 15 s that the stop and removal of the setup container may
+/// take, so that it never cuts a removal that the engine answers.
 #[cfg(target_os = "macos")]
 const REMOVAL_BUDGET: Duration = Duration::from_secs(35);
 
@@ -302,10 +321,12 @@ impl Uninstall for ThisMac {
         remove_installed_binaries();
     }
 
-    fn bridge_is_enabled(&self) -> bool {
-        portman_core::paths::netbridge_state_path()
-            .map(|path| portman_core::netbridge_state::load(&path).enabled)
-            .unwrap_or(true)
+    fn saved_bridge_state(&self) -> SavedBridge {
+        match portman_core::paths::netbridge_state_path() {
+            Ok(path) if portman_core::netbridge_state::load(&path).enabled => SavedBridge::On,
+            Ok(_) => SavedBridge::Off,
+            Err(_) => SavedBridge::Unknown,
+        }
     }
 
     fn say(&self, line: &str) {
@@ -792,18 +813,24 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    enum StandInEngine {
+        Answers(BridgeLeftovers),
+        Stalls,
+    }
+
+    #[cfg(target_os = "macos")]
     struct StandInMac {
-        leftovers: Option<BridgeLeftovers>,
-        bridge_enabled: bool,
+        engine: StandInEngine,
+        saved_bridge: SavedBridge,
         did: std::sync::Mutex<Vec<String>>,
     }
 
     #[cfg(target_os = "macos")]
     impl StandInMac {
-        fn new(leftovers: Option<BridgeLeftovers>) -> Self {
+        fn new(engine: StandInEngine) -> Self {
             Self {
-                leftovers,
-                bridge_enabled: true,
+                engine,
+                saved_bridge: SavedBridge::On,
                 did: Default::default(),
             }
         }
@@ -836,9 +863,9 @@ mod tests {
             self.note(format!(
                 "ask the engine at {engine_socket:?} for the removal"
             ));
-            match &self.leftovers {
-                Some(leftovers) => leftovers.clone(),
-                None => std::future::pending().await,
+            match &self.engine {
+                StandInEngine::Answers(leftovers) => leftovers.clone(),
+                StandInEngine::Stalls => std::future::pending().await,
             }
         }
 
@@ -846,8 +873,8 @@ mod tests {
             self.note("remove the plist and the daemon's binary");
         }
 
-        fn bridge_is_enabled(&self) -> bool {
-            self.bridge_enabled
+        fn saved_bridge_state(&self) -> SavedBridge {
+            self.saved_bridge
         }
 
         fn say(&self, line: &str) {
@@ -861,7 +888,7 @@ mod tests {
         let owed = BridgeLeftovers::Owed {
             socket: "/run/demo/docker.sock".into(),
         };
-        let mac = StandInMac::new(Some(owed.clone()));
+        let mac = StandInMac::new(StandInEngine::Answers(owed.clone()));
 
         uninstall(&mac).await;
 
@@ -884,7 +911,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test(start_paused = true)]
     async fn an_engine_that_stalls_does_not_hold_an_uninstall_up() {
-        let mac = StandInMac::new(None);
+        let mac = StandInMac::new(StandInEngine::Stalls);
         let began = tokio::time::Instant::now();
 
         let ended = tokio::time::timeout(Duration::from_secs(3600), uninstall(&mac)).await;
@@ -908,30 +935,31 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn an_uninstall_that_finds_no_engine_names_the_forwarder_only_for_a_bridge_that_was_on() {
+    async fn an_uninstall_that_finds_no_engine_is_silent_only_for_a_bridge_that_is_saved_as_off() {
         let no_engine = BridgeLeftovers::NoEngine {
             reason: "no docker socket found".into(),
         };
-        for bridge_enabled in [false, true] {
+        let table = [
+            (SavedBridge::Off, false),
+            (SavedBridge::On, true),
+            (SavedBridge::Unknown, true),
+        ];
+        for (saved_bridge, names_the_forwarder) in table {
             let mac = StandInMac {
-                bridge_enabled,
-                ..StandInMac::new(Some(no_engine.clone()))
+                saved_bridge,
+                ..StandInMac::new(StandInEngine::Answers(no_engine.clone()))
             };
 
             uninstall(&mac).await;
 
             let did = mac.did();
-            assert_eq!(
-                did[..5],
-                UP_TO_THE_REMOVAL,
-                "bridge_enabled={bridge_enabled}"
-            );
+            assert_eq!(did[..5], UP_TO_THE_REMOVAL, "{saved_bridge:?}");
             let said: Vec<String> = bridge_leftover_lines(&no_engine)
                 .into_iter()
-                .filter(|_| bridge_enabled)
+                .filter(|_| names_the_forwarder)
                 .map(|line| format!("say: {line}"))
                 .collect();
-            assert_eq!(did[5..], said, "bridge_enabled={bridge_enabled}");
+            assert_eq!(did[5..], said, "{saved_bridge:?}");
         }
     }
 
