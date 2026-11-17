@@ -2299,7 +2299,7 @@ destination: 172.18.0.0
         "--listen-address=192.168.99.129",
         "--bind-interfaces",
         "--strict-order",
-        "--no-negcache",
+        "--cache-size=0",
         "--log-facility=-",
     ];
     const TO_THE_VM: &str = "--server=/host.docker.internal/#";
@@ -2846,6 +2846,46 @@ destination: 172.18.0.0
             assert_eq!(ensured.ok(), want, "{forwarder}");
             assert_eq!(engine.asked_for(), requests, "{forwarder}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_forwarder_from_0_1_7_is_replaced_by_one_that_keeps_no_answer() {
+        let from_0_1_7 = [
+            "dns",
+            "--keep-in-foreground",
+            "--no-hosts",
+            "--listen-address=192.168.99.129",
+            "--bind-interfaces",
+            "--strict-order",
+            "--no-negcache",
+            "--log-facility=-",
+            "--server=/test/192.168.99.1",
+            "--server=/test/@vm-resolver@",
+            "--server=/host.docker.internal/#",
+        ]
+        .map(String::from);
+        let engine = FakeEngine::start().await;
+        engine.hold(FORWARDER_INSPECT, &held_forwarder(&from_0_1_7, RUNNING));
+
+        let ensured = engine
+            .bridge()
+            .await
+            .ensure_dns_forwarder(&tlds(&["test"]))
+            .await;
+
+        assert_eq!(ensured.unwrap(), DnsForwarder::Started);
+        let requests = engine.requests();
+        let asked: Vec<&str> = requests.iter().map(|(asked, _)| asked.as_str()).collect();
+        assert_eq!(
+            asked,
+            [
+                "DELETE /containers/dddd2222",
+                "POST /containers/create",
+                "POST /containers/portman-netbridge-dns/start",
+            ]
+        );
+        let created = &requests[1].1;
+        assert!(created.contains(r#""--cache-size=0""#), "{created}");
     }
 
     #[tokio::test]
