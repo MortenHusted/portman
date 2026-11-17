@@ -255,6 +255,10 @@ pub(crate) fn readiness_timeout_message(
     )
 }
 
+const NEW_DAEMON_LIMIT: Duration = Duration::from_secs(30);
+const READY_LIMIT: Duration = Duration::from_secs(120);
+const POLL_PAUSE: Duration = Duration::from_millis(300);
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct InterruptedServices(Vec<UpService>);
 
@@ -288,12 +292,24 @@ impl InterruptedServices {
         recorded
     }
 
-    async fn record_from<F, Fut>(_send: F) -> Self
+    async fn record_from<F, Fut>(mut send: F) -> Self
     where
         F: FnMut(Request) -> Fut,
         Fut: Future<Output = Result<Response>>,
     {
-        Self(Vec::new())
+        let Ok(Response::ServiceStatuses { services }) = send(Request::ServiceStatus).await else {
+            return Self(Vec::new());
+        };
+        Self(
+            services
+                .into_iter()
+                .filter(is_up)
+                .map(|status| UpService {
+                    name: status.name,
+                    root: status.root,
+                })
+                .collect(),
+        )
     }
 
     pub(crate) async fn restore(self) {
@@ -305,13 +321,67 @@ impl InterruptedServices {
         }
     }
 
-    async fn restore_through<F, Fut>(self, _send: F) -> RestartReport
+    async fn restore_through<F, Fut>(self, mut send: F) -> RestartReport
     where
         F: FnMut(Request) -> Fut,
         Fut: Future<Output = Result<Response>>,
     {
-        drop(self);
-        RestartReport::default()
+        let mut report = RestartReport::default();
+        if self.0.is_empty() {
+            return report;
+        }
+        let names = self.names();
+        let listed = poll_services(&mut send, NEW_DAEMON_LIMIT, |rows| {
+            names
+                .iter()
+                .all(|name| rows.iter().any(|row| row.name == *name))
+        })
+        .await;
+        let Some(listed) = listed else {
+            report.fail(self.0, "the new daemon did not answer within 30s");
+            return report;
+        };
+        let (known, unknown): (Vec<_>, Vec<_>) = self
+            .0
+            .into_iter()
+            .partition(|service| listed.iter().any(|row| row.name == service.name));
+        report.fail(unknown, "the new daemon has no definition for it");
+        if known.is_empty() {
+            return report;
+        }
+
+        let names: Vec<String> = known.iter().map(|service| service.name.clone()).collect();
+        let asked = send(Request::ServiceUp {
+            names: names.clone(),
+        })
+        .await
+        .and_then(|response| match response {
+            Response::ServiceStatuses { .. } => Ok(()),
+            other => other.unexpected(),
+        });
+        if let Err(err) = asked {
+            report.fail(known, &format!("{err:#}"));
+            return report;
+        }
+
+        let rows = poll_services(&mut send, READY_LIMIT, |rows| {
+            rows.iter()
+                .filter(|row| names.contains(&row.name))
+                .all(start_ended)
+        })
+        .await
+        .unwrap_or_default();
+        for service in known {
+            match rows.iter().find(|row| row.name == service.name) {
+                Some(row) if row.state == ServiceState::Ready => report.started.push(service.name),
+                Some(row) => {
+                    let why = why_not_ready(row);
+                    report.not_started.push(NotStarted { service, why });
+                }
+                None => report.fail(vec![service], "the new daemon no longer lists it"),
+            }
+        }
+        report
     }
 
     fn names(&self) -> Vec<String> {
@@ -320,6 +390,14 @@ impl InterruptedServices {
 }
 
 impl RestartReport {
+    fn fail(&mut self, services: Vec<UpService>, why: &str) {
+        self.not_started
+            .extend(services.into_iter().map(|service| NotStarted {
+                service,
+                why: why.to_string(),
+            }));
+    }
+
     fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         if !self.started.is_empty() {
@@ -336,6 +414,64 @@ impl RestartReport {
             ));
         }
         lines
+    }
+}
+
+fn is_up(status: &ServiceStatusInfo) -> bool {
+    status.desired_up
+        && matches!(
+            status.state,
+            ServiceState::Pending
+                | ServiceState::Starting
+                | ServiceState::Ready
+                | ServiceState::Backoff
+        )
+}
+
+fn start_ended(row: &ServiceStatusInfo) -> bool {
+    match row.state {
+        ServiceState::Ready | ServiceState::Failed => true,
+        ServiceState::Stopped => !row.desired_up,
+        _ => false,
+    }
+}
+
+fn why_not_ready(row: &ServiceStatusInfo) -> String {
+    let state = if start_ended(row) {
+        row.state.to_string()
+    } else {
+        format!("still {} after 120s", row.state)
+    };
+    if row.detail.is_empty() {
+        state
+    } else {
+        format!("{state} ({})", row.detail)
+    }
+}
+
+async fn poll_services<F, Fut>(
+    send: &mut F,
+    limit: Duration,
+    done: impl Fn(&[ServiceStatusInfo]) -> bool,
+) -> Option<Vec<ServiceStatusInfo>>
+where
+    F: FnMut(Request) -> Fut,
+    Fut: Future<Output = Result<Response>>,
+{
+    let deadline = Instant::now() + limit;
+    let mut last = None;
+    loop {
+        if let Ok(Response::ServiceStatuses { services }) = send(Request::ServiceStatus).await {
+            let finished = done(&services);
+            last = Some(services);
+            if finished {
+                return last;
+            }
+        }
+        if Instant::now() >= deadline {
+            return last;
+        }
+        sleep(POLL_PAUSE).await;
     }
 }
 
