@@ -25,7 +25,8 @@ pub(crate) const DNS_FORWARDER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 99, 129);
 const PORTMAN_NETWORK_CIDR: &str = "192.168.99.128/25";
 /// The label of a setup image that has the `dns` mode, and its value.
 const DNS_IMAGE_LABEL: (&str, &str) = ("dev.portman.dns-forwarder", "1");
-const SETUP_IMAGE_REVISION: (&str, u32) = ("dev.portman.setup-image-revision", 2);
+const SETUP_IMAGE_REVISION_LABEL: &str = "dev.portman.setup-image-revision";
+const SETUP_IMAGE_REVISION: u32 = 2;
 const ENDPOINT_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,12 +283,12 @@ fn setup_image_from_inspect(inspected: &str) -> SetupImageStatus {
     let (id, created) = (text("Id").to_string(), text("Created").to_string());
     let revision = image
         .pointer("/Config/Labels")
-        .and_then(|labels| labels.get(SETUP_IMAGE_REVISION.0))
+        .and_then(|labels| labels.get(SETUP_IMAGE_REVISION_LABEL))
         .and_then(Value::as_str)
         .and_then(|revision| revision.parse().ok());
     if id.is_empty() {
         SetupImageStatus::Missing
-    } else if revision.unwrap_or(0) < SETUP_IMAGE_REVISION.1 {
+    } else if revision.unwrap_or(0) < SETUP_IMAGE_REVISION {
         SetupImageStatus::Outdated { id, created }
     } else {
         SetupImageStatus::Present { id, created }
@@ -2583,8 +2584,7 @@ destination: 172.18.0.0
     #[test]
     fn the_embedded_setup_image_says_which_revision_it_is() {
         let dockerfile = include_str!("../../portman-netbridge/setup-image/Dockerfile");
-        let (key, revision) = SETUP_IMAGE_REVISION;
-        let label = format!("LABEL {key}=\"{revision}\"");
+        let label = format!("LABEL {SETUP_IMAGE_REVISION_LABEL}=\"{SETUP_IMAGE_REVISION}\"");
 
         assert!(dockerfile.lines().any(|line| line == label), "{label}");
     }
