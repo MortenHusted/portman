@@ -243,6 +243,40 @@ mod tests {
         assert!(issue(&reloaded, "run-2", now + 60).is_err());
     }
     #[test]
+    fn concurrent_callers_keep_a_valid_grant_while_the_clock_advances() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(GrantStore::new(dir.path().join("grants.json")));
+        issue(&store, "run-1", crate::now_unix_ms() / 1000 + 3600).unwrap();
+        let clock = Arc::new(AtomicU64::new(crate::now_unix_ms() / 1000));
+        let done = Arc::new(AtomicBool::new(false));
+        let denied = Arc::new(AtomicUsize::new(0));
+        let callers: Vec<_> = (0..8)
+            .map(|_| {
+                let (store, clock, done, denied) =
+                    (store.clone(), clock.clone(), done.clone(), denied.clone());
+                std::thread::spawn(move || {
+                    while !done.load(Ordering::Relaxed) {
+                        let now = clock.load(Ordering::Relaxed);
+                        if !store.permits("qwen.localhost", "route-v1", &headers(), now) {
+                            denied.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            clock.fetch_add(1, Ordering::Relaxed);
+        }
+        done.store(true, Ordering::Relaxed);
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        assert_eq!(denied.load(Ordering::Relaxed), 0);
+    }
+    #[test]
     fn corrupt_store_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("grants.json");
