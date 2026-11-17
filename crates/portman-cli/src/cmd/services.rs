@@ -1043,6 +1043,28 @@ mod tests {
         assert_took(began, Duration::from_secs(120));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_daemon_that_stops_answering_after_the_start_request_is_named() {
+        let mut daemon = NewDaemon::holding(&["web"]);
+
+        let report = InterruptedServices(vec![up("web")])
+            .restore_through(|request| {
+                if !daemon.start_requests.is_empty() {
+                    daemon.refused_connections = usize::MAX;
+                }
+                std::future::ready(daemon.answer(request))
+            })
+            .await;
+
+        assert_eq!(
+            report.lines(),
+            [
+                "could not start web again: the new daemon stopped answering after the start \
+                 request. Run `portman up web` in /Users/dev/acme/web."
+            ]
+        );
+    }
+
     #[test]
     fn status_says_when_a_failed_bridge_start_runs_again() {
         let line = |json: &str| match serde_json::from_str(json).unwrap() {
