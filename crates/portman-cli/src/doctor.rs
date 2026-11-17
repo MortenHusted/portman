@@ -57,11 +57,45 @@ impl DaemonSnapshot {
     }
 }
 
+/// Why a `docker` CLI call gave no output to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DockerCliError {
+    /// The `docker` program did not start, as when none is installed.
+    NotStarted(String),
+    /// The CLI reached no engine.
+    NoAnswer(String),
+    /// Any other failure. An engine that answers with an error, as it does
+    /// for a container that is gone, ends here.
+    Failed(String),
+}
+
+impl std::fmt::Display for DockerCliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (DockerCliError::NotStarted(message)
+        | DockerCliError::NoAnswer(message)
+        | DockerCliError::Failed(message)) = self;
+        f.write_str(message)
+    }
+}
+
+/// What one check learned from the `docker` CLI: that an engine answered,
+/// or why the CLI gave nothing.
+pub(crate) type CliAnswer<'a> = Result<(), &'a DockerCliError>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SetupImageStatus {
     Present { id: String, created: String },
     Missing,
-    DockerUnavailable { message: String },
+    Unavailable(DockerCliError),
+}
+
+impl SetupImageStatus {
+    pub(crate) fn cli_answer(&self) -> CliAnswer<'_> {
+        match self {
+            SetupImageStatus::Unavailable(error) => Err(error),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,13 +117,15 @@ pub(crate) struct DockerRouteDiagnostic {
 pub(crate) enum DockerRouteStatus {
     Routes(Vec<DockerRouteDiagnostic>),
     NoLabelledContainers,
-    DockerUnavailable { message: String },
+    Unavailable(DockerCliError),
 }
 
 impl DockerRouteStatus {
-    /// Whether an engine answered the `docker` CLI.
-    pub(crate) fn cli_answered(&self) -> bool {
-        !matches!(self, DockerRouteStatus::DockerUnavailable { .. })
+    pub(crate) fn cli_answer(&self) -> CliAnswer<'_> {
+        match self {
+            DockerRouteStatus::Unavailable(error) => Err(error),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -125,35 +161,17 @@ pub(crate) struct SetupImageBuildCommand {
 }
 
 pub(crate) fn inspect_setup_image() -> SetupImageStatus {
-    let output = match StdCommand::new("docker")
-        .args([
-            "image",
-            "inspect",
-            SETUP_IMAGE,
-            "--format",
-            "{{.Id}}\t{{.Created}}",
-        ])
-        .output()
-    {
-        Ok(output) => output,
-        Err(err) => {
-            return SetupImageStatus::DockerUnavailable {
-                message: err.to_string(),
-            };
-        }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("No such image") || stderr.contains("No such object") {
+    let format = "{{.Id}}\t{{.Created}}";
+    let stdout = match docker_stdout(&["image", "inspect", SETUP_IMAGE, "--format", format]) {
+        Ok(stdout) => stdout,
+        Err(DockerCliError::Failed(message))
+            if message.contains("No such image") || message.contains("No such object") =>
+        {
             return SetupImageStatus::Missing;
         }
-        return SetupImageStatus::DockerUnavailable {
-            message: stderr.trim().to_string(),
-        };
-    }
+        Err(error) => return SetupImageStatus::Unavailable(error),
+    };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let mut parts = stdout.trim().split('\t');
     let id = parts.next().unwrap_or("").to_string();
     let created = parts.next().unwrap_or("").to_string();
@@ -204,7 +222,7 @@ pub(crate) fn detect_legacy_bridge() -> LegacyBridgeStatus {
 pub(crate) fn collect_docker_routes() -> DockerRouteStatus {
     let ids_output = match docker_stdout(&["ps", "--filter", "label=dev.portman.host", "-q"]) {
         Ok(output) => output,
-        Err(message) => return DockerRouteStatus::DockerUnavailable { message },
+        Err(error) => return DockerRouteStatus::Unavailable(error),
     };
     let ids: Vec<&str> = ids_output.split_ascii_whitespace().collect();
     if ids.is_empty() {
@@ -215,7 +233,7 @@ pub(crate) fn collect_docker_routes() -> DockerRouteStatus {
     inspect_args.extend(ids.iter().copied());
     let container_json = match docker_stdout(&inspect_args) {
         Ok(output) => output,
-        Err(message) => return DockerRouteStatus::DockerUnavailable { message },
+        Err(error) => return DockerRouteStatus::Unavailable(error),
     };
     let containers = parse_labelled_containers(&container_json);
     if containers.is_empty() {
@@ -235,7 +253,7 @@ pub(crate) fn collect_docker_routes() -> DockerRouteStatus {
     network_args.extend(networks.iter().copied());
     let network_json = match docker_stdout(&network_args) {
         Ok(output) => output,
-        Err(message) => return DockerRouteStatus::DockerUnavailable { message },
+        Err(error) => return DockerRouteStatus::Unavailable(error),
     };
 
     DockerRouteStatus::Routes(route_diagnostics_from_networks_json(
@@ -301,11 +319,8 @@ pub(crate) fn render_report(report: &DoctorReport) -> String {
     let legacy = check_legacy_bridge(&report.legacy_bridge);
     let legacy_running = legacy.state != CheckState::Ok;
     let cli_answers = [
-        !matches!(
-            report.setup_image,
-            SetupImageStatus::DockerUnavailable { .. }
-        ),
-        report.docker_routes.cli_answered(),
+        report.setup_image.cli_answer(),
+        report.docker_routes.cli_answer(),
     ];
     let mut outcomes = vec![check_daemon(&report.daemon)];
     outcomes.extend(check_docker(
@@ -383,7 +398,7 @@ fn bridge_guidance(phase: Option<BridgePhase>) -> &'static [&'static str] {
 /// `docker` CLI.
 fn check_docker(
     docker: Option<&DockerStatus>,
-    cli_answers: &[bool],
+    cli_answers: &[CliAnswer<'_>],
     cli_lines: &str,
 ) -> Option<CheckOutcome> {
     let docker = docker?;
@@ -402,18 +417,21 @@ fn check_docker(
 
 /// The daemon and the `docker` CLI each choose their socket, so one can
 /// have an engine while the other has none. The note says so, and names the
-/// lines that show the CLI's result. `cli_answers` holds, for each check
-/// that ran the CLI, whether an engine answered it.
+/// lines that show the CLI's result. `cli_answers` holds one answer for each
+/// check that ran the CLI. A check that failed in another way than
+/// [`DockerCliError::NoAnswer`] shows neither that the CLI has an engine nor
+/// that it has none, so it brings no note.
 pub(crate) fn docker_cli_note(
     docker: Option<&DockerStatus>,
-    cli_answers: &[bool],
+    cli_answers: &[CliAnswer<'_>],
     cli_lines: &str,
 ) -> Option<String> {
+    let no_answer = |answer: &CliAnswer<'_>| matches!(answer, Err(DockerCliError::NoAnswer(_)));
     let found = match docker?.state {
-        DockerState::Connected if cli_answers.contains(&false) => {
+        DockerState::Connected if cli_answers.iter().any(no_answer) => {
             "a check got no answer from an engine, and the daemon is connected to one"
         }
-        DockerState::Disconnected if cli_answers.contains(&true) => {
+        DockerState::Disconnected if cli_answers.iter().any(Result::is_ok) => {
             "a check reached an engine, and the daemon is connected to none"
         }
         _ => return None,
@@ -440,7 +458,7 @@ fn check_docker_routes(status: &DockerRouteStatus) -> CheckOutcome {
             }
         }
         DockerRouteStatus::NoLabelledContainers => CheckState::Ok,
-        DockerRouteStatus::DockerUnavailable { .. } => CheckState::Fail,
+        DockerRouteStatus::Unavailable(_) => CheckState::Fail,
     };
     CheckOutcome {
         state,
@@ -471,8 +489,8 @@ pub(crate) fn render_docker_routes(status: &DockerRouteStatus) -> Vec<String> {
         DockerRouteStatus::NoLabelledContainers => {
             vec!["labelled docker networks: no running dev.portman.host containers".to_string()]
         }
-        DockerRouteStatus::DockerUnavailable { message } => {
-            vec![format!("labelled docker networks: unavailable ({message})")]
+        DockerRouteStatus::Unavailable(error) => {
+            vec![format!("labelled docker networks: unavailable ({error})")]
         }
     }
 }
@@ -595,9 +613,9 @@ fn check_setup_image(status: &SetupImageStatus) -> CheckOutcome {
             CheckState::Warn,
             format!("setup image: missing {SETUP_IMAGE} (run `portman bridge prepare`)"),
         ),
-        SetupImageStatus::DockerUnavailable { message } => CheckOutcome::gating(
+        SetupImageStatus::Unavailable(error) => CheckOutcome::gating(
             CheckState::Fail,
-            format!("setup image: unavailable ({message})"),
+            format!("setup image: unavailable ({error})"),
         ),
     }
 }
@@ -713,20 +731,34 @@ fn route_interface_for_cidr(cidr: &str) -> Option<String> {
     parse_route_get_interface(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn docker_stdout(args: &[&str]) -> Result<String, String> {
-    let output = StdCommand::new("docker")
+fn docker_stdout(args: &[&str]) -> Result<String, DockerCliError> {
+    run_docker("docker", args)
+}
+
+/// What the `docker` CLI prints when it reaches no engine. Docker 29 names
+/// "the docker API", and the releases before it name "the Docker daemon".
+const NO_ENGINE: [&str; 3] = [
+    "connect to the docker API",
+    "connect to the Docker daemon",
+    "error during connect",
+];
+
+fn run_docker(program: &str, args: &[&str]) -> Result<String, DockerCliError> {
+    let output = StdCommand::new(program)
         .args(args)
         .output()
-        .map_err(|err| err.to_string())?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
-            format!("docker {args:?} exited with {}", output.status)
-        } else {
-            stderr
-        });
+        .map_err(|err| DockerCliError::NotStarted(err.to_string()))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if stderr.is_empty() {
+        DockerCliError::Failed(format!("docker {args:?} exited with {}", output.status))
+    } else if NO_ENGINE.iter().any(|phrase| stderr.contains(phrase)) {
+        DockerCliError::NoAnswer(stderr)
+    } else {
+        DockerCliError::Failed(stderr)
+    })
 }
 
 fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
@@ -896,14 +928,25 @@ mod tests {
 
     #[test]
     fn a_note_says_when_the_docker_cli_and_the_daemon_see_different_engines() {
-        let (answered, failed, mixed) = (&[true][..], &[false][..], &[true, false][..]);
-        // (the daemon's engine state, whether each `docker` CLI check got an
-        // answer) → the note names
+        let no_engine = DockerCliError::NoAnswer("failed to connect to the docker API".into());
+        let gone = DockerCliError::Failed("No such container: 0a1b2c".into());
+        let no_program = DockerCliError::NotStarted("No such file or directory".into());
+        let answered = &[Ok(())][..];
+        let silent = &[Err(&no_engine)][..];
+        let mixed = &[Ok(()), Err(&no_engine)][..];
+        let refused = &[Err(&gone)][..];
+        let not_run = &[Err(&no_program)][..];
+        // (the daemon's engine state, what each `docker` CLI check learned)
+        // → the note names
         let table = [
             (Some(connected_docker()), answered, None),
-            (Some(connected_docker()), failed, Some("got no answer")),
+            (Some(connected_docker()), silent, Some("got no answer")),
             (Some(connected_docker()), mixed, Some("got no answer")),
-            (Some(disconnected_docker()), failed, None),
+            (Some(connected_docker()), refused, None),
+            (Some(connected_docker()), not_run, None),
+            (Some(disconnected_docker()), silent, None),
+            (Some(disconnected_docker()), refused, None),
+            (Some(disconnected_docker()), not_run, None),
             (
                 Some(disconnected_docker()),
                 answered,
@@ -915,9 +958,9 @@ mod tests {
                 Some("reached an engine"),
             ),
             (None, answered, None),
-            (None, failed, None),
+            (None, silent, None),
             (Some(DockerStatus::default()), answered, None),
-            (Some(DockerStatus::default()), failed, None),
+            (Some(DockerStatus::default()), silent, None),
         ];
         for (docker, cli_answers, names) in table {
             let note = docker_cli_note(docker.as_ref(), cli_answers, "labelled docker networks");
@@ -947,13 +990,78 @@ mod tests {
         );
 
         let mut report = with_docker(Some(connected_docker()));
-        report.docker_routes = DockerRouteStatus::DockerUnavailable {
-            message: "Cannot connect to the Docker daemon".to_string(),
-        };
+        report.docker_routes = DockerRouteStatus::Unavailable(DockerCliError::NoAnswer(
+            "Cannot connect to the Docker daemon".to_string(),
+        ));
         let daemon_only = render_report(&report);
         assert!(
             daemon_only.contains("docker CLI: a check got no answer"),
             "{daemon_only}"
+        );
+    }
+
+    #[test]
+    fn doctor_prints_no_note_for_an_engine_that_answered_with_an_error_or_a_cli_that_did_not_run() {
+        let gone = "Error response from daemon: No such container: 0a1b2c";
+        let errors = [
+            DockerCliError::Failed(gone.to_string()),
+            DockerCliError::NotStarted("No such file or directory (os error 2)".to_string()),
+        ];
+        for error in errors {
+            let mut report = with_docker(Some(connected_docker()));
+            report.docker_routes = DockerRouteStatus::Unavailable(error.clone());
+
+            let rendered = render_report(&report);
+
+            assert!(!rendered.contains("docker CLI:"), "{error:?}\n{rendered}");
+            assert!(
+                rendered.contains(&format!("labelled docker networks: unavailable ({error})")),
+                "{error:?}\n{rendered}"
+            );
+            assert!(
+                rendered.contains("replacement: needs attention"),
+                "{error:?}\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_docker_cli_call_says_whether_an_engine_answered_it() {
+        let fails_with = |stderr: &str| format!("echo '{stderr}' >&2; exit 1");
+        let no_engine = "failed to connect to the docker API at unix:///run/demo/docker.sock; \
+                         check if the path is correct and if the daemon is running";
+        let no_engine_before_29 = "Cannot connect to the Docker daemon at \
+                                   unix:///run/demo/docker.sock. Is the docker daemon running?";
+        let gone = "Error response from daemon: No such container: kafka-connect-1";
+        // the script that stands for `docker` → what the call returns
+        let table = [
+            ("echo 0a1b2c".to_string(), Ok("0a1b2c\n".to_string())),
+            (
+                fails_with(no_engine),
+                Err(DockerCliError::NoAnswer(no_engine.to_string())),
+            ),
+            (
+                fails_with(no_engine_before_29),
+                Err(DockerCliError::NoAnswer(no_engine_before_29.to_string())),
+            ),
+            (
+                fails_with(gone),
+                Err(DockerCliError::Failed(gone.to_string())),
+            ),
+        ];
+        for (script, want) in table {
+            assert_eq!(run_docker("sh", &["-c", &script]), want, "{script}");
+        }
+
+        let silent_failure = run_docker("sh", &["-c", "exit 3"]);
+        assert!(
+            matches!(silent_failure, Err(DockerCliError::Failed(_))),
+            "{silent_failure:?}"
+        );
+        let no_program = run_docker("/run/demo/no-such-docker", &["ps"]);
+        assert!(
+            matches!(no_program, Err(DockerCliError::NotStarted(_))),
+            "{no_program:?}"
         );
     }
 

@@ -31,7 +31,7 @@ pub(crate) async fn cmd_bridge_status() -> Result<()> {
             }
             let note = doctor::docker_cli_note(
                 docker.as_ref(),
-                &[routes.cli_answered()],
+                &[routes.cli_answer()],
                 "labelled docker networks lines",
             );
             for line in note
