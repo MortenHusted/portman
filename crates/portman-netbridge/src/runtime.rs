@@ -116,15 +116,15 @@ const REQUESTS_MARGIN_SECS: u64 = 5;
 /// so a VM that froze with its socket open held a step for a multiple of
 /// that limit, or without end once a head was in. Each of these steps
 /// removes the setup container at most once, and the budget is the waits of
-/// that removal and [`REQUESTS_MARGIN_SECS`], so that it cuts no step on an
+/// that removal and `REQUESTS_MARGIN_SECS`, so that it cuts no step on an
 /// engine that answers.
 pub const ENGINE_STEP_BUDGET: Duration =
     Duration::from_secs(SETUP_REMOVAL_WAITS_SECS + REQUESTS_MARGIN_SECS);
 
 /// As [`ENGINE_STEP_BUDGET`], for a start. A start removes the setup
-/// container of an earlier bridge, waits [`SETUP_KEY_TIMEOUT`] for the key
+/// container of an earlier bridge, waits `SETUP_KEY_TIMEOUT` for the key
 /// of the new one, and removes that one when no key came. The budget is
-/// those waits and [`REQUESTS_MARGIN_SECS`], so that a start that uses up
+/// those waits and `REQUESTS_MARGIN_SECS`, so that a start that uses up
 /// every wait still ends with its own error and with its setup container
 /// gone.
 pub const ENGINE_START_BUDGET: Duration = Duration::from_secs(
