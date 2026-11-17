@@ -3684,11 +3684,17 @@ mod tests {
         // No file can replace a directory, whoever writes.
         std::fs::remove_file(&rig.state_path).unwrap();
         std::fs::create_dir(&rig.state_path).unwrap();
+        let (logged, _capture) = Logged::capture();
         rig.engine_session(S1);
         let swept = rig.next_sweep().await;
         rig.no_sweep_follows().await;
 
         assert_eq!(swept, (Session(1), SetupContainerAndNetwork));
+        let warnings = logged.take_warnings();
+        assert!(!warnings.is_empty(), "a write that failed and no warning");
+        for warning in &warnings {
+            assert!(warning.contains("Is a directory"), "{warning}");
+        }
         std::fs::remove_dir(&rig.state_path).expect("the write replaced the directory");
 
         rig.manage(&["test", "demo"]);
