@@ -3560,6 +3560,35 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_write_that_failed_is_made_again_when_the_loop_next_wakes() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut rig = Rig::spawn(None, false, false);
+        rig.send(Control::Disable).await;
+        rig.no_sweep_follows().await;
+        assert_eq!(saved_debt(&rig.state_path), true);
+        let dir = rig.dir.path().to_path_buf();
+        let allow = |mode| {
+            let mode = std::fs::Permissions::from_mode(mode);
+            std::fs::set_permissions(&dir, mode).unwrap();
+        };
+
+        allow(0o500);
+        rig.engine_session(S1);
+        let swept = rig.next_sweep().await;
+        rig.no_sweep_follows().await;
+        let saved_in_a_directory_that_takes_no_write = saved_debt(&rig.state_path);
+        allow(0o700);
+
+        assert_eq!(swept, (Session(1), SetupContainerAndNetwork));
+        assert_eq!(saved_in_a_directory_that_takes_no_write, true);
+
+        rig.manage(&["test", "demo"]);
+        rig.no_sweep_follows().await;
+
+        assert_eq!(saved_debt(&rig.state_path), false);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn an_enable_ends_the_debt_and_the_next_disable_owes_anew() {
         let mut rig = Rig::spawn(None, false, false);
         rig.send(Control::Disable).await;
