@@ -1724,6 +1724,19 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_wake_for_another_reason_does_not_put_off_the_retry_of_a_failed_start() {
+        let mut rig = Rig::start();
+        rig.send(Control::Enable).await;
+        let first = rig.next_attempt().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        rig.manage(&["acme"]);
+        let retry = rig.next_attempt().await;
+
+        assert_eq!(retry.at - first.at, RETRY_BASE);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn the_utun_index_is_published_before_the_phase_says_up() {
         let rig = Rig::up().await;
 
