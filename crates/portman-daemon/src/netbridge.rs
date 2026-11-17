@@ -16,7 +16,10 @@
 //!     left, then waits for a control message, a change of engine session,
 //!     or a retry timer. Before each step it takes the messages that are in
 //!     the channel. A message that arrives later waits for the step to end:
-//!     the loop does not cancel a step in flight.
+//!     the loop does not cancel a step in flight. The bridge gives the
+//!     engine 30 s for each step, so a message waits no longer than that
+//!     for an engine that froze. A start that is cut there fails and is
+//!     retried, and a cleanup stays owed.
 //!   - a bridge is built on one engine session. When no session exists the
 //!     loop ends the bridge and asks the engine nothing. When another
 //!     session opens, the loop keeps the bridge if that engine says within
@@ -86,7 +89,8 @@ const ENABLE_ENV: &str = "PORTMAN_NETBRIDGE";
 /// bridge's setup container. bollard bounds only the wait for a response
 /// head, so a VM that froze with its socket open would never end this
 /// check. The budget bounds this check alone. A later step that asks the
-/// same engine can still hold the loop, and with it every control message.
+/// same engine holds the loop, and with it every control message, for the
+/// 30 s that the bridge gives the engine for a step.
 const SETUP_CHECK_BUDGET: Duration = Duration::from_secs(3);
 
 const RETRY_BASE: Duration = Duration::from_secs(5);

@@ -25,6 +25,7 @@
 //! forwarder asks. The daemon keeps those separate.
 
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::process::{Command as StdCommand, Output, Stdio};
@@ -99,6 +100,25 @@ const ROUTE_RECONCILE_PERIOD: Duration = Duration::from_secs(5);
 const ROUTE_LIMIT: Duration = Duration::from_secs(3);
 /// How long a command that was killed gets to go away.
 const KILL_GRACE: Duration = Duration::from_millis(500);
+/// How long the engine has to answer all that one step of a bridge asks it:
+/// a start, a stop, a cleanup of leftovers, an ensure of the DNS forwarder.
+/// The limit of the caller's client is for one request and ends at the head
+/// of the response, so a VM that froze with its socket open held a step for
+/// a multiple of that limit, or without end once a head was in. A step on
+/// an engine that answers takes under a second. The deadlines inside one
+/// start add up to 25 s, and the budget is above them.
+const ENGINE_BUDGET: Duration = Duration::from_secs(30);
+
+/// A step that is cut leaves in the engine what it had done by then.
+async fn within_budget<T>(step: impl Future<Output = T>) -> Result<T> {
+    let cut = tokio::time::timeout(ENGINE_BUDGET, step).await;
+    cut.map_err(|_| {
+        anyhow!(
+            "the container engine gave no answer within {} s",
+            ENGINE_BUDGET.as_secs()
+        )
+    })
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeOptions {
@@ -165,11 +185,18 @@ impl Runtime {
     /// As [`Runtime::start_with_options`], with the host keypair supplied by
     /// the caller. A caller that retries a failed start passes the same
     /// keypair, and the key is then logged once and not for every retry.
+    /// A start that the engine does not answer fails when [`ENGINE_BUDGET`]
+    /// is spent. It can leave a setup container, which the next start or
+    /// cleanup removes.
     pub async fn start_with_keypair(
         docker: Docker,
         options: RuntimeOptions,
         host_kp: &Keypair,
     ) -> Result<Self> {
+        within_budget(Self::bring_up(docker, options, host_kp)).await?
+    }
+
+    async fn bring_up(docker: Docker, options: RuntimeOptions, host_kp: &Keypair) -> Result<Self> {
         let host_pub = host_kp.public_base64();
         if is_new_host_key(&host_pub) {
             info!(
@@ -284,11 +311,16 @@ impl Runtime {
     /// because a new one would end the same way. A container of that name
     /// without portman's labels is an error and stays as it is. The bridge
     /// holds the listen port, so no other daemon has a bridge up whose
-    /// forwarder this could replace.
+    /// forwarder this could replace. An ensure that the engine does not
+    /// answer fails when [`ENGINE_BUDGET`] is spent.
     pub async fn ensure_dns_forwarder(
         &self,
         managed_tlds: &BTreeSet<String>,
     ) -> Result<DnsForwarder> {
+        within_budget(self.ensure_forwarder(managed_tlds)).await?
+    }
+
+    async fn ensure_forwarder(&self, managed_tlds: &BTreeSet<String>) -> Result<DnsForwarder> {
         let Some(image) = setup_image_with_dns_mode(&self.docker).await? else {
             return Ok(DnsForwarder::ImageWithoutDnsMode);
         };
@@ -318,7 +350,8 @@ impl Runtime {
     /// gone; call [`Runtime::shutdown_and_remove_network`] for that.
     pub async fn shutdown(mut self) {
         self.end_tasks().await;
-        best_effort_remove_setup_container(&self.docker, &self.listen_port).await;
+        let container = Leftovers::SetupContainer;
+        remove_with_port_held(&self.docker, &self.listen_port, container).await;
         info!(utun = %self.utun_name, "netbridge shut down (network retained)");
     }
 
@@ -1341,11 +1374,24 @@ pub async fn remove_leftovers(docker: &Docker, listen_port: u16, leftovers: Left
     remove_with_port_held(docker, &held, leftovers).await
 }
 
+/// A cleanup that the engine does not answer ends owed when
+/// [`ENGINE_BUDGET`] is spent.
 async fn remove_with_port_held(
     docker: &Docker,
     held: &ListenPort,
     leftovers: Leftovers,
 ) -> Cleanup {
+    let removals = remove_each(docker, held, leftovers);
+    within_budget(removals).await.unwrap_or_else(|error| {
+        warn!(
+            %error,
+            "netbridge cleanup ended early, and what it was to remove can still be in the engine"
+        );
+        Cleanup::Owed
+    })
+}
+
+async fn remove_each(docker: &Docker, held: &ListenPort, leftovers: Leftovers) -> Cleanup {
     let container_gone = best_effort_remove_setup_container(docker, held).await;
     let (forwarder_gone, network) = match leftovers {
         Leftovers::SetupContainer => (true, None),
