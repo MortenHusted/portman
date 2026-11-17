@@ -40,10 +40,14 @@
 //!     such a cleanup, so no second one follows it on its session. A
 //!     network that the engine refuses to remove because it is in use is
 //!     not owed. It stays until the next `Disable`, so that no later
-//!     session removes it under containers that have stopped. The debt is
-//!     not saved, so a daemon restart ends it. Each removal needs the UDP
-//!     port that a bridge listens on, so that it cannot take what another
-//!     daemon's bridge runs on.
+//!     session removes it under containers that have stopped. Each removal
+//!     needs the UDP port that a bridge listens on, so that it cannot take
+//!     what another daemon's bridge runs on. A cleanup that finds the port
+//!     taken ends the debt as a network in use does: the holder may run a
+//!     bridge on the forwarder and the network, and a debt that waited for
+//!     the port would be paid the first time the port is free for a
+//!     moment. The debt is saved in `netbridge.json` with the flag, so a
+//!     daemon that restarts still owes it. An `Enable` ends it.
 //!   - a failed start is retried with a growing delay. The wait does not
 //!     hold up control messages, and a new session starts the delay over.
 //!   - a bridge that is up gets the DNS forwarder in the VM: the loop makes
@@ -387,23 +391,20 @@ fn backoff(failures: u32) -> Duration {
     RETRY_BASE.saturating_mul(1 << doublings).min(RETRY_CAP)
 }
 
-/// What the loop has yet to remove from the engine. [`plan`] collects it only
-/// while the bridge is off and none runs, so a debt that an enable finds is
-/// not collected, and the disable that turns the bridge off again owes the
-/// network anew. The debt is not saved: after a daemon restart every session
-/// owes the setup container and no network.
+/// The sessions that the loop has yet to clean up on. [`plan`] collects a
+/// cleanup only while the bridge is off and none runs. Every session owes
+/// the setup container. Whether one also owes the DNS forwarder and the
+/// docker network is `cleanup_owed` of the saved state, which a `Disable`
+/// sets and which outlives the daemon.
 #[derive(Default)]
 struct Debt {
-    /// A `Disable` asked for the DNS forwarder and the docker network to go,
-    /// and no cleanup has run to its end since.
-    network: bool,
     /// The session that had its cleanup. Every other session is owed one.
     swept: Option<Session>,
 }
 
 impl Debt {
-    fn owed_on(&self, session: Option<Session>) -> Option<Leftovers> {
-        (self.swept != session).then_some(if self.network {
+    fn owed_on(&self, session: Option<Session>, network_owed: bool) -> Option<Leftovers> {
+        (self.swept != session).then_some(if network_owed {
             Leftovers::SetupContainerAndNetwork
         } else {
             Leftovers::SetupContainer
@@ -411,17 +412,12 @@ impl Debt {
     }
 
     fn disabled(&mut self) {
-        self.network = true;
         self.swept = None;
     }
 
     /// A cleanup that did not finish is not tried again on its session.
-    fn settle(&mut self, session: Session, leftovers: Leftovers, swept: Swept) {
+    fn settle(&mut self, session: Session) {
         self.swept = Some(session);
-        let complete = swept == Swept::Ended(CleanupEnd::Complete);
-        if leftovers == Leftovers::SetupContainerAndNetwork && complete {
-            self.network = false;
-        }
     }
 }
 
@@ -437,9 +433,23 @@ pub(crate) enum Swept {
     SessionEnded,
 }
 
+impl Swept {
+    /// Whether no later cleanup asks for the DNS forwarder and the docker
+    /// network again until the next `Disable`. They are gone, or a later
+    /// cleanup could take them from under what uses them: the containers on
+    /// a network in use, or the bridge of the daemon that holds the port.
+    fn ends_the_debt(self) -> bool {
+        match self {
+            Swept::Ended(CleanupEnd::Complete) | Swept::PortTaken => true,
+            Swept::Ended(CleanupEnd::Failed | CleanupEnd::NoAnswer) | Swept::SessionEnded => false,
+        }
+    }
+}
+
 /// What the bridge should be: the intent the user saved, with the
 /// `PORTMAN_NETBRIDGE` override on top. Only `saved` is written to
-/// `netbridge.json`.
+/// `netbridge.json`. It also holds whether a `Disable` still owes a
+/// cleanup, so that the debt is saved in the same write as the flag.
 struct Wanted {
     saved: NetbridgeState,
     forced_on: bool,
@@ -449,15 +459,19 @@ impl Wanted {
     fn intent(&self) -> NetbridgeState {
         NetbridgeState {
             enabled: self.saved.enabled || self.forced_on,
-            mode: self.saved.mode,
+            ..self.saved
         }
     }
 
     fn apply(&mut self, msg: Control) {
         match msg {
-            Control::Enable => self.saved.enabled = true,
+            Control::Enable => {
+                self.saved.enabled = true;
+                self.saved.cleanup_owed = false;
+            }
             Control::Disable => {
                 self.saved.enabled = false;
+                self.saved.cleanup_owed = true;
                 self.forced_on = false;
             }
             Control::SetMode(mode) => {
@@ -550,7 +564,7 @@ async fn converge<E: BridgeEngine>(
         let now = Instant::now();
         let forwarded = running.as_ref().map(|r| r.forwarded.as_ref());
         let forwarder_due = forwarded.is_some_and(|last| forwarder_due(last, &tlds, now));
-        let owed = debt.owed_on(session);
+        let owed = debt.owed_on(session, wanted.saved.cleanup_owed);
         match plan(&intent, session, built, may_start, owed, forwarder_due) {
             Step::Keep => {
                 // A start waits only while no bridge runs, and a forwarder
@@ -604,15 +618,27 @@ async fn converge<E: BridgeEngine>(
             Step::Teardown => {
                 if let Some(old) = running.take() {
                     let ended = old.bridge.shutdown_and_remove_network().await;
+                    debt.settle(old.built.session);
                     let asked_for = Leftovers::SetupContainerAndNetwork;
-                    debt.settle(old.built.session, asked_for, Swept::Ended(ended));
+                    settle(&mut wanted, &state_path, asked_for, Swept::Ended(ended));
                 }
             }
             Step::Sweep(session, leftovers) => {
                 let swept = engine.remove_leftovers(session, leftovers).await;
-                debt.settle(session, leftovers, swept);
+                debt.settle(session);
+                settle(&mut wanted, &state_path, leftovers, swept);
             }
         }
+    }
+}
+
+/// Saves that the debt of a `Disable` is over, when a cleanup that asked
+/// for the DNS forwarder and the docker network ended it.
+fn settle(wanted: &mut Wanted, state_path: &Path, asked_for: Leftovers, swept: Swept) {
+    let network_asked_for = asked_for == Leftovers::SetupContainerAndNetwork;
+    if wanted.saved.cleanup_owed && network_asked_for && swept.ends_the_debt() {
+        wanted.saved.cleanup_owed = false;
+        persist(state_path, &wanted.saved);
     }
 }
 
@@ -880,10 +906,16 @@ impl BridgeEngine for LinkedEngine {
         match runtime::try_remove_leftovers(&docker, listen_port, leftovers).await {
             Ok(ended) => Swept::Ended(ended),
             Err(err) => {
+                let until = match leftovers {
+                    Leftovers::SetupContainer => "",
+                    Leftovers::SetupContainerAndNetwork => {
+                        ". portman does not ask again until the next `portman bridge disable`"
+                    }
+                };
                 info!(
                     listen_port,
                     %err,
-                    "netbridge leftovers stay in the engine: the listen port is taken, and its holder may run a bridge on them"
+                    "netbridge leftovers stay in the engine: the listen port is taken, and its holder may run a bridge on them{until}"
                 );
                 Swept::PortTaken
             }
@@ -980,7 +1012,11 @@ mod tests {
     }
 
     fn intent(enabled: bool, mode: NetbridgeMode) -> NetbridgeState {
-        NetbridgeState { enabled, mode }
+        NetbridgeState {
+            enabled,
+            mode,
+            cleanup_owed: false,
+        }
     }
 
     #[test]
