@@ -110,15 +110,16 @@ mod tests {
     }
 
     /// An engine that holds a setup container, a forwarder and a network
-    /// named as portman names them. `own` says whether they carry portman's
-    /// labels.
-    fn engine_with_leftovers(own: bool) -> (crate::engine::Engine, Arc<FakeEngine>) {
+    /// named as portman names them.
+    fn engine_with_leftovers(
+        carry_portmans_labels: bool,
+    ) -> (crate::engine::Engine, Arc<FakeEngine>) {
         let (engine, fake) = crate::engine::tests::connected();
-        let role = |role| own.then_some(role);
+        let role = |role| carry_portmans_labels.then_some(role);
         fake.hold(SETUP_CONTAINER, &container(role("netbridge-setup")));
         fake.hold(FORWARDER, &container(role("dns-forwarder")));
         fake.hold(FORWARDER_BY_ID, &container(role("dns-forwarder")));
-        let network_labels = if own {
+        let network_labels = if carry_portmans_labels {
             r#"{"Labels": {"dev.portman.managed": "1"}}"#
         } else {
             r#"{"Labels": {}}"#
@@ -145,8 +146,8 @@ mod tests {
             ((false, FREE_PORT), (vec![], none_left)),
             ((true, taken), (vec![], BridgeLeftovers::Owed { socket })),
         ];
-        for ((own, listen_port), (removed, ended)) in table {
-            let (engine, fake) = engine_with_leftovers(own);
+        for ((carry_portmans_labels, listen_port), (removed, ended)) in table {
+            let (engine, fake) = engine_with_leftovers(carry_portmans_labels);
             let sockets = Sockets::Configured(SOCKET.into());
 
             let uninstalled = remove_from(&sockets, &|_| engine.docker().ok(), listen_port).await;
@@ -156,8 +157,10 @@ mod tests {
                 .into_iter()
                 .filter(|call| call.starts_with("DELETE"))
                 .collect();
-            assert_eq!(removals, removed, "own={own} listen_port={listen_port}");
-            assert_eq!(uninstalled, ended, "own={own} listen_port={listen_port}");
+            let case =
+                format!("carry_portmans_labels={carry_portmans_labels} listen_port={listen_port}");
+            assert_eq!(removals, removed, "{case}");
+            assert_eq!(uninstalled, ended, "{case}");
         }
     }
 

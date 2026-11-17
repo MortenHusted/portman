@@ -209,7 +209,7 @@ pub(crate) async fn cmd_uninstall_macos() -> Result<()> {
     sweep_stragglers();
     remove_legacy_menubar();
 
-    if !old_daemon_exited() {
+    if !old_daemon_exits_within_30s() {
         eprintln!("previous daemon still running after 30s");
     }
     eprintln!("removing what the bridge left in Docker…");
@@ -515,7 +515,7 @@ pub(crate) fn sweep_stragglers() {
 /// on a wedged daemon would be worse.
 #[cfg(target_os = "macos")]
 pub(crate) fn wait_for_old_daemon_exit() {
-    if !old_daemon_exited() {
+    if !old_daemon_exits_within_30s() {
         eprintln!("previous daemon still running after 30s; attempting bootstrap anyway");
     }
 }
@@ -523,7 +523,7 @@ pub(crate) fn wait_for_old_daemon_exit() {
 /// Whether the installed `portman-daemon` process is gone, after a wait of
 /// at most 30s for it.
 #[cfg(target_os = "macos")]
-fn old_daemon_exited() -> bool {
+fn old_daemon_exits_within_30s() -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut waited = false;
     loop {
@@ -676,10 +676,10 @@ mod tests {
     #[tokio::test]
     async fn an_uninstall_asks_the_engine_that_the_daemon_is_connected_to() {
         let connected = r#"{"state":"connected","socket":"/run/demo/docker.sock"}"#;
-        let no_socket = r#"{"state":"disconnected","socket":"/run/demo/docker.sock"}"#;
+        let disconnected = r#"{"state":"disconnected","socket":"/run/demo/docker.sock"}"#;
         let table = [
             (status(connected), Some("/run/demo/docker.sock")),
-            (status(no_socket), None),
+            (status(disconnected), None),
             (status("null"), None),
             (Ok(Response::Ok), None),
             (Err(anyhow::anyhow!("no daemon answers")), None),
