@@ -69,6 +69,17 @@ git clone https://github.com/MortenHusted/portman && cd portman && cargo build -
 
 Optional extras: a Docker runtime if you want container routing, and [`mkcert`](https://github.com/FiloSottile/mkcert) if you want local TLS.
 
+To upgrade, run `portman install` again. It restarts the daemon, and the daemon stops every supervised service when it stops. The install names the services that are up before the restart and starts the same ones on the new daemon. A service that was down stays down. The install waits up to 120 seconds for the services to get ready, then prints the ones that are ready again. For each service that is not ready, it prints the reason and the command that starts it:
+
+```text
+the restart of the daemon stops these services: jobs, web
+starting them again on the new daemon…
+started again: web
+could not start jobs again: failed (process exited (exit status: 1) before becoming ready). Run `portman up jobs` in /Users/dev/acme/shop.
+```
+
+A service that does not start does not fail the install.
+
 ### macOS
 
 ```bash
@@ -118,7 +129,7 @@ portman down --forget # stop and remove this repo's synced definitions
 portman down --forget --root /old/worktree # forget a moved/deleted checkout
 ```
 
-After a reboot or daemon restart, synced services stay **down** until you start them (`portman up`, `portman start <name>`, or the dashboard). To have the daemon relaunch whatever was running when it stopped, set `PORTMAN_AUTOSTART_SERVICES=true` (or pass `--autostart-services=true`) in the daemon's environment. Orphaned processes from an unclean daemon exit are reclaimed either way.
+After a reboot or daemon restart, synced services stay **down** until you start them (`portman up`, `portman start <name>`, or the dashboard). To have the daemon relaunch whatever was running when it stopped, set `PORTMAN_AUTOSTART_SERVICES=true` (or pass `--autostart-services=true`) in the daemon's environment. Orphaned processes from an unclean daemon exit are reclaimed either way. An upgrade with `portman install` differs. It starts the services that were up, as [Install](#install) describes.
 
 The dashboard's inspector has the same two forgets as buttons: **Forget** drops one service, **Forget root** drops everything its config root owns.
 
