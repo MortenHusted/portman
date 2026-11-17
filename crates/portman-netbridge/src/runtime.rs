@@ -1000,7 +1000,7 @@ async fn best_effort_remove_setup_container(docker: &Docker, held: &ListenPort) 
         Err(err) => {
             warn!(
                 container = SETUP_CONTAINER,
-                error = %err,
+                error = %format_args!("{err:#}"),
                 "could not remove netbridge setup container"
             );
             false
@@ -1343,7 +1343,7 @@ async fn best_effort_remove_dns_forwarder(docker: &Docker, held: &ListenPort) ->
         Err(err) => {
             warn!(
                 container = DNS_CONTAINER,
-                error = %err,
+                error = %format_args!("{err:#}"),
                 "could not remove the dns forwarder container"
             );
             false
