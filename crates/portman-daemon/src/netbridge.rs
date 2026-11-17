@@ -2967,6 +2967,41 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_disable_on_an_engine_that_froze_waits_one_step_budget_and_asks_no_second_time() {
+        let daemon = OnFakeEngine::start(&[(NETWORK, OWN_NETWORK)]).await;
+        daemon.fake.hang(NETWORK);
+        let (logged, _capture) = Logged::capture();
+
+        let disabled = Instant::now();
+        daemon.handle.tx.send(Control::Disable).await.unwrap();
+        let poll = Duration::from_millis(100);
+        let mut warnings = logged.take_warnings();
+        while warnings.is_empty() && disabled.elapsed() < LONGEST_WAIT {
+            tokio::time::sleep(poll).await;
+            warnings = logged.take_warnings();
+        }
+
+        let waited = disabled.elapsed();
+        assert!(
+            waited >= ENGINE_STEP_BUDGET && waited <= ENGINE_STEP_BUDGET + poll,
+            "{waited:?}"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let no_answer = says_no_answer_within(ENGINE_STEP_BUDGET);
+        assert!(warnings[0].contains(&no_answer), "{}", warnings[0]);
+
+        let asked = daemon.fake.calls();
+        tokio::time::sleep(LONGEST_WAIT).await;
+
+        assert_eq!(logged.take_warnings(), [] as [&str; 0]);
+        assert_eq!(
+            daemon.fake.calls(),
+            asked,
+            "a second cleanup on the session"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_network_in_use_stays_and_only_the_next_disable_asks_for_it_again() {
         let daemon = OnFakeEngine::start(&[(NETWORK, OWN_NETWORK)]).await;
         daemon.fake.fail_delete(NETWORK, Some(IN_USE));
