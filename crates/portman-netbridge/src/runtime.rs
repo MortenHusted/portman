@@ -95,7 +95,7 @@ const SETUP_REMOVE_TIMEOUT: Duration = Duration::from_secs(10);
 const LABEL_HOST: &str = "dev.portman.host";
 const ROUTE_RECONCILE_PERIOD: Duration = Duration::from_secs(5);
 /// A `route` command takes milliseconds. A bridge that ends waits for the
-/// command that runs for its utun, so one that takes longer is ended.
+/// command that runs at that moment, so one that takes longer is ended.
 const ROUTE_LIMIT: Duration = Duration::from_secs(3);
 /// How long a command that was killed gets to go away.
 const KILL_GRACE: Duration = Duration::from_millis(500);
@@ -1619,8 +1619,10 @@ fn remember_own_utun(name: &str) {
 }
 
 /// Ends the claim on `name` and waits for the `route` command that runs at
-/// this moment. No later command runs for the name, so the wait is for one
-/// command, which [`ROUTE_LIMIT`] bounds.
+/// this moment. The lock is one for the process, so that command can be
+/// another bridge's. No later command runs for the name, so the wait is for
+/// one command: at most [`ROUTE_LIMIT`], and [`KILL_GRACE`] after it for a
+/// command that was killed.
 fn forget_own_utun(name: &str) {
     OWN_UTUNS
         .lock()
