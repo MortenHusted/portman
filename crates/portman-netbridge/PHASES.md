@@ -99,11 +99,12 @@ longer exists.
 portman-netbridge creates a docker network named `portman` with:
 
 - Driver `bridge` (standard Linux bridge inside colima's VM).
-- Subnet `192.168.99.0/24`, gateway `192.168.99.2` (the chip0 interface
-  inside the VM).
+- Subnet `192.168.99.128/25`, gateway `192.168.99.129`. It is the upper
+  half of `192.168.99.0/24`. The lower half holds the tunnel's two ends,
+  the host at `.1` and the chip0 interface inside the VM at `.2`.
 - Option `com.docker.network.driver.mtu=1420` for WireGuard overhead.
 - Reserved IPs inside the subnet: `192.168.99.254` is never allocated to
-  containers (reserved for the host-facing virtual IP — see c2c/c2h
+  containers (reserved for the host-facing virtual IP — see the c2h
   hooks).
 
 ### B.3 — adoption without migration

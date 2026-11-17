@@ -1,7 +1,9 @@
 //! Embedded authoritative DNS server backed by the registry.
 //!
-//! Answers A queries for hostnames present in the registry. Other record
-//! types (AAAA, SOA, …) return NOERROR with zero answers for now.
+//! Answers A queries for hostnames present in the registry. For such a
+//! hostname, other record types (AAAA, SOA, …) return NOERROR with zero
+//! answers for now. The two listeners differ in what they answer for a
+//! name that the registry does not hold.
 //!
 //! Two listeners:
 //!   - `run(registry, port, loopback)` — host-facing, on `127.0.0.1:<port>`.

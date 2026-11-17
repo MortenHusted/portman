@@ -30,7 +30,8 @@ Docker networks/containers, or build Docker images.
 The native netbridge is intentionally mode-gated:
 
 - `opt-in` is the default and only routes Portman's dedicated `portman` Docker
-  network (`192.168.99.0/24`). Existing compose default networks are untouched.
+  network (`192.168.99.128/25`, inside the routed `192.168.99.0/24`). Existing
+  compose default networks are untouched.
 - `docker` is the docker-mac-net-connect replacement path. It discovers running
   containers with `dev.portman.host`, finds their Docker bridge networks, and
   routes those bridge subnets through Portman's tunnel without requiring
