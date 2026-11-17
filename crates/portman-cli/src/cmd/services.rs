@@ -746,6 +746,7 @@ mod tests {
         refused_connections: usize,
         services: Vec<ServiceStatusInfo>,
         ends: std::collections::HashMap<String, (ServiceState, String)>,
+        depends: std::collections::HashMap<String, Vec<String>>,
         start_requests: Vec<Vec<String>>,
     }
 
@@ -766,10 +767,12 @@ mod tests {
                 bail!("connection refused");
             }
             if let Request::ServiceUp { names } = request {
+                let dependencies = names.iter().filter_map(|name| self.depends.get(name));
+                let targets: Vec<&String> = dependencies.flatten().chain(&names).collect();
                 for row in self
                     .services
                     .iter_mut()
-                    .filter(|row| names.contains(&row.name))
+                    .filter(|row| targets.contains(&&row.name))
                 {
                     let (state, detail) = self
                         .ends
@@ -1091,6 +1094,23 @@ mod tests {
                 "could not start web again: the new daemon stopped answering after the start \
                  request. Run `portman up web` in /Users/dev/acme/web."
             ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dependency_that_the_start_request_brings_up_is_named() {
+        let mut daemon = NewDaemon::holding(&["api", "cron", "db"]);
+        daemon.depends.insert("api".into(), vec!["db".into()]);
+        let started_by_the_daemon_itself = &mut daemon.services[1];
+        started_by_the_daemon_itself.desired_up = true;
+        started_by_the_daemon_itself.state = ServiceState::Ready;
+
+        let report = restore(InterruptedServices(vec![up("api")]), &mut daemon).await;
+
+        assert_eq!(daemon.start_requests, [["api"]]);
+        assert_eq!(
+            report.lines(),
+            ["started again: api", "started as a dependency: db"]
         );
     }
 
