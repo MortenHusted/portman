@@ -133,6 +133,9 @@ struct State {
     resource_usage: Option<ResourceUsageSnapshot>,
     resource_history: Vec<portman_protocol::ResourceSeries>,
     error: Option<(String, Instant)>,
+    /// What the last bridge command said beyond its success. It stays on
+    /// the status bar while the bridge waits for Docker.
+    notice: Option<String>,
     entries_sel: ListState,
     tlds_sel: ListState,
     services: Vec<ServiceStatusInfo>,
@@ -150,6 +153,12 @@ struct State {
 impl State {
     fn scheme_of(&self, entry: &Entry) -> &'static str {
         self.schemes.get(&entry.host).copied().unwrap_or("http")
+    }
+
+    fn waits_for_docker(&self) -> bool {
+        self.status
+            .as_ref()
+            .is_some_and(|status| status.bridge_phase == BridgePhase::WaitingForDocker)
     }
 }
 
@@ -331,6 +340,9 @@ fn apply_refresh(state: &mut State, outcome: RefreshOutcome) {
             state.services = data.services;
             state.schemes = compute_schemes(&state.entries, &state.tlds);
             state.daemon_online = true;
+            if !state.waits_for_docker() {
+                state.notice = None;
+            }
             clamp_selection(&mut state.entries_sel, state.entries.len());
             clamp_selection(&mut state.tlds_sel, state.tlds.len());
             clamp_selection(&mut state.services_sel, state.services.len());
@@ -479,7 +491,7 @@ async fn fetch_resource_usage() -> Result<ResourceUsageSnapshot> {
 }
 
 use crate::client::request as send;
-use crate::client::wait_for_bridge_state;
+use crate::client::{wait_for_bridge_state, Settled};
 use crate::fmt::{
     format_bytes as format_resource_bytes, format_rate as format_resource_rate, open_browser,
     truncate as truncate_for_tui,
@@ -561,7 +573,7 @@ async fn handle_key(
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                     state.modal = Modal::None;
                     let res = mutate_bridge(Request::BridgeDisable, false).await;
-                    apply_result(state, res);
+                    apply_bridge_result(state, res, "netbridge disabled");
                     refresh(state).await;
                 }
                 _ => {}
@@ -629,7 +641,7 @@ async fn handle_key(
                 state.modal = Modal::ConfirmBridgeDisable;
             } else {
                 let res = mutate_bridge(Request::BridgeEnable, true).await;
-                apply_result(state, res);
+                apply_bridge_result(state, res, "netbridge enabled");
                 refresh(state).await;
             }
         }
@@ -752,11 +764,24 @@ fn selected_service(state: &State) -> Option<&ServiceStatusInfo> {
 }
 
 fn apply_result(state: &mut State, res: Result<()>) {
+    state.notice = None;
     if let Err(e) = res {
         state.error = Some((format!("{e:#}"), Instant::now()));
     } else {
         state.error = None;
     }
+}
+
+/// `done` says what the command did, in the words the CLI prints. The CLI's
+/// line shows only when it says more than `done`, since the status panel
+/// shows a bridge that is up or off.
+fn apply_bridge_result(state: &mut State, res: Result<Settled>, done: &str) {
+    let notice = match &res {
+        Ok(Settled::WaitsForDocker) => Some(Settled::WaitsForDocker.line(done)),
+        _ => None,
+    };
+    apply_result(state, res.map(drop));
+    state.notice = notice;
 }
 
 // ---------------------------------------------------------------------------
@@ -796,9 +821,9 @@ async fn mutate_add_entry(host: &str, target: &str, mode: Mode) -> Result<()> {
 }
 
 /// Set the v1 netbridge state via IPC and wait for status to reflect it.
-async fn mutate_bridge(req: Request, desired: bool) -> Result<()> {
+async fn mutate_bridge(req: Request, desired: bool) -> Result<Settled> {
     match send(req).await? {
-        Response::Ok => wait_for_bridge_state(desired).await.map(drop),
+        Response::Ok => wait_for_bridge_state(desired).await,
         other => other.unexpected(),
     }
 }
@@ -1877,6 +1902,9 @@ fn render_status_bar(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
         .to_string(),
         Style::default().fg(color),
     ));
+    if let Some(notice) = &state.notice {
+        spans.push(Span::raw(format!("  ·  {notice}")));
+    }
     if let Some(s) = &state.status {
         spans.push(Span::raw(format!(
             "  ·  dns :{}  ·  http :{}  ·  tls :{}",
@@ -2366,6 +2394,65 @@ mod tests {
                 "phase={phase:?}\n{rows:#?}"
             );
         }
+    }
+
+    /// The status bar, on a terminal of `columns` columns.
+    fn status_bar(columns: u16, state: &State) -> String {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(columns, 40)).unwrap();
+        terminal.draw(|f| view(f, state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let bar: String = (0..columns).map(|x| buffer[(x, 38)].symbol()).collect();
+        bar.trim_end().to_string()
+    }
+
+    /// What a refresh reads from a daemon whose bridge is in `phase`.
+    fn refreshed(phase: BridgePhase) -> RefreshOutcome {
+        Ok(RefreshData {
+            entries: Vec::new(),
+            tlds: Vec::new(),
+            status: status_state(phase, None).status.unwrap(),
+            resource_usage: None,
+            resource_history: Vec::new(),
+            services: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn an_enable_that_waits_for_docker_says_so_on_the_status_bar_until_the_bridge_stops_waiting() {
+        let said = "netbridge enabled; the bridge starts when Docker connects";
+        let mut state = status_state(BridgePhase::Disabled, None);
+
+        apply_bridge_result(&mut state, Ok(Settled::WaitsForDocker), "netbridge enabled");
+        apply_refresh(&mut state, refreshed(BridgePhase::WaitingForDocker));
+        for columns in [120, 80] {
+            let bar = status_bar(columns, &state);
+            assert!(bar.contains(said), "columns={columns} {bar:?}");
+            assert!(!bar.contains("error"), "columns={columns} {bar:?}");
+        }
+
+        apply_refresh(&mut state, refreshed(BridgePhase::Up));
+        let bar = status_bar(120, &state);
+        assert!(!bar.contains("netbridge"), "{bar:?}");
+    }
+
+    #[test]
+    fn a_bridge_command_that_reached_its_state_or_failed_says_nothing_about_docker() {
+        let mut state = status_state(BridgePhase::WaitingForDocker, None);
+        apply_bridge_result(&mut state, Ok(Settled::WaitsForDocker), "netbridge enabled");
+
+        apply_bridge_result(&mut state, Ok(Settled::Reached), "netbridge disabled");
+        let bar = status_bar(120, &state);
+        assert!(!bar.contains("netbridge"), "{bar:?}");
+
+        apply_bridge_result(&mut state, Ok(Settled::WaitsForDocker), "netbridge enabled");
+        let failed = Err(anyhow::anyhow!("netbridge was disabled before it came up"));
+        apply_bridge_result(&mut state, failed, "netbridge enabled");
+        let bar = status_bar(120, &state);
+        assert!(
+            bar.contains("error: netbridge was disabled before it came up"),
+            "{bar:?}"
+        );
+        assert!(!bar.contains("Docker connects"), "{bar:?}");
     }
 
     #[test]
