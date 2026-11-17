@@ -3196,14 +3196,14 @@ destination: 172.18.0.0
 
     /// At its end the daemon drops its tokio runtime, and the runtime drops
     /// the task that holds the bridge and the pump tasks in an order of its
-    /// own.
+    /// own. The order follows the ids of the tasks, which count up across
+    /// the process and fall into four lists. So the test puts 0 to 7 tasks
+    /// between the pump and the holder of the bridge.
     #[test]
     fn a_tokio_runtime_that_shuts_down_drops_no_half_of_a_device_under_the_claim_on_its_utun() {
-        let orders = [
-            (true, "utun-of-a-bridge-that-is-older-than-its-pump"),
-            (false, "utun-of-a-pump-that-is-older-than-its-bridge"),
-        ];
-        for (bridge_first, utun) in orders {
+        for tasks_between in 0..8 {
+            let utun = format!("utun-at-a-shutdown-{tasks_between}");
+            let utun: &'static str = Box::leak(utun.into_boxed_str());
             let seen = Seen::claim(utun);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -3213,24 +3213,21 @@ destination: 172.18.0.0
                 let engine = FakeEngine::start().await;
                 let mut bridge = engine.bridge().await;
                 bridge.utun_name = utun.to_string();
-                let (give, given) = tokio::sync::oneshot::channel::<Runtime>();
+                bridge.tasks = vec![tx_pump(seen.half(Ends::Never)).await];
+                for _ in 0..tasks_between {
+                    tokio::spawn(std::future::pending::<()>());
+                }
                 let (holds, held) = tokio::sync::oneshot::channel();
-                let hold = async move {
-                    let _bridge = given.await;
+                tokio::spawn(async move {
+                    let _bridge = bridge;
                     let _ = holds.send(());
                     std::future::pending::<()>().await
-                };
-                let pump = if bridge_first {
-                    tokio::spawn(hold);
-                    tx_pump(seen.half(Ends::Never)).await
-                } else {
-                    let pump = tx_pump(seen.half(Ends::Never)).await;
-                    tokio::spawn(hold);
-                    pump
-                };
-                bridge.tasks = vec![pump];
-                assert!(give.send(bridge).is_ok());
+                });
                 held.await.unwrap();
+                assert!(
+                    is_own_utun(utun),
+                    "the bridge let go of the utun under a pump that runs"
+                );
             });
 
             drop(runtime);
@@ -3238,7 +3235,7 @@ destination: 172.18.0.0
             assert_eq!(
                 seen.claimed_at_drop(),
                 [false],
-                "bridge_first={bridge_first}"
+                "tasks_between={tasks_between}"
             );
         }
     }
