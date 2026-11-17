@@ -3451,12 +3451,36 @@ destination: 172.18.0.0
             (b"out\n".into(), b"err\n".into())
         );
 
-        let began = std::time::Instant::now();
-        let limit = Duration::from_millis(100);
-        let hung = output_within(StdCommand::new("sleep").arg("60"), limit);
-        assert_eq!(hung.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
-        let took = began.elapsed();
-        assert!(took < Duration::from_secs(10), "it took {took:?}");
+        // The program that hangs writes its id first. Under load the limit
+        // can pass before it has, and such a run shows nothing, so the next
+        // one gets twice the limit.
+        let pid_file = std::env::temp_dir().join(format!("portman-hangs-{}", std::process::id()));
+        let hangs = format!("echo $$ > '{}'; exec sleep 60", pid_file.display());
+        let mut limit = Duration::from_millis(100);
+        let pid = loop {
+            let _ = std::fs::remove_file(&pid_file);
+            let began = std::time::Instant::now();
+            let hung = output_within(StdCommand::new("sh").args(["-c", &hangs]), limit);
+            assert_eq!(hung.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+            let took = began.elapsed();
+            assert!(took < limit + Duration::from_secs(10), "it took {took:?}");
+            match std::fs::read_to_string(&pid_file) {
+                Ok(pid) if pid.ends_with('\n') => break pid.trim().to_string(),
+                _ => limit *= 2,
+            }
+        };
+        std::fs::remove_file(&pid_file).unwrap();
+        assert!(
+            !exists(&pid),
+            "the program that hangs (pid {pid}) is there after its limit"
+        );
+    }
+
+    /// Whether a process with this id exists. One that has ended and that
+    /// its parent has not waited for still exists.
+    fn exists(pid: &str) -> bool {
+        let signal_none = StdCommand::new("kill").args(["-0", pid]).output().unwrap();
+        signal_none.status.success()
     }
 
     #[test]
