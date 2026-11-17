@@ -24,7 +24,6 @@
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use bollard::models::ContainerSummary;
 use bollard::query_parameters::{ListContainersOptionsBuilder, ListNetworksOptionsBuilder};
@@ -36,9 +35,6 @@ use crate::discovery::{self, PORTMAN_NETWORK};
 use crate::engine::Engine;
 use crate::netbridge::BridgePhase;
 
-/// How often to re-assess. 5s matches the menubar's own refresh cadence;
-/// a bridge flap surfaces in the UI within the next poll cycle.
-const ASSESSMENT_PERIOD: Duration = Duration::from_secs(5);
 const LABEL_HOST: &str = "dev.portman.host";
 
 use portman_protocol::BridgeAssessment;
@@ -64,7 +60,9 @@ pub(crate) async fn run(
     bridge_ifindex: crate::upstream::BridgeIfIndex,
     mut phase: watch::Receiver<BridgePhase>,
 ) -> anyhow::Result<()> {
-    let mut ticker = tokio::time::interval(ASSESSMENT_PERIOD);
+    // 5s matches the menubar's own refresh cadence; a bridge flap surfaces
+    // in the UI within the next poll cycle.
+    let mut ticker = tokio::time::interval(BridgeAssessment::PERIOD);
     let mut link = engine.watch();
     // First tick fires immediately, which is what we want — establish an
     // assessment ASAP after startup rather than leaving the menubar on
@@ -281,6 +279,7 @@ enum RouteState {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::time::Duration;
 
     use super::*;
 
